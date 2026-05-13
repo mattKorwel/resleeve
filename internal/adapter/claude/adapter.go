@@ -40,15 +40,7 @@ func (a *Adapter) Detect(ctx context.Context) (adapter.Detection, error) {
 	return d, nil
 }
 
-// InstallBridge is implemented in install.go (Stage 3c).
-func (a *Adapter) InstallBridge(ctx context.Context, opts adapter.InstallOpts) error {
-	return fmt.Errorf("%w: claude.InstallBridge (Stage 3c)", adapter.ErrNotImplemented)
-}
-
-// UninstallBridge is implemented alongside InstallBridge in Stage 3c.
-func (a *Adapter) UninstallBridge(ctx context.Context) error {
-	return fmt.Errorf("%w: claude.UninstallBridge (Stage 3c)", adapter.ErrNotImplemented)
-}
+// InstallBridge / UninstallBridge are implemented in install.go.
 
 // ToNative renders normalized events back into Claude Code's native
 // JSONL format. Deferred to Stage 5 (re-sleeving).

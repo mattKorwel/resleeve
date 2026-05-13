@@ -31,6 +31,8 @@ func Main(args []string) int {
 		return runAgent(ctx, rest)
 	case "hook":
 		return runHook(ctx, rest)
+	case "install-bridge":
+		return runInstallBridge(ctx, rest)
 	case "help", "--help", "-h":
 		printUsage(os.Stdout)
 		return 0
@@ -47,6 +49,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  version          print version and exit")
 	fmt.Fprintln(w, "  agent            run the local daemon")
 	fmt.Fprintln(w, "  hook             process a hook event (stdin → daemon)")
+	fmt.Fprintln(w, "  install-bridge   install hooks into the harness's settings file")
 	fmt.Fprintln(w, "  help             show this help")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Other commands ship in later stages — see docs/design/round-3/00-v1-cut.md")
