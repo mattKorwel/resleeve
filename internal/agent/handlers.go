@@ -1,21 +1,21 @@
 package agent
 
 import (
+	"crypto/subtle"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/mattkorwel/resleeve/internal/event"
-	rsql "github.com/mattkorwel/resleeve/internal/storage/sql"
 )
 
 func (d *Daemon) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/health", d.handleHealth)
-	mux.HandleFunc("/v1/sessions/", d.handleSessionEvents)
+	mux.HandleFunc("/v1/sessions/", d.requireBearer(d.handleSessionEvents))
 }
 
+// handleHealth is unauthenticated; useful for `resleeve doctor` and
+// liveness probes.
 func (d *Daemon) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -28,10 +28,9 @@ func (d *Daemon) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleSessionEvents handles POST /v1/sessions/{id}/events.
-// Stage 3a: auto-creates the session if missing with minimal metadata
-// derived from the first event. Stage 3b will move session metadata
-// onto a dedicated POST /v1/sessions endpoint and tighten auth.
+// handleSessionEvents handles POST /v1/sessions/{id}/events. The
+// daemon ingests the batch via IngestBatch, which auto-creates the
+// session if missing and heartbeats the slot.
 func (d *Daemon) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
 	const prefix = "/v1/sessions/"
 	const suffix = "/events"
@@ -61,32 +60,35 @@ func (d *Daemon) handleSessionEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
-
-	// Auto-create session if missing (3a stub behavior).
-	if _, err := d.store.Sessions().Get(ctx, sessionID); err != nil {
-		if !errors.Is(err, rsql.ErrNotFound) {
-			http.Error(w, "session get: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		first := body.Events[0]
-		ses := &rsql.Session{
-			ID:         sessionID,
-			Slot:       first.Slot,
-			CLI:        first.Vendor.Name,
-			CLIVersion: first.Vendor.Version,
-			StartedAt:  time.Now().UTC(),
-			Status:     rsql.SessionStatusActive,
-		}
-		if err := d.store.Sessions().Create(ctx, ses); err != nil {
-			http.Error(w, "session create: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
-
-	if err := d.store.Events().Append(ctx, body.Events); err != nil {
-		http.Error(w, "append: "+err.Error(), http.StatusInternalServerError)
+	if err := d.IngestBatch(r.Context(), sessionID, body.Events); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// requireBearer is the authentication middleware. Compares the
+// Authorization header's Bearer value to d.secret in constant time.
+// Returns 401 on mismatch.
+func (d *Daemon) requireBearer(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		const prefix = "Bearer "
+		h := r.Header.Get("Authorization")
+		if !strings.HasPrefix(h, prefix) {
+			http.Error(w, "missing bearer", http.StatusUnauthorized)
+			return
+		}
+		provided := strings.TrimPrefix(h, prefix)
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(d.secret)) != 1 {
+			http.Error(w, "bad bearer", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// decodeIgnoringUnknown is a small helper for parsing partial JSON
+// payloads where we only care about a few fields.
+func decodeIgnoringUnknown(data []byte, target any) error {
+	return json.Unmarshal(data, target)
 }

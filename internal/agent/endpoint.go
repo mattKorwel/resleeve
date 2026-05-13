@@ -11,12 +11,12 @@ import (
 
 // LoadEndpoint reads the daemon's endpoint URL and shared secret.
 // Resolution order:
-//  1. $RESLEEVE_AGENT_ENDPOINT env var (URL only; no secret)
-//  2. The endpoint file at EndpointPath()
-// Returns an error if neither resolves.
+//  1. $RESLEEVE_AGENT_ENDPOINT env var (URL); pairs with $RESLEEVE_AGENT_SECRET if set.
+//  2. The endpoint file at EndpointPath() containing "URL\nSECRET\n".
+// Returns an error if no endpoint can be resolved.
 func LoadEndpoint() (url, secret string, err error) {
 	if e := os.Getenv("RESLEEVE_AGENT_ENDPOINT"); e != "" {
-		return e, "", nil
+		return e, os.Getenv("RESLEEVE_AGENT_SECRET"), nil
 	}
 	path, err := EndpointPath()
 	if err != nil {

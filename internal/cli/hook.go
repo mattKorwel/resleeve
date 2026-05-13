@@ -2,23 +2,19 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"io"
 	"os"
-	"path/filepath"
-	"time"
 
-	"github.com/google/uuid"
-
+	"github.com/mattkorwel/resleeve/internal/adapter"
+	"github.com/mattkorwel/resleeve/internal/adapter/claude"
 	"github.com/mattkorwel/resleeve/internal/agent"
-	"github.com/mattkorwel/resleeve/internal/event"
 )
 
-// runHook is the "resleeve hook" subcommand. Reads a Claude Code hook
-// JSON envelope on stdin, wraps it as a single KindSystem event for
-// Stage 3a (real per-record events arrive in 3b), and POSTs to the
-// daemon. Always exits 0 — a hook failure must NOT crash Claude Code.
+// runHook is the "resleeve hook" subcommand. Claude Code's hook system
+// invokes it with the hook event JSON on stdin. It must always exit 0
+// (per docs/design/round-2/02-journey-01-decisions.md Q10) — a hook
+// failure must never crash the harness.
 func runHook(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("hook", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -34,49 +30,43 @@ func runHook(ctx context.Context, args []string) int {
 
 	endpoint, secret, err := agent.LoadEndpoint()
 	if err != nil {
-		// Silent no-op when no daemon resolves (per 02-journey-01-decisions.md Q10).
+		// Silent no-op when no daemon resolves — don't crash Claude Code.
 		return 0
 	}
 
-	// Probe session metadata from the hook envelope.
-	var probe struct {
-		SessionID     string `json:"session_id"`
-		HookEventName string `json:"hook_event_name"`
-		Cwd           string `json:"cwd"`
+	a, err := pickAdapter(*adapterName)
+	if err != nil {
+		return 0
 	}
-	_ = json.Unmarshal(raw, &probe)
 
-	sessionID := probe.SessionID
+	events, err := a.FromNative(ctx, raw, adapter.Source{Kind: adapter.SourceHook})
+	if err != nil || len(events) == 0 {
+		return 0
+	}
+
+	sessionID := events[0].SessionID
 	if sessionID == "" {
-		sessionID = "unknown-" + uuid.NewString()
-	}
-
-	now := time.Now().UTC()
-	contentBytes, _ := json.Marshal(map[string]any{
-		"raw_hook":        json.RawMessage(raw),
-		"hook_event_name": probe.HookEventName,
-		"cwd":             probe.Cwd,
-		"received_at":     now.Format(time.RFC3339Nano),
-	})
-
-	scope := "unknown"
-	if probe.Cwd != "" {
-		scope = filepath.Base(probe.Cwd)
-	}
-
-	e := event.Event{
-		EventUUID:     uuid.NewString(),
-		SessionID:     sessionID,
-		Slot:          event.Slot{Scope: scope, AgentName: "default"},
-		Seq:           now.UnixNano(),
-		Timestamp:     now,
-		Kind:          event.KindSystem,
-		SchemaVersion: 1,
-		Content:       contentBytes,
-		Vendor:        event.Vendor{Name: *adapterName, Version: "unknown"},
+		return 0
 	}
 
 	client := agent.NewClient(endpoint, secret)
-	_ = client.AppendEvents(ctx, sessionID, []event.Event{e})
+	_ = client.AppendEvents(ctx, sessionID, events)
 	return 0
+}
+
+// pickAdapter returns an adapter.Adapter for the given name. v1 only
+// supports claude; v3 will register opencode / codex / gemini.
+func pickAdapter(name string) (adapter.Adapter, error) {
+	switch name {
+	case claude.Name, "":
+		return claude.New(), nil
+	default:
+		return nil, &unknownAdapterError{name: name}
+	}
+}
+
+type unknownAdapterError struct{ name string }
+
+func (e *unknownAdapterError) Error() string {
+	return "unknown adapter: " + e.name
 }
