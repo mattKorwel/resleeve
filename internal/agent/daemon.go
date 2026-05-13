@@ -7,6 +7,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/mattkorwel/resleeve/internal/adapter/claude"
@@ -75,6 +77,12 @@ func (d *Daemon) Serve(ctx context.Context) error {
 	d.endpoint = endpointPath
 	fmt.Printf("resleeve agent listening on %s\nendpoint: %s\n", url, endpointPath)
 
+	// Write PID file so `resleeve down` / `doctor` can find this daemon.
+	pidPath, _ := PIDPath()
+	if pidPath != "" {
+		_ = os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600)
+	}
+
 	// Shutdown goroutine.
 	go func() {
 		<-ctx.Done()
@@ -82,6 +90,9 @@ func (d *Daemon) Serve(ctx context.Context) error {
 		defer cancel()
 		_ = d.server.Shutdown(shutCtx)
 		_ = RemoveEndpoint(endpointPath)
+		if pidPath != "" {
+			_ = os.Remove(pidPath)
+		}
 		_ = d.store.Close()
 	}()
 

@@ -35,6 +35,16 @@ func Main(args []string) int {
 		return runInstallBridge(ctx, rest)
 	case "session":
 		return runSession(ctx, rest)
+	case "up":
+		return runUp(ctx, rest)
+	case "down":
+		return runDown(ctx, rest)
+	case "doctor":
+		return runDoctor(ctx, rest)
+	case "purge":
+		return runPurge(ctx, rest)
+	case "usage":
+		return runUsage(ctx, rest)
 	case "help", "--help", "-h":
 		printUsage(os.Stdout)
 		return 0
@@ -53,6 +63,11 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  hook             process a hook event (stdin → daemon)")
 	fmt.Fprintln(w, "  install-bridge   install hooks into the harness's settings file")
 	fmt.Fprintln(w, "  session          list/show/search/tail captured sessions")
+	fmt.Fprintln(w, "  up               start the daemon and install bridges")
+	fmt.Fprintln(w, "  down             stop the daemon and remove bridges")
+	fmt.Fprintln(w, "  doctor           print daemon + bridge + CLI status")
+	fmt.Fprintln(w, "  usage            show data-dir size and session count")
+	fmt.Fprintln(w, "  purge            wipe data dir (interactive confirm)")
 	fmt.Fprintln(w, "  help             show this help")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Other commands ship in later stages — see docs/design/round-3/00-v1-cut.md")

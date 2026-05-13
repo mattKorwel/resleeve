@@ -78,6 +78,34 @@ func EndpointPath() (string, error) {
 	return filepath.Join(home, ".resleeve", "endpoint"), nil
 }
 
+// DataDir returns the directory where resleeve stores its data
+// (database, blobs, pid file, daemon log). ~/.resleeve/ today.
+func DataDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("homedir: %w", err)
+	}
+	return filepath.Join(home, ".resleeve"), nil
+}
+
+// PIDPath returns the path to the daemon PID file (under DataDir).
+func PIDPath() (string, error) {
+	dir, err := DataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "daemon.pid"), nil
+}
+
+// LogPath returns the path to the daemon log file (under DataDir).
+func LogPath() (string, error) {
+	dir, err := DataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "daemon.log"), nil
+}
+
 func generateSecret() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
