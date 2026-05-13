@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -56,8 +57,12 @@ func (d *Daemon) createSessionFromFirstEvent(ctx context.Context, sessionID stri
 		var c struct {
 			Cwd string `json:"cwd"`
 		}
-		_ = decodeIgnoringUnknown(first.Content, &c)
+		_ = json.Unmarshal(first.Content, &c)
 		cwd = c.Cwd
+	}
+	startedAt := first.Timestamp
+	if startedAt.IsZero() {
+		startedAt = time.Now().UTC()
 	}
 	ses := &rsql.Session{
 		ID:         sessionID,
@@ -65,7 +70,7 @@ func (d *Daemon) createSessionFromFirstEvent(ctx context.Context, sessionID stri
 		CLI:        first.Vendor.Name,
 		CLIVersion: first.Vendor.Version,
 		Cwd:        cwd,
-		StartedAt:  time.Now().UTC(),
+		StartedAt:  startedAt,
 		Status:     rsql.SessionStatusActive,
 	}
 	return d.store.Sessions().Create(ctx, ses)

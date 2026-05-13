@@ -190,6 +190,77 @@ func (s *sessionStore) Get(ctx context.Context, id string) (*rsql.Session, error
 	return &ses, nil
 }
 
+// List returns sessions matching f, ordered by started_at DESC.
+func (s *sessionStore) List(ctx context.Context, f rsql.SessionFilter) ([]*rsql.Session, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+
+	q := `SELECT id, scope, agent_name, cli, cli_version, cwd, git_branch, model,
+		started_at, ended_at, event_count, status, exit_status
+		FROM sessions WHERE 1=1`
+	var args []any
+	if f.Scope != "" {
+		q += ` AND scope = ?`
+		args = append(args, f.Scope)
+	}
+	if f.AgentName != "" {
+		q += ` AND agent_name = ?`
+		args = append(args, f.AgentName)
+	}
+	if f.Status != "" {
+		q += ` AND status = ?`
+		args = append(args, string(f.Status))
+	}
+	if f.Since != nil {
+		q += ` AND started_at >= ?`
+		args = append(args, f.Since.UTC().Format(time.RFC3339Nano))
+	}
+	q += ` ORDER BY started_at DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*rsql.Session
+	for rows.Next() {
+		ses := &rsql.Session{}
+		var startedAt string
+		var endedAt sql.NullString
+		var exitStatus sql.NullInt64
+		var status string
+		if err := rows.Scan(
+			&ses.ID, &ses.Slot.Scope, &ses.Slot.AgentName,
+			&ses.CLI, &ses.CLIVersion, &ses.Cwd, &ses.GitBranch, &ses.Model,
+			&startedAt, &endedAt, &ses.EventCount, &status, &exitStatus,
+		); err != nil {
+			return nil, err
+		}
+		if t, err := time.Parse(time.RFC3339Nano, startedAt); err == nil {
+			ses.StartedAt = t
+		}
+		if endedAt.Valid {
+			if t, err := time.Parse(time.RFC3339Nano, endedAt.String); err == nil {
+				ses.EndedAt = &t
+			}
+		}
+		if exitStatus.Valid {
+			v := int(exitStatus.Int64)
+			ses.ExitStatus = &v
+		}
+		ses.Status = rsql.SessionStatus(status)
+		out = append(out, ses)
+	}
+	return out, rows.Err()
+}
+
 // ---- eventStore ----
 
 type eventStore struct{ db *sql.DB }
@@ -287,6 +358,105 @@ func (s *eventStore) List(ctx context.Context, sessionID string, sinceSeq int64,
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// Search performs a portable substring search over events.content
+// (JSON-as-TEXT). v1 uses LIKE; SQLite FTS5 + Postgres tsvector are
+// pluggable upgrades behind the same Search contract.
+func (s *eventStore) Search(ctx context.Context, query string, limit int) ([]rsql.EventSearchHit, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	if query == "" {
+		return nil, nil
+	}
+	// Escape LIKE wildcards in the user query.
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(query)
+	pattern := "%" + escaped + "%"
+
+	rows, err := s.db.QueryContext(ctx, `SELECT event_uuid, session_id, seq, turn_id, parent_event_uuid,
+		ts, kind, schema_version, content, vendor_name, vendor_version, vendor_native_payload
+		FROM events WHERE content LIKE ? ESCAPE '\' ORDER BY ts DESC LIMIT ?`,
+		pattern, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []rsql.EventSearchHit
+	for rows.Next() {
+		var e event.Event
+		var turnID, parentUUID sql.NullString
+		var ts, kind string
+		var content, native []byte
+		if err := rows.Scan(
+			&e.EventUUID, &e.SessionID, &e.Seq, &turnID, &parentUUID,
+			&ts, &kind, &e.SchemaVersion,
+			&content, &e.Vendor.Name, &e.Vendor.Version, &native,
+		); err != nil {
+			return nil, err
+		}
+		e.Kind = event.Kind(kind)
+		if turnID.Valid {
+			v := turnID.String
+			e.TurnID = &v
+		}
+		if parentUUID.Valid {
+			v := parentUUID.String
+			e.ParentEventUUID = &v
+		}
+		if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+			e.Timestamp = t
+		}
+		if len(content) > 0 {
+			e.Content = json.RawMessage(content)
+		}
+		if len(native) > 0 {
+			e.Vendor.NativePayload = json.RawMessage(native)
+		}
+		out = append(out, rsql.EventSearchHit{
+			Event:   e,
+			Snippet: snippet(string(content), query, 120),
+		})
+	}
+	return out, rows.Err()
+}
+
+// snippet returns up to width chars around the first case-insensitive
+// match of needle in haystack. Best-effort, not algorithmically optimal.
+func snippet(haystack, needle string, width int) string {
+	if needle == "" {
+		return ""
+	}
+	lh := strings.ToLower(haystack)
+	ln := strings.ToLower(needle)
+	idx := strings.Index(lh, ln)
+	if idx < 0 {
+		if len(haystack) > width {
+			return haystack[:width] + "…"
+		}
+		return haystack
+	}
+	start := idx - width/2
+	if start < 0 {
+		start = 0
+	}
+	end := start + width
+	if end > len(haystack) {
+		end = len(haystack)
+	}
+	prefix := ""
+	if start > 0 {
+		prefix = "…"
+	}
+	suffix := ""
+	if end < len(haystack) {
+		suffix = "…"
+	}
+	return prefix + haystack[start:end] + suffix
 }
 
 // ---- slotStore ----

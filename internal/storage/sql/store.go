@@ -38,6 +38,15 @@ type Session struct {
 	ExitStatus *int
 }
 
+// SessionFilter narrows SessionStore.List.
+type SessionFilter struct {
+	Scope     string        // exact match; empty = any
+	AgentName string        // exact match; empty = any
+	Status    SessionStatus // empty = any
+	Since     *time.Time    // started_at >= since
+	Limit     int           // <= 0 ⇒ default 50; capped at 500
+}
+
 // SlotState is the durable view of one slot.
 type SlotState struct {
 	Slot             event.Slot
@@ -45,10 +54,17 @@ type SlotState struct {
 	CurrentSessionID string // empty if quiescent
 }
 
+// EventSearchHit is one result row from a cross-session search.
+type EventSearchHit struct {
+	Event   event.Event
+	Snippet string // best-effort excerpt around the match
+}
+
 // SessionStore persists sessions.
 type SessionStore interface {
 	Create(ctx context.Context, s *Session) error
 	Get(ctx context.Context, id string) (*Session, error)
+	List(ctx context.Context, f SessionFilter) ([]*Session, error)
 }
 
 // EventStore persists session events. Appends are idempotent on
@@ -56,6 +72,7 @@ type SessionStore interface {
 type EventStore interface {
 	Append(ctx context.Context, events []event.Event) error
 	List(ctx context.Context, sessionID string, sinceSeq int64, limit int) ([]event.Event, error)
+	Search(ctx context.Context, query string, limit int) ([]EventSearchHit, error)
 }
 
 // SlotStore tracks slot heartbeats and the current session per slot.
@@ -74,9 +91,7 @@ type UserStore interface {
 }
 
 // Store is the union — each backend exposes the sub-stores via typed
-// accessors. v1 deploys the SQLite implementation; the interface is
-// sized for Postgres (and Spanner-PG, AlloyDB, etc.) from day one.
-// See docs/design/round-2/11-storage-backends.md.
+// accessors. See docs/design/round-2/11-storage-backends.md.
 type Store interface {
 	Sessions() SessionStore
 	Events() EventStore
