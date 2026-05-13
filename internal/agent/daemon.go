@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"time"
 
+	"github.com/mattkorwel/resleeve/internal/adapter/claude"
 	"github.com/mattkorwel/resleeve/internal/storage/sql/sqlite"
 )
 
@@ -81,6 +83,16 @@ func (d *Daemon) Serve(ctx context.Context) error {
 		_ = d.server.Shutdown(shutCtx)
 		_ = RemoveEndpoint(endpointPath)
 		_ = d.store.Close()
+	}()
+
+	// One-shot reconcile sweep over Claude Code's session JSONL files.
+	// Backfills any events the live hook path missed. Deterministic
+	// UUIDs + INSERT OR IGNORE handle dedup against already-captured rows.
+	go func() {
+		a := claude.New()
+		if err := a.ReconcileOnce(ctx, d); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("reconcile: %v", err)
+		}
 	}()
 
 	serveErr := d.server.Serve(ln)
