@@ -26,6 +26,7 @@ type Store struct {
 	sessions *sessionStore
 	events   *eventStore
 	slots    *slotStore
+	users    *userStore
 }
 
 // Open opens (and auto-migrates) a SQLite database at the given DSN.
@@ -47,6 +48,7 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	s.sessions = &sessionStore{db: db}
 	s.events = &eventStore{db: db}
 	s.slots = &slotStore{db: db}
+	s.users = &userStore{db: db}
 	if err := s.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -62,6 +64,9 @@ func (s *Store) Events() rsql.EventStore { return s.events }
 
 // Slots returns the SlotStore view.
 func (s *Store) Slots() rsql.SlotStore { return s.slots }
+
+// Users returns the UserStore view.
+func (s *Store) Users() rsql.UserStore { return s.users }
 
 // Close releases the underlying database handle.
 func (s *Store) Close() error { return s.db.Close() }

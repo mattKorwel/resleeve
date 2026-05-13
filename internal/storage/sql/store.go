@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/mattkorwel/resleeve/internal/auth"
 	"github.com/mattkorwel/resleeve/internal/event"
 )
 
@@ -63,13 +64,23 @@ type SlotStore interface {
 	Get(ctx context.Context, slot event.Slot) (*SlotState, error)
 }
 
-// Store is the union — each backend exposes the three sub-stores
-// via typed accessors. v1 deploys the SQLite implementation; the
-// interface is sized for Postgres (and Spanner-PG, AlloyDB, etc.)
-// from day one. See docs/design/round-2/11-storage-backends.md.
+// UserStore persists user accounts and their KEK-wrap material.
+// See docs/design/round-2/10-auth-subsystem.md.
+type UserStore interface {
+	Create(ctx context.Context, u *auth.User) error
+	GetByID(ctx context.Context, id string) (*auth.User, error)
+	GetByEmail(ctx context.Context, email string) (*auth.User, error)
+	UpdateAuth(ctx context.Context, u *auth.User) error
+}
+
+// Store is the union — each backend exposes the sub-stores via typed
+// accessors. v1 deploys the SQLite implementation; the interface is
+// sized for Postgres (and Spanner-PG, AlloyDB, etc.) from day one.
+// See docs/design/round-2/11-storage-backends.md.
 type Store interface {
 	Sessions() SessionStore
 	Events() EventStore
 	Slots() SlotStore
+	Users() UserStore
 	Close() error
 }
