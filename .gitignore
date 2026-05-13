@@ -1,0 +1,37 @@
+# Binaries
+/resleeve
+/resleeve-*
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binaries / coverage
+*.test
+*.out
+/coverage/
+
+# Go
+/vendor/
+go.work
+go.work.sum
+
+# IDE / tooling
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-local state
+.claude/
+.env
+.env.*
+/var/
+/tmp/
+
+# Build artifacts
+/build/
+/dist/
