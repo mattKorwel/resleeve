@@ -1,0 +1,147 @@
+package sqlite
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/mattkorwel/resleeve/internal/event"
+	rsql "github.com/mattkorwel/resleeve/internal/storage/sql"
+)
+
+func openTestStore(t *testing.T) *Store {
+	t.Helper()
+	ctx := context.Background()
+	st, err := Open(ctx, "file::memory:?cache=shared&_pragma=foreign_keys=on")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
+
+func TestStore_RoundTrip(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+
+	slot := event.Slot{Scope: "auth-rewrite", AgentName: "claude-3"}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	ses := &rsql.Session{
+		ID:         "01HZW001",
+		Slot:       slot,
+		CLI:        "claude_code",
+		CLIVersion: "2.1.140",
+		Cwd:        "/Users/test/proj",
+		StartedAt:  now,
+		Status:     rsql.SessionStatusActive,
+	}
+	if err := st.Sessions().Create(ctx, ses); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	got, err := st.Sessions().Get(ctx, ses.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if got.ID != ses.ID || got.Slot != slot || got.CLI != ses.CLI {
+		t.Errorf("session mismatch: got %+v, want %+v", got, ses)
+	}
+	if got.Status != rsql.SessionStatusActive {
+		t.Errorf("status: got %q, want %q", got.Status, rsql.SessionStatusActive)
+	}
+
+	turnID := "01HZT001"
+	events := []event.Event{
+		{
+			EventUUID:     "01HZ001",
+			SessionID:     ses.ID,
+			Slot:          slot,
+			Seq:           1,
+			Timestamp:     now,
+			Kind:          event.KindUserMessage,
+			SchemaVersion: 1,
+			Content:       json.RawMessage(`{"text":"fix the auth bug"}`),
+			Vendor:        event.Vendor{Name: "claude_code", Version: "2.1.140"},
+		},
+		{
+			EventUUID:     "01HZ002",
+			SessionID:     ses.ID,
+			Slot:          slot,
+			Seq:           2,
+			TurnID:        &turnID,
+			Timestamp:     now.Add(time.Second),
+			Kind:          event.KindAssistantMessage,
+			SchemaVersion: 1,
+			Content:       json.RawMessage(`{"text":"reading the middleware first."}`),
+			Vendor: event.Vendor{
+				Name:          "claude_code",
+				Version:       "2.1.140",
+				NativePayload: json.RawMessage(`{"raw":"vendor payload"}`),
+			},
+		},
+	}
+	if err := st.Events().Append(ctx, events); err != nil {
+		t.Fatalf("append events: %v", err)
+	}
+
+	// Idempotency: re-appending must not error or duplicate.
+	if err := st.Events().Append(ctx, events); err != nil {
+		t.Fatalf("re-append should be idempotent: %v", err)
+	}
+
+	listed, err := st.Events().List(ctx, ses.ID, 0, 100)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	if len(listed) != 2 {
+		t.Fatalf("expected 2 events after idempotent re-append, got %d", len(listed))
+	}
+	if listed[0].EventUUID != "01HZ001" || listed[1].EventUUID != "01HZ002" {
+		t.Errorf("event ordering wrong: %v, %v", listed[0].EventUUID, listed[1].EventUUID)
+	}
+	if listed[1].TurnID == nil || *listed[1].TurnID != turnID {
+		t.Errorf("turn_id round-trip failed: %v", listed[1].TurnID)
+	}
+	if len(listed[1].Vendor.NativePayload) == 0 {
+		t.Errorf("vendor native_payload not round-tripped")
+	}
+
+	// Slot heartbeat + get.
+	if err := st.Slots().Heartbeat(ctx, slot, ses.ID); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	state, err := st.Slots().Get(ctx, slot)
+	if err != nil {
+		t.Fatalf("get slot: %v", err)
+	}
+	if state.CurrentSessionID != ses.ID {
+		t.Errorf("slot current_session_id: got %q, want %q", state.CurrentSessionID, ses.ID)
+	}
+
+	// Heartbeat again with the same slot to verify upsert semantics.
+	if err := st.Slots().Heartbeat(ctx, slot, ""); err != nil {
+		t.Fatalf("re-heartbeat: %v", err)
+	}
+	state2, err := st.Slots().Get(ctx, slot)
+	if err != nil {
+		t.Fatalf("get slot after re-heartbeat: %v", err)
+	}
+	if state2.CurrentSessionID != "" {
+		t.Errorf("slot current_session_id should be cleared, got %q", state2.CurrentSessionID)
+	}
+}
+
+func TestStore_NotFound(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+
+	if _, err := st.Sessions().Get(ctx, "nope"); !errors.Is(err, rsql.ErrNotFound) {
+		t.Errorf("missing session: expected ErrNotFound, got %v", err)
+	}
+	if _, err := st.Slots().Get(ctx, event.Slot{Scope: "x", AgentName: "y"}); !errors.Is(err, rsql.ErrNotFound) {
+		t.Errorf("missing slot: expected ErrNotFound, got %v", err)
+	}
+}
