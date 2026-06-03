@@ -63,6 +63,11 @@ type EventSearchHit struct {
 
 // SessionStore persists sessions.
 type SessionStore interface {
+	// Create inserts a new session. Idempotent on the session ID — a
+	// duplicate ID is a silent no-op (INSERT OR IGNORE in the SQLite
+	// implementation), so two near-simultaneous first-events for the
+	// same session can both call Create without one of them racing into
+	// a primary-key violation. Existing fields are preserved.
 	Create(ctx context.Context, s *Session) error
 	Get(ctx context.Context, id string) (*Session, error)
 	List(ctx context.Context, f SessionFilter) ([]*Session, error)

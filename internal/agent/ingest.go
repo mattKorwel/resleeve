@@ -28,13 +28,12 @@ func (d *Daemon) IngestBatch(ctx context.Context, sessionID string, events []eve
 		return nil
 	}
 
-	if _, err := d.store.Sessions().Get(ctx, sessionID); err != nil {
-		if !errors.Is(err, rsql.ErrNotFound) {
-			return fmt.Errorf("ingest: get session: %w", err)
-		}
-		if err := d.createSessionFromFirstEvent(ctx, sessionID, events[0]); err != nil {
-			return fmt.Errorf("ingest: create session: %w", err)
-		}
+	// Create-if-absent in one atomic step. The storage layer's Create
+	// is INSERT OR IGNORE, so two near-simultaneous first-event hooks
+	// for the same session can both call here without racing into a
+	// PK-violation error (and silently dropping events).
+	if err := d.createSessionFromFirstEvent(ctx, sessionID, events[0]); err != nil {
+		return fmt.Errorf("ingest: create session: %w", err)
 	}
 
 	if err := d.store.Events().Append(ctx, events); err != nil {

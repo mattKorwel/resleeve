@@ -142,6 +142,12 @@ func versionOf(name string) int {
 
 type sessionStore struct{ db *sql.DB }
 
+// Create inserts a session. Idempotent: a duplicate ID is a silent
+// no-op via INSERT OR IGNORE, so two near-simultaneous first-events
+// for the same session can both call Create without one of them
+// racing into a PK-violation error. Matches the spirit of the recent
+// ori "atomic sticky pointer" fix — same shape of bug, different
+// fields. See docs/design/round-2/02-journey-01-decisions.md Q2.
 func (s *sessionStore) Create(ctx context.Context, ses *rsql.Session) error {
 	var endedAt sql.NullString
 	if ses.EndedAt != nil {
@@ -151,7 +157,7 @@ func (s *sessionStore) Create(ctx context.Context, ses *rsql.Session) error {
 	if ses.ExitStatus != nil {
 		exitStatus = sql.NullInt64{Valid: true, Int64: int64(*ses.ExitStatus)}
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO sessions
+	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO sessions
 		(id, scope, agent_name, cli, cli_version, cwd, git_branch, model, started_at, ended_at, event_count, status, exit_status)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		ses.ID, ses.Slot.Scope, ses.Slot.AgentName, ses.CLI, ses.CLIVersion, ses.Cwd, ses.GitBranch, ses.Model,

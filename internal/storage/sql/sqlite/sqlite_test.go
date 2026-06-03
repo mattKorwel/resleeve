@@ -134,6 +134,45 @@ func TestStore_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestSessions_CreateIdempotent is the regression test for the
+// TOCTOU window in IngestBatch's auto-create-on-first-event path.
+// Two near-simultaneous first-event hooks for the same session must
+// both succeed (and not clobber each other's fields).
+func TestSessions_CreateIdempotent(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+
+	slot := event.Slot{Scope: "scope", AgentName: "default"}
+	original := &rsql.Session{
+		ID:         "S-RACE",
+		Slot:       slot,
+		CLI:        "claude",
+		CLIVersion: "2.1.140",
+		StartedAt:  time.Now().UTC(),
+		Status:     rsql.SessionStatusActive,
+	}
+	if err := st.Sessions().Create(ctx, original); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+
+	// A second Create with the same ID but different fields must not
+	// return an error AND must not overwrite the existing row.
+	racer := *original
+	racer.CLI = "would-have-been-clobbered"
+	racer.CLIVersion = "9.9.9"
+	if err := st.Sessions().Create(ctx, &racer); err != nil {
+		t.Fatalf("second create (idempotent): %v", err)
+	}
+	got, err := st.Sessions().Get(ctx, original.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.CLI != "claude" || got.CLIVersion != "2.1.140" {
+		t.Errorf("idempotent create clobbered existing fields: cli=%q cli_version=%q",
+			got.CLI, got.CLIVersion)
+	}
+}
+
 func TestStore_NotFound(t *testing.T) {
 	ctx := context.Background()
 	st := openTestStore(t)
