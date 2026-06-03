@@ -201,6 +201,19 @@ func (s *sessionStore) Get(ctx context.Context, id string) (*rsql.Session, error
 	return &ses, nil
 }
 
+// SyncEventCount recomputes sessions.event_count from the events
+// table. Recompute (not delta) is intentional — Append is idempotent
+// via INSERT OR IGNORE on (session_id, event_uuid), so re-appending
+// the same batch must not double-count. The COUNT(*) on events is
+// authoritative. A no-op for an unknown session_id (UPDATE matches
+// zero rows, no error).
+func (s *sessionStore) SyncEventCount(ctx context.Context, sessionID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sessions
+		SET event_count = (SELECT COUNT(*) FROM events WHERE session_id = ?)
+		WHERE id = ?`, sessionID, sessionID)
+	return err
+}
+
 // List returns sessions matching f, ordered by started_at DESC.
 func (s *sessionStore) List(ctx context.Context, f rsql.SessionFilter) ([]*rsql.Session, error) {
 	limit := f.Limit

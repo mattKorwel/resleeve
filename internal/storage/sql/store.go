@@ -71,6 +71,12 @@ type SessionStore interface {
 	Create(ctx context.Context, s *Session) error
 	Get(ctx context.Context, id string) (*Session, error)
 	List(ctx context.Context, f SessionFilter) ([]*Session, error)
+	// SyncEventCount recomputes sessions.event_count for the given
+	// session as SELECT COUNT(*) FROM events WHERE session_id = ?.
+	// Recompute (not delta) is intentional: Append is idempotent via
+	// INSERT OR IGNORE, so re-appending the same batch must not
+	// double-count. The COUNT(*) on events is authoritative.
+	SyncEventCount(ctx context.Context, sessionID string) error
 }
 
 // EventStore persists session events. Appends are idempotent on

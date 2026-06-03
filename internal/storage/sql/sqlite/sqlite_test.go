@@ -173,6 +173,95 @@ func TestSessions_CreateIdempotent(t *testing.T) {
 	}
 }
 
+// TestSessions_EventCountSynced is the regression test for the F7 bug
+// where session.event_count remained 0 because nothing updated it
+// after Events.Append. SyncEventCount must reflect the actual COUNT(*)
+// and must be safe against re-Append (Append is INSERT OR IGNORE, so
+// idempotent re-Append must not double-count).
+func TestSessions_EventCountSynced(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+
+	slot := event.Slot{Scope: "scope", AgentName: "default"}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	ses := &rsql.Session{
+		ID:         "S-COUNT",
+		Slot:       slot,
+		CLI:        "claude_code",
+		CLIVersion: "2.1.140",
+		StartedAt:  now,
+		Status:     rsql.SessionStatusActive,
+	}
+	if err := st.Sessions().Create(ctx, ses); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	events := []event.Event{
+		{
+			EventUUID:     "E-COUNT-1",
+			SessionID:     ses.ID,
+			Slot:          slot,
+			Seq:           1,
+			Timestamp:     now,
+			Kind:          event.KindUserMessage,
+			SchemaVersion: 1,
+			Content:       json.RawMessage(`{"text":"one"}`),
+			Vendor:        event.Vendor{Name: "claude_code", Version: "2.1.140"},
+		},
+		{
+			EventUUID:     "E-COUNT-2",
+			SessionID:     ses.ID,
+			Slot:          slot,
+			Seq:           2,
+			Timestamp:     now.Add(time.Second),
+			Kind:          event.KindAssistantMessage,
+			SchemaVersion: 1,
+			Content:       json.RawMessage(`{"text":"two"}`),
+			Vendor:        event.Vendor{Name: "claude_code", Version: "2.1.140"},
+		},
+		{
+			EventUUID:     "E-COUNT-3",
+			SessionID:     ses.ID,
+			Slot:          slot,
+			Seq:           3,
+			Timestamp:     now.Add(2 * time.Second),
+			Kind:          event.KindUserMessage,
+			SchemaVersion: 1,
+			Content:       json.RawMessage(`{"text":"three"}`),
+			Vendor:        event.Vendor{Name: "claude_code", Version: "2.1.140"},
+		},
+	}
+	if err := st.Events().Append(ctx, events); err != nil {
+		t.Fatalf("append events: %v", err)
+	}
+	if err := st.Sessions().SyncEventCount(ctx, ses.ID); err != nil {
+		t.Fatalf("sync event_count: %v", err)
+	}
+	got, err := st.Sessions().Get(ctx, ses.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if got.EventCount != 3 {
+		t.Errorf("after first sync: event_count = %d, want 3", got.EventCount)
+	}
+
+	// Re-append the same batch. INSERT OR IGNORE means rows are not
+	// duplicated; SyncEventCount must therefore still see 3.
+	if err := st.Events().Append(ctx, events); err != nil {
+		t.Fatalf("idempotent re-append: %v", err)
+	}
+	if err := st.Sessions().SyncEventCount(ctx, ses.ID); err != nil {
+		t.Fatalf("sync event_count (re-append): %v", err)
+	}
+	got, err = st.Sessions().Get(ctx, ses.ID)
+	if err != nil {
+		t.Fatalf("get session (re-append): %v", err)
+	}
+	if got.EventCount != 3 {
+		t.Errorf("after re-append: event_count = %d, want 3 (no double-count)", got.EventCount)
+	}
+}
+
 func TestStore_NotFound(t *testing.T) {
 	ctx := context.Background()
 	st := openTestStore(t)

@@ -40,6 +40,14 @@ func (d *Daemon) IngestBatch(ctx context.Context, sessionID string, events []eve
 		return fmt.Errorf("ingest: append events: %w", err)
 	}
 
+	// Recompute sessions.event_count from the events table. Recompute
+	// (rather than +len(events)) is intentional: Append is idempotent
+	// via INSERT OR IGNORE, so retrying the same batch must not
+	// double-count.
+	if err := d.store.Sessions().SyncEventCount(ctx, sessionID); err != nil {
+		return fmt.Errorf("ingest: sync event_count: %w", err)
+	}
+
 	// Heartbeat the slot from the first event. All events in a batch
 	// should share the same slot in practice; if not, the first event's
 	// slot wins for the heartbeat.
