@@ -2,13 +2,16 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"os"
 
 	"github.com/mattkorwel/resleeve/internal/adapter"
 	"github.com/mattkorwel/resleeve/internal/adapter/claude"
 	"github.com/mattkorwel/resleeve/internal/agent"
+	"github.com/mattkorwel/resleeve/internal/event"
 )
 
 // runHook is the "resleeve hook" subcommand. Claude Code's hook system
@@ -51,7 +54,32 @@ func runHook(ctx context.Context, args []string) int {
 
 	client := agent.NewClient(endpoint, secret)
 	_ = client.AppendEvents(ctx, sessionID, events)
+
+	// SessionStart side-channel: fetch the rolled-up memory for this
+	// scope and emit `{"additionalContext": "..."}` on stdout so Claude
+	// Code injects it. Silent no-op when no scope, no daemon-side
+	// memory, or any error along the way (a hook failure must not
+	// crash the harness).
+	if events[0].Kind == event.KindSessionStart {
+		injectContext(ctx, client, events[0].Slot.Scope)
+	}
 	return 0
+}
+
+func injectContext(ctx context.Context, c *agent.Client, scope string) {
+	if scope == "" || scope == "unknown" {
+		return
+	}
+	body, err := c.GetContext(ctx, scope)
+	if err != nil || body == "" {
+		return
+	}
+	out := map[string]string{"additionalContext": body}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return
+	}
+	fmt.Println(string(b))
 }
 
 // pickAdapter returns an adapter.Adapter for the given name. v1 only
