@@ -238,32 +238,99 @@ func runSessionSearch(ctx context.Context, args []string) int {
 // --- session tail ---
 
 func runSessionTail(ctx context.Context, args []string) int {
-	fs := flag.NewFlagSet("session tail", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	fromSeq := fs.Int64("from", 0, "start from seq (0 = beginning)")
-	pollMS := fs.Int("poll-ms", 500, "poll interval for new events")
-	if err := fs.Parse(args); err != nil {
+	// Hand-rolled parsing so flags can appear before OR after the positional
+	// session id (flag.FlagSet stops at the first positional).
+	const usage = "usage: resleeve session tail <session-id> [--limit N] [--from SEQ] [--poll-ms MS]"
+	limit := 50
+	var fromSeq int64
+	pollMS := 500
+	var positional []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--limit":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "session tail: --limit needs a value")
+				return 2
+			}
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "session tail: --limit must be an integer")
+				return 2
+			}
+			limit = n
+			i++
+		case strings.HasPrefix(a, "--limit="):
+			n, err := strconv.Atoi(strings.TrimPrefix(a, "--limit="))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "session tail: --limit must be an integer")
+				return 2
+			}
+			limit = n
+		case a == "--from":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "session tail: --from needs a value")
+				return 2
+			}
+			n, err := strconv.ParseInt(args[i+1], 10, 64)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "session tail: --from must be an integer")
+				return 2
+			}
+			fromSeq = n
+			i++
+		case strings.HasPrefix(a, "--from="):
+			n, err := strconv.ParseInt(strings.TrimPrefix(a, "--from="), 10, 64)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "session tail: --from must be an integer")
+				return 2
+			}
+			fromSeq = n
+		case a == "--poll-ms":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "session tail: --poll-ms needs a value")
+				return 2
+			}
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "session tail: --poll-ms must be an integer")
+				return 2
+			}
+			pollMS = n
+			i++
+		case strings.HasPrefix(a, "--poll-ms="):
+			n, err := strconv.Atoi(strings.TrimPrefix(a, "--poll-ms="))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "session tail: --poll-ms must be an integer")
+				return 2
+			}
+			pollMS = n
+		case strings.HasPrefix(a, "--"):
+			fmt.Fprintf(os.Stderr, "session tail: unknown flag %q\n", a)
+			fmt.Fprintln(os.Stderr, usage)
+			return 2
+		default:
+			positional = append(positional, a)
+		}
+	}
+	if len(positional) != 1 {
+		fmt.Fprintln(os.Stderr, usage)
 		return 2
 	}
-	rest := fs.Args()
-	if len(rest) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: resleeve session tail <session-id>")
-		return 2
-	}
-	sessionID := rest[0]
+	sessionID := positional[0]
 
 	c, err := clientFromEndpoint()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "session tail:", err)
 		return 1
 	}
-	since := *fromSeq
-	interval := time.Duration(*pollMS) * time.Millisecond
+	since := fromSeq
+	interval := time.Duration(pollMS) * time.Millisecond
 	for {
 		if ctx.Err() != nil {
 			return 0
 		}
-		events, err := c.ListEvents(ctx, sessionID, since, 200)
+		events, err := c.ListEvents(ctx, sessionID, since, limit)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return 0
