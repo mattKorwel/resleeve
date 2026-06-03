@@ -155,7 +155,7 @@ The slot model + dedup model means the event schema needs:
 - `session_id` (UUID, per run)
 - `event_uuid` (UUID, per event — bridge-assigned or content-derived)
 - `slot` (object: `{scope, agent_name}`)
-- `seq` (monotonic per session, for ordering within a session)
+- `seq` (monotonic 64-bit ordering value; ties broken by `event_uuid`. SQLite implementation uses `ts.UnixNano()` — see `04-event-schema.md`.)
 - `ts` (timestamp)
 - `kind` (assistant_message | user_message | tool_call | tool_result | thinking | system | session_start | session_end)
 - … plus the OTel-GenAI-aligned content fields enumerated in the schema doc (next).

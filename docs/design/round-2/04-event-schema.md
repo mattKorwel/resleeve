@@ -31,7 +31,7 @@ Every event in the firehose:
 | `event_uuid` | ULID, monotonic. Assigned by the bridge plugin at event creation; deterministic from content hash for the file-watcher safety net so dedup works on `(session_id, event_uuid)`. |
 | `session_id` | ULID of the session this event belongs to. |
 | `slot` | `(scope, agent_name)` tuple per `02-journey-01-decisions.md` Q3. |
-| `seq` | Monotonic int per session; default ordering for replay. |
+| `seq` | Monotonic 64-bit ordering value (int64). The SQLite implementation populates this from `ts.UnixNano()` so events are naturally globally sortable without a per-session counter (no coordination, no `MAX(seq)+1` lookup). Same-nanosecond ties are broken by `event_uuid` ascending. Default ordering for replay. |
 | `turn_id` | ULID identifying the model invocation that produced this event. Multiple events (one `thinking` + one `assistant_message` + two `tool_call`s) share a `turn_id` when they came from one Anthropic-style multi-block response. NULL for events not associated with a model turn (`user_message`, `system`, `tool_result`, `session_start`, `session_end`). |
 | `parent_event_uuid` | Optional. References another event's UUID for DAG semantics (Claude Code's `parentUuid`). Most events don't need it. |
 | `ts` | Event-generation timestamp (ISO 8601, UTC). |
@@ -230,7 +230,7 @@ Every event carries:
 
 ## Ordering
 
-- **Default:** sort by `seq` ascending within a session.
+- **Default:** sort by `seq` ascending, then by `event_uuid` ascending to break same-nanosecond ties.
 - **DAG vendors (Claude Code):** traverse by `parent_event_uuid` if a tree view is desired. Most consumers use `seq`.
 
 ## OTel-GenAI mapping

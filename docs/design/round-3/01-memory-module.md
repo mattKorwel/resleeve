@@ -234,7 +234,12 @@ Claude Code's SessionStart hook accepts a stdout JSON payload with `additionalCo
 - If empty, print nothing.
 - Other hooks unchanged (silent).
 
-Scope derivation in v1: `filepath.Base(cwd)`. Matches the existing slot derivation. Path-defaults config (longest-prefix cwd → scope match) is v2+.
+Scope derivation in v1, in resolution order:
+1. `$RESLEEVE_SCOPE` env var (verbatim override).
+2. `.resleeve-scope` marker file: walk cwd ancestors for the file; if found non-empty, scope = `<marker-content>/<rel-from-marker-dir>`. Lets a project root opt into a hierarchical scope (e.g. `monorepo/svc-billing`) that descendant directories inherit automatically.
+3. `filepath.Base(cwd)`; `"unknown"` if cwd is empty. Matches the existing slot derivation.
+
+Path-defaults config (longest-prefix cwd → scope match via persisted state) remains a v2+ alternative for users who don't want a checked-in marker file.
 
 ## What this changes vs. the existing v1 cut
 
@@ -259,7 +264,7 @@ Scope derivation in v1: `filepath.Base(cwd)`. Matches the existing slot derivati
 2. **Learnings append-only vs editable?** ✅ Resolved: **append-only with soft-supersede chains**. New entries can supersede prior ones (preserved in storage, hidden from default reads). Full history accessible via `?include=superseded`.
 3. **Scope deletion with children?** ✅ Resolved: **refuse**. `DELETE /v1/scope?path=X` returns 409 if children exist; clean up explicitly.
 4. **`.donotinherit` semantics.** ✅ Resolved: **boundary-reset**. The marker scope is included; everything above it is dropped from the walk. Sub-projects under a marker see only themselves + the chain from the marker down.
-5. **Default cwd → scope derivation.** ✅ Resolved: `filepath.Base(cwd)`; `"unknown"` if cwd is empty. Same as the existing slot derivation — no surprise.
+5. **Default cwd → scope derivation.** ✅ Resolved (amended post-v1): three-stage resolution. (a) `$RESLEEVE_SCOPE` env var override. (b) Walk cwd ancestors for a `.resleeve-scope` marker file; if found non-empty, scope = `<marker>/<rel-from-marker-dir>`. (c) `filepath.Base(cwd)`; `"unknown"` if cwd is empty. The amendment landed because v1 validation found that flat `filepath.Base` mapping made nested directories unable to inherit a parent scope's plans/learnings via the SessionStart context-injection path.
 6. **`resleeve plan write` input flow.** ✅ Resolved: **stdin by default** (the 99% case is the agent writing). `--content "..."` and `--file <path>` for inline / file input. `--edit` opt-in opens `$EDITOR` for human convenience.
 7. **Context injection default.** ✅ Resolved: **on by default**. Empty rolled-up context (no plans/learnings on the chain) → bridge emits no `additionalContext` (silent no-op; nothing injected).
 8. **`Scope.Kind` discrete or free-form?** ✅ Resolved: **discrete enum** — `portfolio | program | project | dispatch | agent | other`. Validated at the API layer; DB column stays plain `TEXT` so future kinds are a code change, not a migration.
