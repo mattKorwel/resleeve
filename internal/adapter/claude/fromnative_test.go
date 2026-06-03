@@ -3,11 +3,74 @@ package claude
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/mattkorwel/resleeve/internal/adapter"
 	"github.com/mattkorwel/resleeve/internal/event"
 )
+
+func TestDeriveScope_EnvOverride(t *testing.T) {
+	t.Setenv("RESLEEVE_SCOPE", "monorepo/svc-billing")
+	if got := deriveScope("/anywhere/else"); got != "monorepo/svc-billing" {
+		t.Errorf("env override: got %q, want %q", got, "monorepo/svc-billing")
+	}
+}
+
+func TestDeriveScope_EmptyCwdUnknown(t *testing.T) {
+	t.Setenv("RESLEEVE_SCOPE", "")
+	if got := deriveScope(""); got != "unknown" {
+		t.Errorf("empty cwd: got %q, want %q", got, "unknown")
+	}
+}
+
+func TestDeriveScope_NoMarkerFallbackBase(t *testing.T) {
+	t.Setenv("RESLEEVE_SCOPE", "")
+	dir := t.TempDir()
+	if got := deriveScope(dir); got != filepath.Base(dir) {
+		t.Errorf("no marker: got %q, want %q", got, filepath.Base(dir))
+	}
+}
+
+func TestDeriveScope_MarkerInCwd(t *testing.T) {
+	t.Setenv("RESLEEVE_SCOPE", "")
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ScopeMarkerFile), []byte("monorepo\n"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	if got := deriveScope(dir); got != "monorepo" {
+		t.Errorf("marker in cwd: got %q, want %q", got, "monorepo")
+	}
+}
+
+func TestDeriveScope_MarkerInAncestor(t *testing.T) {
+	t.Setenv("RESLEEVE_SCOPE", "")
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ScopeMarkerFile), []byte("monorepo"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	leaf := filepath.Join(root, "services", "billing")
+	if err := os.MkdirAll(leaf, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	want := "monorepo/services/billing"
+	if got := deriveScope(leaf); got != want {
+		t.Errorf("marker in ancestor: got %q, want %q", got, want)
+	}
+}
+
+func TestDeriveScope_EmptyMarkerIgnored(t *testing.T) {
+	t.Setenv("RESLEEVE_SCOPE", "")
+	dir := t.TempDir()
+	// Empty (whitespace-only) marker should be treated as no marker.
+	if err := os.WriteFile(filepath.Join(dir, ScopeMarkerFile), []byte("   \n\t\n"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	if got := deriveScope(dir); got != filepath.Base(dir) {
+		t.Errorf("empty marker should fall through: got %q, want %q", got, filepath.Base(dir))
+	}
+}
 
 func TestFromNative_Hook_SessionStart(t *testing.T) {
 	a := New()

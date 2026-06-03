@@ -5,13 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mattkorwel/resleeve/internal/adapter"
 	"github.com/mattkorwel/resleeve/internal/event"
 )
+
+// ScopeMarkerFile is the filename resleeve looks for when walking cwd
+// ancestors to resolve a hierarchical scope. See deriveScope.
+const ScopeMarkerFile = ".resleeve-scope"
 
 // hookEnvelope is the JSON Claude Code passes on stdin to a hook command.
 // Fields are a superset across hook event types; unused fields are
@@ -405,11 +411,48 @@ func synthesizeSessionStart(sessionID, cwd, version string, ts time.Time) event.
 
 // --- helpers ---
 
+// deriveScope picks a scope path for an event given its cwd. Resolution
+// order:
+//  1. $RESLEEVE_SCOPE — verbatim override, if set.
+//  2. Walk cwd ancestors for a `.resleeve-scope` marker file. If found
+//     non-empty, scope = <marker-content>/<rel-from-marker-dir>. This lets
+//     a project root opt into a hierarchical scope (e.g. "monorepo/svc-X")
+//     that descendant directories automatically inherit.
+//  3. filepath.Base(cwd), or "unknown" if cwd is empty.
 func deriveScope(cwd string) string {
+	if env := strings.TrimSpace(os.Getenv("RESLEEVE_SCOPE")); env != "" {
+		return env
+	}
 	if cwd == "" {
 		return "unknown"
 	}
+	if marker, dir := findScopeMarker(cwd); marker != "" {
+		rel, err := filepath.Rel(dir, cwd)
+		if err != nil || rel == "." {
+			return marker
+		}
+		return marker + "/" + filepath.ToSlash(rel)
+	}
 	return filepath.Base(cwd)
+}
+
+// findScopeMarker walks cwd up to the filesystem root looking for a
+// ScopeMarkerFile. Returns the trimmed file contents and the directory
+// holding the marker, or ("", "") if none found.
+func findScopeMarker(cwd string) (marker, markerDir string) {
+	dir := cwd
+	for {
+		if b, err := os.ReadFile(filepath.Join(dir, ScopeMarkerFile)); err == nil {
+			if v := strings.TrimSpace(string(b)); v != "" {
+				return v, dir
+			}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", ""
+		}
+		dir = parent
+	}
 }
 
 func mustJSON(v any) json.RawMessage {
