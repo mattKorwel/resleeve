@@ -39,14 +39,14 @@ func (k ScopeKind) Valid() bool {
 // Scope is one node in the memory tree. Path is the slash-separated
 // identity; ancestors are derived from it. See `Ancestors` in walk.go.
 type Scope struct {
-	Path         string
-	Kind         ScopeKind
-	Title        string
-	Description  string
-	Cwd          string
-	DoNotInherit bool
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	Path         string    `json:"path"`
+	Kind         ScopeKind `json:"kind"`
+	Title        string    `json:"title"`
+	Description  string    `json:"description"`
+	Cwd          string    `json:"cwd"`
+	DoNotInherit bool      `json:"do_not_inherit"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 // DefaultPlanSlot is the conventional plan slot name used when the
@@ -56,21 +56,21 @@ const DefaultPlanSlot = "_default"
 // Plan is a named slot of markdown content attached to a scope.
 // (scope, name) is the storage primary key.
 type Plan struct {
-	Scope     string
-	Name      string // DefaultPlanSlot for the conventional one
-	Content   string
-	UpdatedAt time.Time
+	Scope     string    `json:"scope"`
+	Name      string    `json:"name"` // DefaultPlanSlot for the conventional one
+	Content   string    `json:"content"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // Learning is one append-only log entry on a scope. SupersedesID may
 // point at a prior learning this one corrects; the prior entry stays
 // in storage but is hidden from default reads.
 type Learning struct {
-	ID           string
-	Scope        string
-	Content      string
-	SupersedesID *string
-	CreatedAt    time.Time
+	ID           string    `json:"id"`
+	Scope        string    `json:"scope"`
+	Content      string    `json:"content"`
+	SupersedesID *string   `json:"supersedes_id,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // Sentinel errors.

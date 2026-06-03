@@ -44,6 +44,7 @@ func New(ctx context.Context, cfg Config) (*Daemon, error) {
 	d := &Daemon{cfg: cfg, store: store}
 	mux := http.NewServeMux()
 	d.registerRoutes(mux)
+	d.registerMemoryRoutes(mux)
 	d.server = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,

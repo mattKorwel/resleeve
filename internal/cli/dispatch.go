@@ -45,6 +45,14 @@ func Main(args []string) int {
 		return runPurge(ctx, rest)
 	case "usage":
 		return runUsage(ctx, rest)
+	case "scope":
+		return runScope(ctx, rest)
+	case "plan":
+		return runPlan(ctx, rest)
+	case "learning":
+		return runLearning(ctx, rest)
+	case "context":
+		return runContext(ctx, rest)
 	case "help", "--help", "-h":
 		printUsage(os.Stdout)
 		return 0
@@ -68,6 +76,10 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  doctor           print daemon + bridge + CLI status")
 	fmt.Fprintln(w, "  usage            show data-dir size and session count")
 	fmt.Fprintln(w, "  purge            wipe data dir (interactive confirm)")
+	fmt.Fprintln(w, "  scope            create/get/list/delete scope tree entries")
+	fmt.Fprintln(w, "  plan             write/read/list plans (per scope, named slots)")
+	fmt.Fprintln(w, "  learning         append/list per-scope learnings")
+	fmt.Fprintln(w, "  context          print the rolled-up bridge-injectable context for a scope")
 	fmt.Fprintln(w, "  help             show this help")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Other commands ship in later stages — see docs/design/round-3/00-v1-cut.md")
