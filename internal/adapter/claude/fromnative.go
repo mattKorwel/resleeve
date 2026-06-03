@@ -376,6 +376,33 @@ func (a *Adapter) systemFromJSONL(rec *Record, base event.Event, kind string, ev
 	return []event.Event{e}
 }
 
+// synthesizeSessionStart builds a synthetic session_start event for the
+// reconcile (JSONL) path. Claude Code's JSONL stream contains no
+// session_start record, so without this nothing in the reconcile batch
+// would carry KindSessionStart — and createSessionFromFirstEvent in the
+// agent only learns cwd from KindSessionStart content. The synthesized
+// event uses the same deterministic UUID key as the live SessionStart
+// hook ("session_start"), so a session captured live and re-observed via
+// reconcile dedups cleanly under INSERT OR IGNORE.
+func synthesizeSessionStart(sessionID, cwd, version string, ts time.Time) event.Event {
+	content := mustJSON(map[string]any{
+		"cli":    Name,
+		"cwd":    cwd,
+		"source": "reconcile",
+	})
+	return event.Event{
+		EventUUID:     DeterministicEventUUID(sessionID, "session_start"),
+		SessionID:     sessionID,
+		Slot:          event.Slot{Scope: deriveScope(cwd), AgentName: "default"},
+		Seq:           ts.UnixNano() - 1, // sort just before the first observed record
+		Timestamp:     ts,
+		Kind:          event.KindSessionStart,
+		SchemaVersion: 1,
+		Content:       content,
+		Vendor:        event.Vendor{Name: Name, Version: version},
+	}
+}
+
 // --- helpers ---
 
 func deriveScope(cwd string) string {
