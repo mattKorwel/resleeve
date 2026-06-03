@@ -7,6 +7,7 @@ import (
 
 	"github.com/mattkorwel/resleeve/internal/auth"
 	"github.com/mattkorwel/resleeve/internal/event"
+	"github.com/mattkorwel/resleeve/internal/memory"
 )
 
 // ErrNotFound is returned when a queried row does not exist.
@@ -90,6 +91,29 @@ type UserStore interface {
 	UpdateAuth(ctx context.Context, u *auth.User) error
 }
 
+// MemoryStore persists the memory module: scope tree, per-scope
+// plans (named slots), append-only learnings with supersede chains.
+// See docs/design/round-3/01-memory-module.md.
+type MemoryStore interface {
+	// Scopes
+	CreateScope(ctx context.Context, s *memory.Scope) error
+	GetScope(ctx context.Context, path string) (*memory.Scope, error)
+	UpdateScope(ctx context.Context, s *memory.Scope) error
+	DeleteScope(ctx context.Context, path string) error // memory.ErrScopeHasChildren if children exist
+	ListScopes(ctx context.Context) ([]*memory.Scope, error)
+
+	// Plans (named slots, upsert per (scope, name))
+	PutPlan(ctx context.Context, p *memory.Plan) error
+	GetPlan(ctx context.Context, scope, slot string) (*memory.Plan, error)
+	ListPlans(ctx context.Context, scope string) ([]*memory.Plan, error)
+	DeletePlan(ctx context.Context, scope, slot string) error
+
+	// Learnings (append-only with soft-supersede)
+	AppendLearning(ctx context.Context, l *memory.Learning) error
+	GetLearning(ctx context.Context, id string) (*memory.Learning, error)
+	ListLearnings(ctx context.Context, scope string, includeSuperseded bool) ([]*memory.Learning, error)
+}
+
 // Store is the union — each backend exposes the sub-stores via typed
 // accessors. See docs/design/round-2/11-storage-backends.md.
 type Store interface {
@@ -97,5 +121,6 @@ type Store interface {
 	Events() EventStore
 	Slots() SlotStore
 	Users() UserStore
+	Memory() MemoryStore
 	Close() error
 }
