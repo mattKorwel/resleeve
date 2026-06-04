@@ -206,86 +206,21 @@ func runDoctor(ctx context.Context, args []string) int {
 		return runDoctorMigrateKey(ctx)
 	}
 
+	return printDoctorReport(ctx)
+}
+
+// printDoctorReport is the cards body of `resleeve doctor` — sub-helpers
+// per card (Q8 split). Card order matches the original inline body so
+// scraped output stays stable. The final return is the exit code from
+// printHookEnvCard (non-zero on the silent-injection-failure combo).
+func printDoctorReport(ctx context.Context) int {
 	fmt.Println("resleeve doctor")
 	fmt.Println("===============")
 
-	// Data dir
-	dataDir, err := agent.DataDir()
-	if err == nil {
-		st, _ := os.Stat(dataDir)
-		if st == nil {
-			fmt.Printf("  data dir         %s (missing)\n", dataDir)
-		} else {
-			fmt.Printf("  data dir         %s\n", dataDir)
-		}
-	}
-
-	// Daemon
-	daemonRunning, _ := daemonAlive()
-	if daemonRunning {
-		_, pid := daemonAlive()
-		fmt.Printf("  daemon           ✓ running (pid %d)\n", pid)
-		if url, secret, _ := agent.LoadEndpoint(); url != "" {
-			fmt.Printf("  endpoint         %s\n", url)
-			// Try /v1/health.
-			resp, err := http.Get(url + "/v1/health")
-			if err == nil && resp.StatusCode == 200 {
-				resp.Body.Close()
-				fmt.Println("  /v1/health       ✓ 200 OK")
-			} else {
-				fmt.Printf("  /v1/health       ✗ %v\n", err)
-			}
-			// Sealer status: tells the operator whether `resleeve login`
-			// has installed a KEK yet. Sync push/pull is parked while
-			// sealed=false on a daemon with --no-seal-key.
-			if sealReq, _ := http.NewRequest("GET", url+"/v1/seal/status", nil); sealReq != nil {
-				sealReq.Header.Set("Authorization", "Bearer "+secret)
-				if resp, err := http.DefaultClient.Do(sealReq); err == nil {
-					defer resp.Body.Close()
-					var status struct {
-						Sealed    bool `json:"sealed"`
-						SyncReady bool `json:"sync_ready"`
-					}
-					_ = json.NewDecoder(resp.Body).Decode(&status)
-					if status.Sealed {
-						fmt.Println("  sealer           ✓ unlocked")
-					} else {
-						fmt.Println("  sealer           ✗ locked (run `resleeve login`)")
-					}
-				}
-			}
-		}
-	} else {
-		fmt.Println("  daemon           ✗ not running")
-	}
-
-	// Legacy placeholder seal.key. Round-5 retired the auto-load model;
-	// surfacing the file's presence here lets users notice they're still
-	// on the transitional shim. Doctor doesn't error — the file is
-	// merely informational at this point — but does point at the
-	// migration verb. See `resleeve migrate-key` and the
-	// `doctor --migrate-key` cleanup helper.
-	if path := defaultSealKeyPath(); path != "" {
-		if st, err := os.Stat(path); err == nil && st.Mode().IsRegular() {
-			fmt.Printf("  legacy seal.key  ⚠  %s exists — run `resleeve migrate-key` then `resleeve doctor --migrate-key`\n", path)
-		}
-	}
-
-	// Bridge
-	bridgeInstalled := false
-	settingsPath, _ := claudeSettingsPath()
-	if settingsPath != "" {
-		if data, err := os.ReadFile(settingsPath); err == nil {
-			if strings.Contains(string(data), `"_resleeve": true`) {
-				bridgeInstalled = true
-				fmt.Printf("  bridge (claude)  ✓ installed in %s\n", settingsPath)
-			} else {
-				fmt.Printf("  bridge (claude)  ✗ not installed in %s\n", settingsPath)
-			}
-		} else {
-			fmt.Printf("  bridge (claude)  ? settings.json missing\n")
-		}
-	}
+	printDataDir()
+	daemonRunning := printDaemon()
+	printLegacySealKey()
+	bridgeInstalled := printBridge()
 
 	// Sync cards (upstream / slow / fast) — additive helpers; only
 	// useful when the daemon is up since the snapshot lives in-process.
@@ -293,22 +228,128 @@ func runDoctor(ctx context.Context, args []string) int {
 		printSyncCards(ctx)
 	}
 
-	// CLI binary
-	if claudeBin, err := exec.LookPath("claude"); err == nil {
-		fmt.Printf("  claude binary    %s\n", claudeBin)
-	} else {
-		fmt.Println("  claude binary    ✗ not on $PATH")
-	}
-
-	// Resleeve binary self
-	if self, err := os.Executable(); err == nil {
-		fmt.Printf("  resleeve binary  %s\n", self)
-	}
+	printBinaries()
 
 	// Hook-env card: LOUDLY warn when bridge is installed but daemon
 	// is not running — the F13 silent-injection-failure state. Returns
 	// non-zero exit code so scripted callers notice.
 	return printHookEnvCard(bridgeInstalled, daemonRunning)
+}
+
+// printDataDir prints the data-dir card.
+func printDataDir() {
+	dataDir, err := agent.DataDir()
+	if err != nil {
+		return
+	}
+	st, _ := os.Stat(dataDir)
+	if st == nil {
+		fmt.Printf("  data dir         %s (missing)\n", dataDir)
+	} else {
+		fmt.Printf("  data dir         %s\n", dataDir)
+	}
+}
+
+// printDaemon prints the daemon / endpoint / health / sealer cards.
+// Returns whether the daemon is alive so the caller can gate subsequent
+// daemon-dependent cards (sync, hook-env warning).
+func printDaemon() bool {
+	daemonRunning, pid := daemonAlive()
+	if !daemonRunning {
+		fmt.Println("  daemon           ✗ not running")
+		return false
+	}
+	fmt.Printf("  daemon           ✓ running (pid %d)\n", pid)
+
+	url, secret, _ := agent.LoadEndpoint()
+	if url == "" {
+		return true
+	}
+	fmt.Printf("  endpoint         %s\n", url)
+
+	// /v1/health probe.
+	resp, err := http.Get(url + "/v1/health")
+	if err == nil && resp.StatusCode == 200 {
+		resp.Body.Close()
+		fmt.Println("  /v1/health       ✓ 200 OK")
+	} else {
+		fmt.Printf("  /v1/health       ✗ %v\n", err)
+	}
+
+	// Sealer status: tells the operator whether `resleeve login` has
+	// installed a KEK yet. Sync push/pull is parked while sealed=false
+	// on a daemon with --no-seal-key.
+	sealReq, _ := http.NewRequest("GET", url+"/v1/seal/status", nil)
+	if sealReq == nil {
+		return true
+	}
+	sealReq.Header.Set("Authorization", "Bearer "+secret)
+	sealResp, err := http.DefaultClient.Do(sealReq)
+	if err != nil {
+		return true
+	}
+	defer sealResp.Body.Close()
+	var status struct {
+		Sealed    bool `json:"sealed"`
+		SyncReady bool `json:"sync_ready"`
+	}
+	_ = json.NewDecoder(sealResp.Body).Decode(&status)
+	if status.Sealed {
+		fmt.Println("  sealer           ✓ unlocked")
+	} else {
+		fmt.Println("  sealer           ✗ locked (run `resleeve login`)")
+	}
+	return true
+}
+
+// printLegacySealKey surfaces the round-4 placeholder ~/.resleeve/seal.key
+// when present. Round-5 retired the auto-load model; this card lets
+// users notice they're still on the transitional shim. Informational
+// only — the migration verb (`resleeve migrate-key`) does the actual
+// work, and `doctor --migrate-key` is the local cleanup helper.
+func printLegacySealKey() {
+	path := defaultSealKeyPath()
+	if path == "" {
+		return
+	}
+	st, err := os.Stat(path)
+	if err != nil || !st.Mode().IsRegular() {
+		return
+	}
+	fmt.Printf("  legacy seal.key  ⚠  %s exists — run `resleeve migrate-key` then `resleeve doctor --migrate-key`\n", path)
+}
+
+// printBridge prints the claude-settings-bridge card and reports
+// whether the bridge is installed so the caller can feed it into the
+// hook-env warning.
+func printBridge() bool {
+	settingsPath, _ := claudeSettingsPath()
+	if settingsPath == "" {
+		return false
+	}
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		fmt.Printf("  bridge (claude)  ? settings.json missing\n")
+		return false
+	}
+	if strings.Contains(string(data), `"_resleeve": true`) {
+		fmt.Printf("  bridge (claude)  ✓ installed in %s\n", settingsPath)
+		return true
+	}
+	fmt.Printf("  bridge (claude)  ✗ not installed in %s\n", settingsPath)
+	return false
+}
+
+// printBinaries renders the "claude binary" + "resleeve binary" cards.
+func printBinaries() {
+	if claudeBin, err := exec.LookPath("claude"); err == nil {
+		fmt.Printf("  claude binary    %s\n", claudeBin)
+	} else {
+		fmt.Println("  claude binary    ✗ not on $PATH")
+	}
+	if self, err := os.Executable(); err == nil {
+		fmt.Printf("  resleeve binary  %s\n", self)
+	}
 }
 
 // printSyncCards renders the upstream / sync(slow) / sync(fast-sse)

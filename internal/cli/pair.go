@@ -100,7 +100,7 @@ func runPairInvite(ctx context.Context, args []string) int {
 	// never use for sync; revoke it on the way out (success OR error)
 	// so it doesn't linger as a usable bearer credential. Best-effort —
 	// a network failure on the revoke shouldn't mask a successful publish.
-	kek, ephemeralTok, err := unwrapKEKViaLogin(ctx, *upstream, email, pw)
+	kek, ephemeralTok, err := loginAndUnwrapKEK(ctx, *upstream, email, pw, "pair-invite-ephemeral")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "pair invite:", err)
 		return 1
@@ -142,7 +142,7 @@ func runPairInvite(ctx context.Context, args []string) int {
 	// (it's just a public string keyed in the pairing_codes table).
 	codeID := newPublicID(8)
 	params := auth.Argon2idParams{MemoryKiB: 16 * 1024, TimeIters: 2, Parallelism: 1}
-	verifierSalt := deterministicSalt(codeID, "pair-verifier")
+	verifierSalt := auth.PairDeterministicSalt(codeID, auth.PairVerifierLabel)
 	verifierHash := auth.DeriveKey([]byte(pairCode), verifierSalt, params)
 	wrapped, err := kek.Wrap([]byte(pairCode), params)
 	if err != nil {
@@ -257,7 +257,7 @@ func runPairAccept(ctx context.Context, args []string) int {
 	// public half. v1 ships salt = HKDF-Extract over (code_id, "pair-verifier")
 	// so the client can derive it locally from code_id. Implemented
 	// inline as a deterministic salt derivation.
-	verifierSalt := deterministicSalt(*codeID, "pair-verifier")
+	verifierSalt := auth.PairDeterministicSalt(*codeID, auth.PairVerifierLabel)
 	verifierHash := auth.DeriveKey([]byte(pairCode), verifierSalt, params)
 
 	var resp serve.PairClaimResp
@@ -319,38 +319,6 @@ func runPairAccept(ctx context.Context, args []string) int {
 	return 0
 }
 
-// unwrapKEKViaLogin is the shared login-flow helper. Returns the
-// unwrapped KEK + the issued device token. Used by pair invite to fetch
-// the KEK needed to wrap under the pair code without re-prompting.
-func unwrapKEKViaLogin(ctx context.Context, upstream, email, password string) (auth.KEK, string, error) {
-	var chal serve.LoginChallengeResp
-	if err := postJSON(ctx, upstream+"/v2/auth/login-challenge", "",
-		serve.LoginChallengeReq{Email: email}, &chal); err != nil {
-		return auth.KEK{}, "", fmt.Errorf("login-challenge: %w", err)
-	}
-	params := auth.Argon2idParams{
-		MemoryKiB: chal.Params.MemoryKiB, TimeIters: chal.Params.TimeIters, Parallelism: chal.Params.Parallelism,
-	}
-	verifier := auth.DeriveKey([]byte(password), chal.VerifierSalt, params)
-	var resp serve.LoginResp
-	if err := postJSON(ctx, upstream+"/v2/auth/login", "",
-		serve.LoginReq{Email: email, VerifierHash: verifier,
-			Device: serve.DeviceMetadata{Name: "pair-invite-ephemeral"}}, &resp); err != nil {
-		return auth.KEK{}, "", fmt.Errorf("login: %w", err)
-	}
-	wrapped := auth.WrappedKEK{
-		Salt: resp.WrappedKEK.Salt, Nonce: resp.WrappedKEK.Nonce, Ciphertext: resp.WrappedKEK.CT,
-		Params: auth.Argon2idParams{
-			MemoryKiB: resp.Params.MemoryKiB, TimeIters: resp.Params.TimeIters, Parallelism: resp.Params.Parallelism,
-		},
-	}
-	kek, err := wrapped.Unwrap([]byte(password))
-	if err != nil {
-		return auth.KEK{}, "", fmt.Errorf("unwrap kek: %w", err)
-	}
-	return kek, resp.DeviceToken, nil
-}
-
 // newPublicID returns a hex public id used for the pair code's CodeID.
 // 8 random bytes = 16 hex chars. Matches the server's newID(8) shape.
 func newPublicID(nBytes int) string {
@@ -405,20 +373,3 @@ func canonicalizePairCode(s string) string {
 	}
 	return strings.Join(parts, "-")
 }
-
-// deterministicSalt derives a stable 16-byte salt from (code_id, label).
-// The accepter doesn't know the salt the inviter generated, and we
-// don't want a salt-disclosure oracle, so we derive a public-but-bound
-// salt from the public code_id. This is NOT security-critical: the
-// salt's job is just to make verifier hash precomputation per-code
-// distinct; the actual secret is the pair code itself.
-func deterministicSalt(codeID, label string) []byte {
-	h := auth.DeriveKey([]byte(label), []byte(codeID), auth.Argon2idParams{MemoryKiB: 8, TimeIters: 1, Parallelism: 1})
-	if len(h) >= 16 {
-		return h[:16]
-	}
-	return h
-}
-
-// guard against unused imports during partial-implementation phases
-var _ = errors.New

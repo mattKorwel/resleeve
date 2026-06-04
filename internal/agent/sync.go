@@ -213,20 +213,14 @@ func (s *SyncClient) EnqueueEvents(ctx context.Context, events []event.Event) er
 	return nil
 }
 
-// PullNow does one immediate pull cycle. Used by on-demand callers
-// (e.g. `resleeve resume` before resolving) to skip the periodic-pull
-// wait. Slice 2 doesn't wire this into existing verbs yet — see round-4/03.
-func (s *SyncClient) PullNow(ctx context.Context) error {
-	_, err := s.pullAllKindsCounts(ctx)
-	return err
-}
-
-// PullNowCounts is PullNow that returns per-kind ingest counts. Used by
-// the `resleeve sync pull` escape-hatch endpoint so the CLI can print
-// e.g. "pulled 3 sessions, 12 events, 1 memory". Counts are the number
-// of rows successfully dispatched into the local stores during this
-// call; idempotent re-ingests of already-known rows still count (we
-// can't cheaply distinguish them here without per-store change probes).
+// PullNowCounts runs one immediate pull cycle and returns per-kind
+// ingest counts. Used by on-demand callers (e.g. `resleeve resume`
+// before resolving, the `resleeve sync pull` escape-hatch endpoint) to
+// skip the periodic-pull wait. Counts are the number of rows
+// successfully dispatched into the local stores during this call;
+// idempotent re-ingests of already-known rows still count (we can't
+// cheaply distinguish them here without per-store change probes).
+// Callers that don't care about counts can discard the first return.
 func (s *SyncClient) PullNowCounts(ctx context.Context) (map[string]int, error) {
 	return s.pullAllKindsCounts(ctx)
 }

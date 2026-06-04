@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 )
@@ -42,17 +43,21 @@ func printSyncUsage(w *os.File) {
 	fmt.Fprintln(w, "configured (see `resleeve up --upstream URL --upstream-token TOK`).")
 }
 
-// runSyncPush hits POST /v1/sync/push-now. Hand-rolled arg loop (per
-// F8) — accepts no flags today; reject any positional/flag arg so we
-// catch typos like `resleeve sync push --force` early.
+// runSyncPush hits POST /v1/sync/push-now. Accepts no flags today.
+// FlagSet rejects unknown flags and unexpected positionals (caught
+// after Parse) so typos like `resleeve sync push --force` fail early.
 func runSyncPush(ctx context.Context, args []string) int {
-	for _, a := range args {
-		if a == "--help" || a == "-h" {
-			fmt.Println("usage: resleeve sync push")
-			fmt.Println("Drains the local outbox to upstream immediately.")
-			return 0
-		}
-		fmt.Fprintf(os.Stderr, "sync push: unexpected argument %q\n", a)
+	fs := flag.NewFlagSet("sync push", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: resleeve sync push")
+		fmt.Fprintln(os.Stderr, "Drains the local outbox to upstream immediately.")
+	}
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "sync push: unexpected argument %q\n", fs.Arg(0))
 		return 2
 	}
 	c, err := clientFromEndpoint()
@@ -81,13 +86,17 @@ func runSyncPush(ctx context.Context, args []string) int {
 
 // runSyncPull hits POST /v1/sync/pull-now.
 func runSyncPull(ctx context.Context, args []string) int {
-	for _, a := range args {
-		if a == "--help" || a == "-h" {
-			fmt.Println("usage: resleeve sync pull")
-			fmt.Println("Pulls the latest rows from upstream immediately.")
-			return 0
-		}
-		fmt.Fprintf(os.Stderr, "sync pull: unexpected argument %q\n", a)
+	fs := flag.NewFlagSet("sync pull", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: resleeve sync pull")
+		fmt.Fprintln(os.Stderr, "Pulls the latest rows from upstream immediately.")
+	}
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "sync pull: unexpected argument %q\n", fs.Arg(0))
 		return 2
 	}
 	c, err := clientFromEndpoint()

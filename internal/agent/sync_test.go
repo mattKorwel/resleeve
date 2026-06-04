@@ -150,8 +150,8 @@ func TestSyncClient_PullIngestsRowsLocallyAndAdvancesCursor(t *testing.T) {
 	}
 
 	// Pull.
-	if err := sc.PullNow(ctx); err != nil {
-		t.Fatalf("PullNow: %v", err)
+	if _, err := sc.PullNowCounts(ctx); err != nil {
+		t.Fatalf("PullNowCounts: %v", err)
 	}
 
 	// Session should now exist locally.
@@ -200,8 +200,8 @@ func TestSyncClient_PullThenPushDoesNotLoop(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := sc.PullNow(ctx); err != nil {
-		t.Fatalf("PullNow: %v", err)
+	if _, err := sc.PullNowCounts(ctx); err != nil {
+		t.Fatalf("PullNowCounts: %v", err)
 	}
 	if d, _ := store.Sync().OutboxDepth(ctx); d != 0 {
 		t.Errorf("pull side-effect: outbox grew to %d (should be 0 — pull bypasses IngestBatch)", d)
@@ -299,8 +299,8 @@ func TestSyncClient_PullMemoryDispatchesByPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := sc.PullNow(ctx); err != nil {
-		t.Fatalf("PullNow: %v", err)
+	if _, err := sc.PullNowCounts(ctx); err != nil {
+		t.Fatalf("PullNowCounts: %v", err)
 	}
 
 	// Scope should be local now.
@@ -514,8 +514,8 @@ func TestSyncClient_RoundTripWithSealer(t *testing.T) {
 		t.Fatalf("drainOnce A: %v", err)
 	}
 
-	if err := scB.PullNow(ctx); err != nil {
-		t.Fatalf("PullNow B: %v", err)
+	if _, err := scB.PullNowCounts(ctx); err != nil {
+		t.Fatalf("PullNowCounts B: %v", err)
 	}
 
 	gotSes, err := storeB.Sessions().Get(ctx, "S-RT")
@@ -590,8 +590,8 @@ func TestSyncClient_DecryptFailureWithWrongKey(t *testing.T) {
 	}
 
 	// B pulls — every row should fail to decrypt, logged but no crash.
-	if err := scB.PullNow(ctx); err != nil {
-		t.Fatalf("PullNow B (should not crash): %v", err)
+	if _, err := scB.PullNowCounts(ctx); err != nil {
+		t.Fatalf("PullNowCounts B (should not crash): %v", err)
 	}
 
 	// Nothing landed in B.

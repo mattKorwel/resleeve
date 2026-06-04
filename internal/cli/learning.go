@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -84,21 +85,18 @@ func runLearningAppend(ctx context.Context, args []string) int {
 }
 
 func runLearningList(ctx context.Context, args []string) int {
-	inherit := false
-	includeSuperseded := false
-	var positional []string
-	for _, a := range args {
-		switch a {
-		case "--inherit":
-			inherit = true
-		case "--include-superseded":
-			includeSuperseded = true
-		default:
-			positional = append(positional, a)
-		}
-	}
-	if len(positional) != 1 {
+	fs := flag.NewFlagSet("learning list", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	inherit := fs.Bool("inherit", false, "walk the scope chain")
+	includeSuperseded := fs.Bool("include-superseded", false, "include superseded learnings")
+	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: resleeve learning list <scope> [--inherit] [--include-superseded]")
+	}
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
 		return 2
 	}
 	c, err := clientFromEndpoint()
@@ -106,7 +104,7 @@ func runLearningList(ctx context.Context, args []string) int {
 		fmt.Fprintln(os.Stderr, "learning list:", err)
 		return 1
 	}
-	ls, err := c.ListLearnings(ctx, positional[0], inherit, includeSuperseded)
+	ls, err := c.ListLearnings(ctx, fs.Arg(0), *inherit, *includeSuperseded)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "learning list:", err)
 		return 1

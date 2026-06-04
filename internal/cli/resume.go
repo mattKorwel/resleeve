@@ -11,8 +11,20 @@ import (
 	"github.com/mattkorwel/resleeve/internal/adapter"
 	"github.com/mattkorwel/resleeve/internal/adapter/claude"
 	"github.com/mattkorwel/resleeve/internal/adapter/opencode"
+	"github.com/mattkorwel/resleeve/internal/agent"
 	"github.com/mattkorwel/resleeve/internal/event"
+	rsql "github.com/mattkorwel/resleeve/internal/storage/sql"
 )
+
+// resumeOpts is the parsed result of the resume verb's argv.
+type resumeOpts struct {
+	targetCLI   string
+	mode        adapter.RenderMode
+	cwdOverride string
+	printOnly   bool
+	noPull      bool
+	sessionID   string
+}
 
 // runResume implements `resleeve resume <session-id>` per
 // docs/design/round-4/01-conversation-transport.md. Hydrate's the
@@ -20,17 +32,38 @@ import (
 // the native resume command so the user lands inside the CLI as if
 // they had run it themselves.
 //
-// Hand-rolled flag parsing because Go's stdlib `flag` package stops
-// at the first positional, but flags can appear before or after the
-// session id (same shape as scope set / session tail).
+// Split (Q4) into:
+//   - parseResumeArgs   — flag parsing
+//   - resolveSession    — daemon client + GetSession (with on-demand pull)
+//   - hydrateForCLI     — adapter selection + Hydrate (incl. prime PlanContent fetch)
+//   - execOrPrint       — print-only formatting vs syscall.Exec hand-off
 func runResume(ctx context.Context, args []string) int {
+	opts, code := parseResumeArgs(args)
+	if code != 0 {
+		return code
+	}
+
+	c, ses, code := resolveSession(ctx, opts)
+	if code != 0 {
+		return code
+	}
+
+	a, view, result, code := hydrateForCLI(ctx, c, ses, opts)
+	if code != 0 {
+		return code
+	}
+
+	return execOrPrint(ctx, a, view, result, opts)
+}
+
+// parseResumeArgs is intentionally hand-rolled: stdlib `flag` stops at
+// the first positional, but `resleeve resume` accepts flags before AND
+// after the session id (same shape as `scope set`, `session tail`).
+// Returns a non-zero exit code on usage error.
+func parseResumeArgs(args []string) (resumeOpts, int) {
 	var (
-		targetCLI   string
-		modeStr     string
-		cwdOverride string
-		printOnly   bool
-		noPull      bool
-		sessionID   string
+		opts    resumeOpts
+		modeStr string
 	)
 
 	i := 0
@@ -38,10 +71,10 @@ func runResume(ctx context.Context, args []string) int {
 		a := args[i]
 		switch {
 		case a == "--cli" && i+1 < len(args):
-			targetCLI = args[i+1]
+			opts.targetCLI = args[i+1]
 			i += 2
 		case strings.HasPrefix(a, "--cli="):
-			targetCLI = strings.TrimPrefix(a, "--cli=")
+			opts.targetCLI = strings.TrimPrefix(a, "--cli=")
 			i++
 		case a == "--mode" && i+1 < len(args):
 			modeStr = args[i+1]
@@ -50,71 +83,85 @@ func runResume(ctx context.Context, args []string) int {
 			modeStr = strings.TrimPrefix(a, "--mode=")
 			i++
 		case a == "--cwd" && i+1 < len(args):
-			cwdOverride = args[i+1]
+			opts.cwdOverride = args[i+1]
 			i += 2
 		case strings.HasPrefix(a, "--cwd="):
-			cwdOverride = strings.TrimPrefix(a, "--cwd=")
+			opts.cwdOverride = strings.TrimPrefix(a, "--cwd=")
 			i++
 		case a == "--print":
-			printOnly = true
+			opts.printOnly = true
 			i++
 		case a == "--no-pull":
-			noPull = true
+			opts.noPull = true
 			i++
 		case strings.HasPrefix(a, "-"):
 			fmt.Fprintf(os.Stderr, "resume: unknown flag %q\n", a)
 			resumeUsage(os.Stderr)
-			return 2
+			return opts, 2
 		default:
-			if sessionID != "" {
+			if opts.sessionID != "" {
 				fmt.Fprintln(os.Stderr, "resume: only one <session-id> may be given")
 				resumeUsage(os.Stderr)
-				return 2
+				return opts, 2
 			}
-			sessionID = a
+			opts.sessionID = a
 			i++
 		}
 	}
 
-	if sessionID == "" {
+	if opts.sessionID == "" {
 		resumeUsage(os.Stderr)
-		return 2
+		return opts, 2
 	}
 
-	mode := adapter.RenderModeAuto
 	switch modeStr {
 	case "", "auto":
-		// default
+		opts.mode = adapter.RenderModeAuto
 	case "replay":
-		mode = adapter.RenderModeReplay
+		opts.mode = adapter.RenderModeReplay
 	case "prime":
-		mode = adapter.RenderModePrime
+		opts.mode = adapter.RenderModePrime
 	default:
 		fmt.Fprintf(os.Stderr, "resume: invalid --mode %q (expected replay or prime)\n", modeStr)
-		return 2
+		return opts, 2
 	}
 
+	return opts, 0
+}
+
+// resolveSession opens a daemon client, kicks off an opportunistic
+// on-demand pull (unless --no-pull was given), and fetches the session
+// the caller asked for. Returns the client so the caller can keep using
+// it (e.g. for prime-mode PlanContent fetch and pagination of events).
+func resolveSession(ctx context.Context, opts resumeOpts) (*agent.Client, *rsql.Session, int) {
 	c, err := clientFromEndpoint()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "resume:", err)
-		return 1
+		return nil, nil, 1
 	}
 
 	// Best-effort pre-pull so resume reflects the freshest upstream
 	// state (e.g., a session captured on another machine seconds ago).
 	// Falls back to local state on timeout/unreachable — see
 	// docs/design/round-4/03-rehydrate-ux.md §"Failure modes".
-	if !noPull {
+	if !opts.noPull {
 		tryOnDemandPull(ctx, c, defaultOnDemandPullTimeout, os.Stderr)
 	}
 
-	ses, err := c.GetSession(ctx, sessionID)
+	ses, err := c.GetSession(ctx, opts.sessionID)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "resume: get session:", err)
-		return 1
+		return nil, nil, 1
 	}
+	return c, ses, 0
+}
 
-	cliName := targetCLI
+// hydrateForCLI picks the right adapter for the session, builds the
+// SessionView, fetches prime-mode PlanContent if applicable, and
+// dispatches Hydrate. Returns the adapter + view + Hydrate result so
+// execOrPrint can build the native-resume command on top.
+func hydrateForCLI(ctx context.Context, c *agent.Client, ses *rsql.Session, opts resumeOpts) (adapter.Adapter, adapter.SessionView, *adapter.HydrateResult, int) {
+	cliName := opts.targetCLI
 	if cliName == "" {
 		cliName = ses.CLI
 	}
@@ -122,6 +169,7 @@ func runResume(ctx context.Context, args []string) int {
 		cliName = claude.Name
 	}
 
+	mode := opts.mode
 	var a adapter.Adapter
 	switch cliName {
 	case claude.Name:
@@ -137,7 +185,7 @@ func runResume(ctx context.Context, args []string) int {
 		}
 	default:
 		fmt.Fprintf(os.Stderr, "resume: no adapter registered for cli %q\n", cliName)
-		return 1
+		return nil, adapter.SessionView{}, nil, 1
 	}
 
 	view := adapter.SessionView{
@@ -149,48 +197,60 @@ func runResume(ctx context.Context, args []string) int {
 		Model:       ses.Model,
 		StartedAt:   ses.StartedAt,
 		EndedAt:     ses.EndedAt,
-		EventStream: func() ([]event.Event, error) { return loadAllEvents(ctx, c, sessionID) },
+		EventStream: func() ([]event.Event, error) { return loadAllEvents(ctx, c, opts.sessionID) },
 	}
 
-	// Prime mode renders a "## Plan" section from the session's scope's
-	// rolled-up memory context (item #8 on the polish punch list). We
-	// fetch via the same daemon endpoint the SessionStart hook uses
-	// (GET /v1/context); replay mode skips this entirely (the section
-	// is prime-only). Empty / "unknown" scopes are skipped: BuildContext
-	// would have nothing useful to return and "unknown" is a sentinel
-	// the slot writer uses when the source CLI never sent a scope.
-	var planContent string
-	if mode == adapter.RenderModePrime {
-		scope := ses.Slot.Scope
-		if scope != "" && scope != "unknown" {
-			ctxBody, ctxErr := c.GetContext(ctx, scope)
-			if ctxErr != nil {
-				// Non-fatal: prime can still render with an empty plan.
-				fmt.Fprintf(os.Stderr, "resume: warning: fetch context for scope %q: %v\n", scope, ctxErr)
-			} else {
-				planContent = ctxBody
-			}
-		}
-	}
+	planContent := fetchPrimePlan(ctx, c, ses, mode)
 
-	result, err := a.Hydrate(ctx, view, adapter.HydrateOpts{Mode: mode, Cwd: cwdOverride, PlanContent: planContent})
+	result, err := a.Hydrate(ctx, view, adapter.HydrateOpts{Mode: mode, Cwd: opts.cwdOverride, PlanContent: planContent})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "resume: hydrate:", err)
-		return 1
+		return nil, adapter.SessionView{}, nil, 1
 	}
 
 	fmt.Fprintf(os.Stderr, "✓ hydrated to %s (%s mode)\n", result.Path, result.Mode)
 	for _, note := range result.Notes {
 		fmt.Fprintf(os.Stderr, "  ⚠ %s\n", note)
 	}
+	return a, view, &result, 0
+}
 
-	cmd, cmdArgs, err := a.NativeResumeCmd(ctx, view, result)
+// fetchPrimePlan renders a "## Plan" section from the session's scope's
+// rolled-up memory context (item #8 on the polish punch list) by hitting
+// the same daemon endpoint the SessionStart hook uses (GET /v1/context).
+// Replay mode skips this entirely (the section is prime-only). Empty /
+// "unknown" scopes are skipped: BuildContext would have nothing useful
+// to return and "unknown" is a sentinel the slot writer uses when the
+// source CLI never sent a scope. Failures are non-fatal — prime can
+// still render with an empty plan.
+func fetchPrimePlan(ctx context.Context, c *agent.Client, ses *rsql.Session, mode adapter.RenderMode) string {
+	if mode != adapter.RenderModePrime {
+		return ""
+	}
+	scope := ses.Slot.Scope
+	if scope == "" || scope == "unknown" {
+		return ""
+	}
+	ctxBody, ctxErr := c.GetContext(ctx, scope)
+	if ctxErr != nil {
+		fmt.Fprintf(os.Stderr, "resume: warning: fetch context for scope %q: %v\n", scope, ctxErr)
+		return ""
+	}
+	return ctxBody
+}
+
+// execOrPrint either prints the native resume command (--print) or
+// syscall.Exec's into it so the target CLI inherits this process's tty,
+// signals, and env cleanly. After a successful Exec, nothing in this
+// process runs again.
+func execOrPrint(ctx context.Context, a adapter.Adapter, view adapter.SessionView, result *adapter.HydrateResult, opts resumeOpts) int {
+	cmd, cmdArgs, err := a.NativeResumeCmd(ctx, view, *result)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "resume: native resume command:", err)
 		return 1
 	}
 
-	if printOnly {
+	if opts.printOnly {
 		// Print in a shell-paste-friendly form.
 		fmt.Println(strings.Join(append([]string{cmd}, cmdArgs...), " "))
 		return 0
@@ -202,8 +262,6 @@ func runResume(ctx context.Context, args []string) int {
 		fmt.Fprintf(os.Stderr, "       (re-run with --print to get the command and execute it yourself)\n")
 		return 1
 	}
-	// Exec replaces our process so the target CLI inherits the tty,
-	// signals, and env cleanly. Anything after this line does not run.
 	if err := syscall.Exec(cmdPath, append([]string{cmd}, cmdArgs...), os.Environ()); err != nil {
 		fmt.Fprintln(os.Stderr, "resume: exec:", err)
 		return 1

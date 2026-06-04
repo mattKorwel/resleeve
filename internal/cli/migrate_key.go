@@ -103,7 +103,7 @@ func runMigrateKey(ctx context.Context, args []string) int {
 		return 1
 	}
 
-	newKEK, deviceToken, err := loginAndUnwrapKEK(ctx, *upstream, email, pw)
+	newKEK, deviceToken, err := loginAndUnwrapKEK(ctx, *upstream, email, pw, hostnameOrDefault())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "migrate-key:", err)
 		return 1
@@ -264,44 +264,6 @@ func pushBatch(ctx context.Context, httpc *http.Client, upstream, token string, 
 		return fmt.Errorf("push: status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	return nil
-}
-
-// loginAndUnwrapKEK runs the same challenge → login → unwrap sequence
-// as `resleeve login`, but returns the raw KEK bytes (plus the fresh
-// device token) so callers can use the KEK directly for re-encryption
-// instead of just shoving it at the daemon. Splitting this out avoids
-// reaching into runLogin's interactive prompt + stdout flow.
-func loginAndUnwrapKEK(ctx context.Context, upstream, email, pw string) (auth.KEK, string, error) {
-	var chal serve.LoginChallengeResp
-	if err := postJSON(ctx, upstream+"/v2/auth/login-challenge", "",
-		serve.LoginChallengeReq{Email: email}, &chal); err != nil {
-		return auth.KEK{}, "", fmt.Errorf("login challenge: %w", err)
-	}
-	params := auth.Argon2idParams{
-		MemoryKiB:   chal.Params.MemoryKiB,
-		TimeIters:   chal.Params.TimeIters,
-		Parallelism: chal.Params.Parallelism,
-	}
-	verifier := auth.DeriveKey([]byte(pw), chal.VerifierSalt, params)
-	var resp serve.LoginResp
-	if err := postJSON(ctx, upstream+"/v2/auth/login", "",
-		serve.LoginReq{Email: email, VerifierHash: verifier,
-			Device: serve.DeviceMetadata{Name: hostnameOrDefault()}}, &resp); err != nil {
-		return auth.KEK{}, "", fmt.Errorf("login: %w", err)
-	}
-	wrapped := auth.WrappedKEK{
-		Salt: resp.WrappedKEK.Salt, Nonce: resp.WrappedKEK.Nonce, Ciphertext: resp.WrappedKEK.CT,
-		Params: auth.Argon2idParams{
-			MemoryKiB:   resp.Params.MemoryKiB,
-			TimeIters:   resp.Params.TimeIters,
-			Parallelism: resp.Params.Parallelism,
-		},
-	}
-	kek, err := wrapped.Unwrap([]byte(pw))
-	if err != nil {
-		return auth.KEK{}, "", fmt.Errorf("unwrap KEK (likely wrong password): %w", err)
-	}
-	return kek, resp.DeviceToken, nil
 }
 
 // runDoctorMigrateKey implements `resleeve doctor --migrate-key`. It is

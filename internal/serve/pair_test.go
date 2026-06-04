@@ -217,15 +217,13 @@ func chunkBase32(b []byte, width int) string {
 	return strings.Join(parts, "-")
 }
 
-// deterministicSaltForTest mirrors cli/pair.go's deterministicSalt
-// (kept in the test package so we don't import the cli package from
-// internal/serve, which would create a circular import).
+// deterministicSaltForTest used to mirror cli/pair.go's deterministicSalt
+// by hand — Q10 caught the silent-drift risk and moved the derivation
+// to auth.PairDeterministicSalt so both production callers (CLI inviter +
+// accepter) and these tests share one source of truth. Thin alias kept
+// to minimise diff to existing call sites.
 func deterministicSaltForTest(codeID, label string) []byte {
-	h := auth.DeriveKey([]byte(label), []byte(codeID), auth.Argon2idParams{MemoryKiB: 8, TimeIters: 1, Parallelism: 1})
-	if len(h) >= 16 {
-		return h[:16]
-	}
-	return h
+	return auth.PairDeterministicSalt(codeID, label)
 }
 
 // --- sec-H2: pair-claim failed-attempt rate-limit ---

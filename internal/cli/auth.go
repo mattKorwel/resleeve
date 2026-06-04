@@ -10,11 +10,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/mattkorwel/resleeve/internal/auth"
 	"github.com/mattkorwel/resleeve/internal/serve"
@@ -435,17 +433,3 @@ func promptPassword(prompt string) (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
-// urlWithQuery appends a query string to base, handling existing '?'.
-// Shared helper used by pair.go (now its own file).
-func urlWithQuery(base string, q url.Values) string {
-	if len(q) == 0 {
-		return base
-	}
-	if strings.Contains(base, "?") {
-		return base + "&" + q.Encode()
-	}
-	return base + "?" + q.Encode()
-}
-
-// keep time import used (will be in commit 3)
-var _ = time.Now

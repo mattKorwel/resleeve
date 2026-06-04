@@ -23,7 +23,7 @@ import (
 // We don't drive runPairInvite directly (it prompts on stdin); instead we
 // exercise the two pieces that the runPairInvite cleanup composes:
 //
-//  1. unwrapKEKViaLogin — the shared helper that mints the ephemeral token,
+//  1. loginAndUnwrapKEK — the shared helper that mints the ephemeral token,
 //     called by runPairInvite at the top of its flow.
 //  2. POST /v2/auth/logout with that token — the exact call our deferred
 //     cleanup makes.
@@ -31,7 +31,7 @@ import (
 // The assertion is "the server saw a logout for the same bearer that
 // login minted." That's the entire contract under test.
 func TestPairInvite_RevokesEphemeralToken(t *testing.T) {
-	// --- Fake just enough of the auth surface to drive unwrapKEKViaLogin
+	// --- Fake just enough of the auth surface to drive loginAndUnwrapKEK
 	// and to record the revoke.
 	const (
 		email    = "inv@b.com"
@@ -97,9 +97,9 @@ func TestPairInvite_RevokesEphemeralToken(t *testing.T) {
 	// --- Drive the login leg the way runPairInvite does.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	kek, tok, err := unwrapKEKViaLogin(ctx, ts.URL, email, password)
+	kek, tok, err := loginAndUnwrapKEK(ctx, ts.URL, email, password, "pair-invite-ephemeral")
 	if err != nil {
-		t.Fatalf("unwrapKEKViaLogin: %v", err)
+		t.Fatalf("loginAndUnwrapKEK: %v", err)
 	}
 	if kek != signup.KEK {
 		t.Fatal("unwrapped KEK differs from registered KEK")

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -163,38 +164,28 @@ func editFromEditor(ctx context.Context, scope, slot string) (string, error) {
 }
 
 func runPlanRead(ctx context.Context, args []string) int {
-	scope := ""
-	slot := ""
-	inherit := false
-	var positional []string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		switch {
-		case a == "--slot":
-			if i+1 < len(args) {
-				slot = args[i+1]
-				i++
-			}
-		case strings.HasPrefix(a, "--slot="):
-			slot = strings.TrimPrefix(a, "--slot=")
-		case a == "--inherit":
-			inherit = true
-		default:
-			positional = append(positional, a)
-		}
-	}
-	if len(positional) != 1 {
+	fs := flag.NewFlagSet("plan read", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	slot := fs.String("slot", "", "plan slot (default _default)")
+	inherit := fs.Bool("inherit", false, "walk the scope chain")
+	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "usage: resleeve plan read <scope> [--slot N] [--inherit]")
+	}
+	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	scope = positional[0]
+	if fs.NArg() != 1 {
+		fs.Usage()
+		return 2
+	}
+	scope := fs.Arg(0)
 	c, err := clientFromEndpoint()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plan read:", err)
 		return 1
 	}
-	if inherit {
-		plans, err := c.GetPlanInherited(ctx, scope, slot)
+	if *inherit {
+		plans, err := c.GetPlanInherited(ctx, scope, *slot)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "plan read:", err)
 			return 1
@@ -208,7 +199,7 @@ func runPlanRead(ctx context.Context, args []string) int {
 		}
 		return 0
 	}
-	p, err := c.GetPlan(ctx, scope, slot)
+	p, err := c.GetPlan(ctx, scope, *slot)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plan read:", err)
 		return 1
