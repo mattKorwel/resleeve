@@ -56,14 +56,29 @@ func runHook(ctx context.Context, args []string) int {
 	_ = client.AppendEvents(ctx, sessionID, events)
 
 	// SessionStart side-channel: fetch the rolled-up memory for this
-	// scope and emit `{"additionalContext": "..."}` on stdout so Claude
-	// Code injects it. Silent no-op when no scope, no daemon-side
+	// scope and emit the matcher-wrapped hookSpecificOutput envelope
+	// Claude Code expects so the additionalContext gets injected into
+	// the conversation. Silent no-op when no scope, no daemon-side
 	// memory, or any error along the way (a hook failure must not
 	// crash the harness).
 	if events[0].Kind == event.KindSessionStart {
 		injectContext(ctx, client, events[0].Slot.Scope)
 	}
 	return 0
+}
+
+// sessionStartHookOutput is the JSON envelope Claude Code expects from
+// a SessionStart hook to inject additionalContext into the conversation.
+// Shape comes from Claude Code's hook contract: the flat
+// {"additionalContext": "..."} form (which a v1 dogfood iteration of
+// this code emitted) is silently dropped by current CC versions.
+type sessionStartHookOutput struct {
+	HookSpecificOutput hookSpecificOutput `json:"hookSpecificOutput"`
+}
+
+type hookSpecificOutput struct {
+	HookEventName     string `json:"hookEventName"`
+	AdditionalContext string `json:"additionalContext"`
 }
 
 func injectContext(ctx context.Context, c *agent.Client, scope string) {
@@ -74,7 +89,12 @@ func injectContext(ctx context.Context, c *agent.Client, scope string) {
 	if err != nil || body == "" {
 		return
 	}
-	out := map[string]string{"additionalContext": body}
+	out := sessionStartHookOutput{
+		HookSpecificOutput: hookSpecificOutput{
+			HookEventName:     "SessionStart",
+			AdditionalContext: body,
+		},
+	}
 	b, err := json.Marshal(out)
 	if err != nil {
 		return
