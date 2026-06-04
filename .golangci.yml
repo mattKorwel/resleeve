@@ -1,0 +1,18 @@
+version: "2"
+
+# golangci-lint v2 config. Conservative baseline — enable govet,
+# ineffassign, staticcheck, unused; defer errcheck to a follow-up sweep
+# (~25 unchecked Close()/Fprintln() returns across the tree, mostly in
+# deferred-cleanup paths where the error is not actionable).
+#
+# When errcheck is re-enabled, the cleanest fix is `_ = f.Close()` at
+# every site, plus migrating tests to `t.Cleanup(func() { _ = resp.Body.Close() })`.
+# Tracked as a code-quality follow-up.
+
+linters:
+  default: none
+  enable:
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
