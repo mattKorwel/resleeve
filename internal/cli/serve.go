@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/mattkorwel/resleeve/internal/serve"
@@ -107,6 +109,9 @@ func runServe(ctx context.Context, args []string) int {
 	}
 
 	fmt.Fprintf(os.Stderr, "resleeve serve listening on http://%s\n", addr)
+	if !addrIsLoopback(addr) {
+		fmt.Fprintf(os.Stderr, "  WARNING  --addr %s is not loopback — operator: confirm you've fronted this with TLS + auth\n", addr)
+	}
 	fmt.Fprintf(os.Stderr, "  backend  local-disk at %s\n", backend.Root())
 	fmt.Fprintln(os.Stderr, "  auth     bearer (token gated)")
 	fmt.Fprintln(os.Stderr, "  routes   POST /v2/sync/push  GET /v2/sync/pull  GET /v2/sync/sse  GET /v2/sync/health")
@@ -143,4 +148,28 @@ func generateToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// addrIsLoopback reports whether a listen address binds the loopback
+// interface only. Anything else gets a startup-warning so the operator
+// confirms they've fronted resleeve serve with TLS + auth. Unparseable
+// addresses (or bare port forms like ":7860") are treated as NON-loopback
+// — the safe default for "I'm not sure" is "warn the operator".
+func addrIsLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
 }

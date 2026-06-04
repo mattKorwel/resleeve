@@ -425,7 +425,7 @@ func promptPassword(prompt string) (string, error) {
 }
 
 // urlWithQuery appends a query string to base, handling existing '?'.
-// Kept for use by pair.go in commit 3.
+// Shared helper used by pair.go (now its own file).
 func urlWithQuery(base string, q url.Values) string {
 	if len(q) == 0 {
 		return base

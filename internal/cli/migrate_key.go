@@ -153,12 +153,15 @@ func runMigrateKey(ctx context.Context, args []string) int {
 		fmt.Println("migrate-key: daemon sealer rotated ✓")
 	}
 
-	// 5) Next-steps. Explicit user confirmation required to delete.
+	// 5) Next-steps. The placeholder seal.key is now retired by the
+	// interactive helper, which also gates on the daemon being down.
+	// We don't do it inline here because this verb may run while the
+	// daemon is still sealing under the old key (it just got its
+	// sealer rotated above).
 	fmt.Println()
-	fmt.Printf("Next: verify a `resleeve session list` / `resleeve resume` works, then\n")
-	fmt.Printf("delete the legacy placeholder with:\n")
-	fmt.Printf("  rm %s\n", *sealKey)
-	fmt.Println("Or run `resleeve doctor --migrate-key` to be prompted interactively.")
+	fmt.Println("Next: verify `resleeve session list` / `resleeve resume` works, then")
+	fmt.Println("retire the legacy placeholder:")
+	fmt.Println("  resleeve down && resleeve doctor --migrate-key")
 	return 0
 }
 

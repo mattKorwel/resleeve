@@ -131,10 +131,6 @@ func (a *Adapter) Hydrate(ctx context.Context, session adapter.SessionView, opts
 // prompt to opencode. opencode's actual prompt-file flag is TBD;
 // this returns `opencode --prompt-file <path>` as a stub the operator
 // can override (or run via --print and pipe themselves).
-//
-// TODO(v3): once opencode's CLI surface is pinned, swap to whatever
-// the canonical flag turns out to be — likely `opencode run --prompt
-// <file>` or stdin via `-`.
 func (a *Adapter) NativeResumeCmd(ctx context.Context, session adapter.SessionView, result adapter.HydrateResult) (string, []string, error) {
 	if result.Mode != adapter.RenderModePrime {
 		return "", nil, fmt.Errorf("opencode.NativeResumeCmd: unsupported mode %q (only prime)", result.Mode)

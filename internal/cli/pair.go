@@ -221,7 +221,11 @@ func runPairAccept(ctx context.Context, args []string) int {
 	if err != nil {
 		return 1
 	}
-	pairCode = strings.ToUpper(strings.TrimSpace(pairCode))
+	// Canonicalize: ToUpper + TrimSpace + strip dashes, then re-insert
+	// dashes in the inviter's 4-4-4 shape. The verifier hash is keyed
+	// on the dashed form (formatPairCode emits it that way) so a user
+	// pasting the code without dashes would otherwise mismatch.
+	pairCode = canonicalizePairCode(pairCode)
 	if pairCode == "" {
 		fmt.Fprintln(os.Stderr, "pair accept: empty pair code")
 		return 1
@@ -377,6 +381,27 @@ func formatPairCode(b []byte) string {
 			end = len(enc)
 		}
 		parts = append(parts, enc[i:end])
+	}
+	return strings.Join(parts, "-")
+}
+
+// canonicalizePairCode normalizes a user-supplied pair code to the
+// inviter-formatted shape ("XXXX-XXXX-XXXX"). Accepts the same code
+// with or without dashes, with surrounding whitespace, in any case.
+// Returns "" if the input is empty after stripping.
+func canonicalizePairCode(s string) string {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, "-", "")
+	if s == "" {
+		return ""
+	}
+	var parts []string
+	for i := 0; i < len(s); i += 4 {
+		end := i + 4
+		if end > len(s) {
+			end = len(s)
+		}
+		parts = append(parts, s[i:end])
 	}
 	return strings.Join(parts, "-")
 }
