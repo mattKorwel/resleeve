@@ -393,6 +393,60 @@ func TestSyncClient_SealedBlobsAreOpaqueOnUpstream(t *testing.T) {
 	}
 }
 
+// TestSyncClient_SealedMemoryBlobsAreOpaqueOnUpstream is the regression
+// for a hot-fix found during cross-machine validation: slice 3 added
+// EnqueueScope/Plan/Learning in parallel with slice 2.5's encryption
+// wrap, and the memory enqueue paths did NOT initially seal their
+// blobs. This test guards against that gap so the zero-knowledge
+// promise holds for the memory tier the persona values most.
+func TestSyncClient_SealedMemoryBlobsAreOpaqueOnUpstream(t *testing.T) {
+	ctx := context.Background()
+	ts, backend := newSyncTestServer(t)
+	store := newSyncTestStore(t)
+	sealer := newTestSealer(t)
+	sc := NewSyncClientWithSealer(store, ts.URL, testSyncToken, sealer)
+
+	const markerTitle = "TOPSECRET-SCOPE-TITLE-1234"
+	const markerPlan = "PLAINTEXT-PLAN-PASSWORD-5678"
+	const markerLearning = "PLAINTEXT-LEARNING-API-KEY-9999"
+
+	scope := &memory.Scope{Path: "secret-project", Kind: memory.ScopeKindProject, Title: markerTitle}
+	plan := &memory.Plan{Scope: "secret-project", Name: memory.DefaultPlanSlot, Content: markerPlan}
+	learning := &memory.Learning{ID: "L_seal_test", Scope: "secret-project", Content: markerLearning}
+
+	if err := sc.EnqueueScope(ctx, scope); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.EnqueuePlan(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.EnqueueLearning(ctx, learning); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.drainOnce(ctx); err != nil {
+		t.Fatalf("drainOnce: %v", err)
+	}
+
+	keys, _, err := backend.List(ctx, "memory", "", 100)
+	if err != nil {
+		t.Fatalf("backend list: %v", err)
+	}
+	if len(keys) != 3 {
+		t.Fatalf("backend memory rows: got %d, want 3", len(keys))
+	}
+	for _, k := range keys {
+		blob, err := backend.Get(ctx, k)
+		if err != nil {
+			t.Fatalf("backend.Get %s: %v", k, err)
+		}
+		for _, marker := range []string{markerTitle, markerPlan, markerLearning, "secret-project"} {
+			if bytes.Contains(blob, []byte(marker)) {
+				t.Errorf("upstream blob %q leaks plaintext %q", k, marker)
+			}
+		}
+	}
+}
+
 // TestSyncClient_RoundTripWithSealer pushes encrypted on client A and
 // verifies client B (same key, distinct store) decrypts and ingests
 // the event with original fields intact.

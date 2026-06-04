@@ -391,6 +391,13 @@ func (s *SyncClient) ingestPulled(ctx context.Context, kind string, blob []byte)
 // All operations are idempotent against the local memory store, so
 // replaying the same row (e.g. SSE backlog + live) is safe.
 func (s *SyncClient) ingestMemoryRow(ctx context.Context, key string, blob []byte) error {
+	if s.sealer != nil {
+		opened, err := s.sealer.Open(blob)
+		if err != nil {
+			return fmt.Errorf("sync: open memory blob %q: %w", key, err)
+		}
+		blob = opened
+	}
 	rest := strings.TrimPrefix(key, "memory/")
 	if rest == key {
 		return fmt.Errorf("not a memory key: %q", key)
@@ -437,6 +444,12 @@ func (s *SyncClient) EnqueueScope(ctx context.Context, scope *memory.Scope) erro
 	if err != nil {
 		return fmt.Errorf("sync: marshal scope: %w", err)
 	}
+	if s.sealer != nil {
+		blob, err = s.sealer.Seal(blob)
+		if err != nil {
+			return fmt.Errorf("sync: seal scope: %w", err)
+		}
+	}
 	key := "memory/" + encodeScopePath(scope.Path)
 	return s.store.Sync().EnqueueOutbox(ctx, "memory", key, blob, time.Now().UTC())
 }
@@ -451,6 +464,12 @@ func (s *SyncClient) EnqueuePlan(ctx context.Context, plan *memory.Plan) error {
 	if err != nil {
 		return fmt.Errorf("sync: marshal plan: %w", err)
 	}
+	if s.sealer != nil {
+		blob, err = s.sealer.Seal(blob)
+		if err != nil {
+			return fmt.Errorf("sync: seal plan: %w", err)
+		}
+	}
 	key := "memory/" + encodeScopePath(plan.Scope) + "/plans/" + plan.Name
 	return s.store.Sync().EnqueueOutbox(ctx, "memory", key, blob, time.Now().UTC())
 }
@@ -464,6 +483,12 @@ func (s *SyncClient) EnqueueLearning(ctx context.Context, l *memory.Learning) er
 	blob, err := json.Marshal(l)
 	if err != nil {
 		return fmt.Errorf("sync: marshal learning: %w", err)
+	}
+	if s.sealer != nil {
+		blob, err = s.sealer.Seal(blob)
+		if err != nil {
+			return fmt.Errorf("sync: seal learning: %w", err)
+		}
 	}
 	key := "memory/" + encodeScopePath(l.Scope) + "/learnings/" + l.ID
 	return s.store.Sync().EnqueueOutbox(ctx, "memory", key, blob, time.Now().UTC())
