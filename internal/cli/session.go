@@ -44,8 +44,8 @@ func runSession(ctx context.Context, args []string) int {
 func printSessionUsage(w *os.File) {
 	fmt.Fprintln(w, "usage: resleeve session <subcommand> [args]")
 	fmt.Fprintln(w, "subcommands:")
-	fmt.Fprintln(w, "  list [--scope X] [--limit N] [--status active|ended|...]")
-	fmt.Fprintln(w, "  show <session-id>")
+	fmt.Fprintln(w, "  list [--scope X] [--limit N] [--status active|ended|...] [--no-pull]")
+	fmt.Fprintln(w, "  show <session-id> [--thinking] [--system] [--no-pull]")
 	fmt.Fprintln(w, "  search <query> [--limit N]")
 	fmt.Fprintln(w, "  tail <session-id> [--from <seq>]")
 }
@@ -66,6 +66,7 @@ func runSessionList(ctx context.Context, args []string) int {
 	scope := fs.String("scope", "", "filter by scope")
 	status := fs.String("status", "", "filter by status (active|ended|failed|partial)")
 	limit := fs.Int("limit", 50, "max rows")
+	noPull := fs.Bool("no-pull", false, "skip the pre-list upstream pull (offline / scripting)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -73,6 +74,9 @@ func runSessionList(ctx context.Context, args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "session list:", err)
 		return 1
+	}
+	if !*noPull {
+		tryOnDemandPull(ctx, c, defaultOnDemandPullTimeout, os.Stderr)
 	}
 	f := rsql.SessionFilter{Scope: *scope, Limit: *limit}
 	if *status != "" {
@@ -105,12 +109,13 @@ func runSessionShow(ctx context.Context, args []string) int {
 	fs.SetOutput(os.Stderr)
 	showThinking := fs.Bool("thinking", false, "include thinking blocks")
 	showSystem := fs.Bool("system", false, "include system events")
+	noPull := fs.Bool("no-pull", false, "skip the pre-show upstream pull (offline / scripting)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	rest := fs.Args()
 	if len(rest) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: resleeve session show <session-id>")
+		fmt.Fprintln(os.Stderr, "usage: resleeve session show <session-id> [--thinking] [--system] [--no-pull]")
 		return 2
 	}
 	sessionID := rest[0]
@@ -119,6 +124,9 @@ func runSessionShow(ctx context.Context, args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "session show:", err)
 		return 1
+	}
+	if !*noPull {
+		tryOnDemandPull(ctx, c, defaultOnDemandPullTimeout, os.Stderr)
 	}
 	ses, err := c.GetSession(ctx, sessionID)
 	if err != nil {

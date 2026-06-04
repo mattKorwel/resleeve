@@ -29,6 +29,7 @@ func runResume(ctx context.Context, args []string) int {
 		modeStr     string
 		cwdOverride string
 		printOnly   bool
+		noPull      bool
 		sessionID   string
 	)
 
@@ -56,6 +57,9 @@ func runResume(ctx context.Context, args []string) int {
 			i++
 		case a == "--print":
 			printOnly = true
+			i++
+		case a == "--no-pull":
+			noPull = true
 			i++
 		case strings.HasPrefix(a, "-"):
 			fmt.Fprintf(os.Stderr, "resume: unknown flag %q\n", a)
@@ -94,6 +98,14 @@ func runResume(ctx context.Context, args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "resume:", err)
 		return 1
+	}
+
+	// Best-effort pre-pull so resume reflects the freshest upstream
+	// state (e.g., a session captured on another machine seconds ago).
+	// Falls back to local state on timeout/unreachable — see
+	// docs/design/round-4/03-rehydrate-ux.md §"Failure modes".
+	if !noPull {
+		tryOnDemandPull(ctx, c, defaultOnDemandPullTimeout, os.Stderr)
 	}
 
 	ses, err := c.GetSession(ctx, sessionID)
@@ -200,7 +212,7 @@ func runResume(ctx context.Context, args []string) int {
 }
 
 func resumeUsage(w *os.File) {
-	fmt.Fprintln(w, "usage: resleeve resume <session-id> [--cli NAME] [--mode replay|prime] [--cwd DIR] [--print]")
+	fmt.Fprintln(w, "usage: resleeve resume <session-id> [--cli NAME] [--mode replay|prime] [--cwd DIR] [--print] [--no-pull]")
 }
 
 // loadAllEvents paginates through the daemon's ListEvents endpoint to
