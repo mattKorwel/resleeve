@@ -40,12 +40,12 @@ func (d *Daemon) requireLoopback(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
-			http.Error(w, "bad remote addr", http.StatusBadRequest)
+			writeErrorStatus(w, http.StatusBadRequest, "bad remote addr")
 			return
 		}
 		ip := net.ParseIP(strings.TrimSpace(host))
 		if ip == nil || !ip.IsLoopback() {
-			http.Error(w, "loopback only", http.StatusForbidden)
+			writeErrorStatus(w, http.StatusForbidden, "loopback only")
 			return
 		}
 		next(w, r)
@@ -68,22 +68,22 @@ type SealUnlockResp struct {
 
 func (d *Daemon) handleSealUnlock(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	defer r.Body.Close()
 	var req SealUnlockReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "decode: "+err.Error(), http.StatusBadRequest)
+		writeErrorStatus(w, http.StatusBadRequest, "decode: "+err.Error())
 		return
 	}
 	if len(req.KEK) != 32 {
-		http.Error(w, "kek must be 32 bytes", http.StatusBadRequest)
+		writeErrorStatus(w, http.StatusBadRequest, "kek must be 32 bytes")
 		return
 	}
 	sealer, err := auth.NewAESGCMSealer(req.KEK)
 	if err != nil {
-		http.Error(w, "build sealer: "+err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, "build sealer: "+err.Error())
 		return
 	}
 	if d.sync != nil {
@@ -100,7 +100,7 @@ type SealLockResp struct {
 
 func (d *Daemon) handleSealLock(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	if d.sync != nil {
@@ -118,7 +118,7 @@ type SealStatusResp struct {
 
 func (d *Daemon) handleSealStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	sealed := false

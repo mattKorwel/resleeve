@@ -190,19 +190,74 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, body io.Re
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
-		bodyStr := strings.TrimSpace(string(b))
-		if resp.StatusCode == http.StatusConflict && strings.Contains(bodyStr, "no upstream configured") {
-			// Wrap the typed sentinel so callers can use errors.Is
-			// instead of string-matching the body fragment.
-			// See internal/agent/errors.go for context.
-			return fmt.Errorf("daemon %s: %s: %w", resp.Status, bodyStr, ErrNoUpstream)
-		}
-		return fmt.Errorf("daemon %s: %s", resp.Status, bodyStr)
+		return classifyDaemonError(resp.Status, b)
 	}
 	if into == nil {
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(into)
+}
+
+// classifyDaemonError turns a 4xx/5xx body into a typed Go error.
+//
+// Preferred path (Q2): the daemon emits a structured envelope
+//
+//	{"error": {"code": "<machine>", "message": "<human>"}}
+//
+// and we match on `code` — so `errors.Is(err, ErrNoUpstream)` works
+// without scanning the prose. See internal/agent/errors_envelope.go.
+//
+// Back-compat path: if the body isn't a JSON envelope (older daemon,
+// proxy-injected error page, http.Error fallback we missed in the
+// envelope migration), we fall back to the legacy strings.Contains
+// match on the message body. The string fragment "no upstream
+// configured" is the only one ever used by the daemon for ErrNoUpstream,
+// and the legacy handler emitted it verbatim — so the fallback is safe
+// to keep narrow. Tests in client_test.go pin both branches.
+func classifyDaemonError(status string, body []byte) error {
+	bodyStr := strings.TrimSpace(string(body))
+	if env, ok := decodeErrorEnvelope(body); ok {
+		err := fmt.Errorf("daemon %s: %s", status, env.Error.Message)
+		if sentinel := sentinelForCode(env.Error.Code); sentinel != nil {
+			return fmt.Errorf("daemon %s: %s: %w", status, env.Error.Message, sentinel)
+		}
+		return err
+	}
+	// Legacy fallback: non-envelope 4xx body. Match the historical
+	// substring for ErrNoUpstream — see errors.go for why this
+	// double-coverage exists.
+	if strings.HasPrefix(status, "409") && strings.Contains(bodyStr, "no upstream configured") {
+		return fmt.Errorf("daemon %s: %s: %w", status, bodyStr, ErrNoUpstream)
+	}
+	return fmt.Errorf("daemon %s: %s", status, bodyStr)
+}
+
+// decodeErrorEnvelope tries to parse the body as the structured envelope.
+// Returns (nil, false) for any failure so the caller can fall back to
+// the legacy substring path without leaking a partial decode.
+func decodeErrorEnvelope(body []byte) (errorEnvelope, bool) {
+	var env errorEnvelope
+	if len(body) == 0 || body[0] != '{' {
+		return env, false
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return env, false
+	}
+	if env.Error.Code == "" {
+		return env, false
+	}
+	return env, true
+}
+
+// sentinelForCode maps a wire code to its typed Go sentinel. nil means
+// "no specific sentinel — surface as an opaque daemon error".
+func sentinelForCode(code string) error {
+	switch code {
+	case codeNoUpstream:
+		return ErrNoUpstream
+	default:
+		return nil
+	}
 }
 
 func (c *Client) doNoBody(ctx context.Context, method, endpoint string, body io.Reader, contentType string) error {

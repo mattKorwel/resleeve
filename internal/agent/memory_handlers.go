@@ -27,7 +27,7 @@ func (d *Daemon) registerMemoryRoutes(mux *http.ServeMux) {
 func (d *Daemon) handleScope(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	if path == "" {
-		http.Error(w, "missing path", http.StatusBadRequest)
+		writeErrorStatus(w, http.StatusBadRequest, "missing path")
 		return
 	}
 	switch r.Method {
@@ -38,7 +38,7 @@ func (d *Daemon) handleScope(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		d.deleteScope(w, r, path)
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
 
@@ -53,13 +53,13 @@ func (d *Daemon) putScope(w http.ResponseWriter, r *http.Request, path string) {
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, http.ErrBodyNotAllowed) {
 		// Empty body is OK; surface other decode errors.
 		if err.Error() != "EOF" {
-			http.Error(w, "decode: "+err.Error(), http.StatusBadRequest)
+			writeErrorStatus(w, http.StatusBadRequest, "decode: "+err.Error())
 			return
 		}
 	}
 	kind := memory.ScopeKind(body.Kind)
 	if !kind.Valid() {
-		http.Error(w, "invalid kind", http.StatusBadRequest)
+		writeErrorStatus(w, http.StatusBadRequest, "invalid kind")
 		return
 	}
 	s := &memory.Scope{
@@ -71,12 +71,12 @@ func (d *Daemon) putScope(w http.ResponseWriter, r *http.Request, path string) {
 		DoNotInherit: body.DoNotInherit,
 	}
 	if err := d.store.Memory().UpdateScope(r.Context(), s); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	got, err := d.store.Memory().GetScope(r.Context(), path)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	// Fast-tier sync: enqueue the canonical (post-write) scope so other
@@ -95,10 +95,10 @@ func (d *Daemon) getScope(w http.ResponseWriter, r *http.Request, path string) {
 	s, err := d.store.Memory().GetScope(r.Context(), path)
 	if err != nil {
 		if errors.Is(err, rsql.ErrNotFound) {
-			http.Error(w, "not found", http.StatusNotFound)
+			writeErrorStatus(w, http.StatusNotFound, "not found")
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, s)
@@ -107,10 +107,10 @@ func (d *Daemon) getScope(w http.ResponseWriter, r *http.Request, path string) {
 func (d *Daemon) deleteScope(w http.ResponseWriter, r *http.Request, path string) {
 	if err := d.store.Memory().DeleteScope(r.Context(), path); err != nil {
 		if errors.Is(err, memory.ErrScopeHasChildren) {
-			http.Error(w, err.Error(), http.StatusConflict)
+			writeErrorStatus(w, http.StatusConflict, err.Error())
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -120,12 +120,12 @@ func (d *Daemon) deleteScope(w http.ResponseWriter, r *http.Request, path string
 
 func (d *Daemon) handleScopes(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	scopes, err := d.store.Memory().ListScopes(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if scopes == nil {
@@ -140,7 +140,7 @@ func (d *Daemon) handlePlan(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	scope := q.Get("scope")
 	if scope == "" {
-		http.Error(w, "missing scope", http.StatusBadRequest)
+		writeErrorStatus(w, http.StatusBadRequest, "missing scope")
 		return
 	}
 	slot := q.Get("slot")
@@ -152,7 +152,7 @@ func (d *Daemon) handlePlan(w http.ResponseWriter, r *http.Request) {
 		inherit := q.Get("inherit") == "true"
 		d.getPlan(w, r, scope, slot, inherit)
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
 
@@ -162,17 +162,17 @@ func (d *Daemon) putPlan(w http.ResponseWriter, r *http.Request, scope, slot str
 		Content string `json:"content"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "decode: "+err.Error(), http.StatusBadRequest)
+		writeErrorStatus(w, http.StatusBadRequest, "decode: "+err.Error())
 		return
 	}
 	p := &memory.Plan{Scope: scope, Name: slot, Content: body.Content}
 	if err := d.store.Memory().PutPlan(r.Context(), p); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	got, err := d.store.Memory().GetPlan(r.Context(), scope, slot)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if d.sync != nil {
@@ -188,10 +188,10 @@ func (d *Daemon) getPlan(w http.ResponseWriter, r *http.Request, scope, slot str
 		p, err := d.store.Memory().GetPlan(r.Context(), scope, slot)
 		if err != nil {
 			if errors.Is(err, rsql.ErrNotFound) {
-				http.Error(w, "not found", http.StatusNotFound)
+				writeErrorStatus(w, http.StatusNotFound, "not found")
 				return
 			}
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, p)
@@ -205,17 +205,17 @@ func (d *Daemon) getPlan(w http.ResponseWriter, r *http.Request, scope, slot str
 
 func (d *Daemon) handlePlans(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	scope := r.URL.Query().Get("scope")
 	if scope == "" {
-		http.Error(w, "missing scope", http.StatusBadRequest)
+		writeErrorStatus(w, http.StatusBadRequest, "missing scope")
 		return
 	}
 	ps, err := d.store.Memory().ListPlans(r.Context(), scope)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if ps == nil {
@@ -230,7 +230,7 @@ func (d *Daemon) handleLearnings(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	scope := q.Get("scope")
 	if scope == "" {
-		http.Error(w, "missing scope", http.StatusBadRequest)
+		writeErrorStatus(w, http.StatusBadRequest, "missing scope")
 		return
 	}
 	switch r.Method {
@@ -241,7 +241,7 @@ func (d *Daemon) handleLearnings(w http.ResponseWriter, r *http.Request) {
 		includeSuperseded := q.Get("include") == "superseded"
 		d.listLearnings(w, r, scope, inherit, includeSuperseded)
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
 
@@ -251,7 +251,7 @@ func (d *Daemon) appendLearning(w http.ResponseWriter, r *http.Request, scope, s
 		Content string `json:"content"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "decode: "+err.Error(), http.StatusBadRequest)
+		writeErrorStatus(w, http.StatusBadRequest, "decode: "+err.Error())
 		return
 	}
 	id := newLearningID()
@@ -261,12 +261,12 @@ func (d *Daemon) appendLearning(w http.ResponseWriter, r *http.Request, scope, s
 		l.SupersedesID = &v
 	}
 	if err := d.store.Memory().AppendLearning(r.Context(), l); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	got, err := d.store.Memory().GetLearning(r.Context(), id)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if d.sync != nil {
@@ -285,7 +285,7 @@ func (d *Daemon) listLearnings(w http.ResponseWriter, r *http.Request, scope str
 		var err error
 		ls, err = d.store.Memory().ListLearnings(r.Context(), scope, includeSuperseded)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 	}
@@ -299,12 +299,12 @@ func (d *Daemon) listLearnings(w http.ResponseWriter, r *http.Request, scope str
 
 func (d *Daemon) handleContext(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	scope := r.URL.Query().Get("scope")
 	if scope == "" {
-		http.Error(w, "missing scope", http.StatusBadRequest)
+		writeErrorStatus(w, http.StatusBadRequest, "missing scope")
 		return
 	}
 	ctx := memory.BuildContext(r.Context(), d.store.Memory(), scope)

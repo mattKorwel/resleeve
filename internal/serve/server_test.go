@@ -323,6 +323,99 @@ func readSSE(r io.Reader, out chan<- PushRow) {
 	}
 }
 
+// TestWriteError_EnvelopeShape locks the Q2 wire contract: every 4xx /
+// 5xx response from serve must be a structured envelope
+//
+//	{"error": {"code": "<machine>", "message": "<human>"}}
+//
+// rather than the pre-Q2 flat `{"error": "freeform text"}`. Asserts on
+// three exemplar paths (missing kind = 400 invalid_request, no bearer
+// = 401 unauthorized, unknown kind = 400 invalid_request). The shape +
+// code matter; the human message is checked loosely (substring) so
+// future wording tweaks don't churn this test.
+func TestWriteError_EnvelopeShape(t *testing.T) {
+	_, base := newTestServer(t)
+
+	type expect struct {
+		name    string
+		req     func() *http.Request
+		status  int
+		code    string
+		msgPart string
+	}
+	cases := []expect{
+		{
+			name: "missing kind = 400 invalid_request",
+			req: func() *http.Request {
+				r, _ := http.NewRequest(http.MethodGet, base+"/v2/sync/pull", nil)
+				r.Header.Set("Authorization", "Bearer "+testToken)
+				return r
+			},
+			status:  http.StatusBadRequest,
+			code:    CodeInvalidRequest,
+			msgPart: "kind",
+		},
+		{
+			name: "no bearer = 401 unauthorized",
+			req: func() *http.Request {
+				r, _ := http.NewRequest(http.MethodGet, base+"/v2/sync/pull?kind=memory", nil)
+				return r
+			},
+			status:  http.StatusUnauthorized,
+			code:    CodeUnauthorized,
+			msgPart: "bearer",
+		},
+		{
+			name: "unknown kind = 400 invalid_request",
+			req: func() *http.Request {
+				r, _ := http.NewRequest(http.MethodGet, base+"/v2/sync/pull?kind=bogus", nil)
+				r.Header.Set("Authorization", "Bearer "+testToken)
+				return r
+			},
+			status:  http.StatusBadRequest,
+			code:    CodeInvalidRequest,
+			msgPart: "invalid kind",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := http.DefaultClient.Do(tc.req())
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.status {
+				t.Fatalf("status: got %d, want %d", resp.StatusCode, tc.status)
+			}
+			if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+				t.Errorf("Content-Type: got %q, want application/json", ct)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			// Envelope decode: error must be an OBJECT, not a string.
+			var env errorEnvelope
+			if err := json.Unmarshal(body, &env); err != nil {
+				t.Fatalf("decode envelope: %v; body=%s", err, string(body))
+			}
+			if env.Error.Code != tc.code {
+				t.Errorf("code: got %q, want %q", env.Error.Code, tc.code)
+			}
+			if !strings.Contains(env.Error.Message, tc.msgPart) {
+				t.Errorf("message: %q does not contain %q", env.Error.Message, tc.msgPart)
+			}
+			// Regression guard: the legacy flat `{"error": "<string>"}`
+			// shape must NOT decode — that's what the rest of the codebase
+			// is migrating away from.
+			var legacy struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(body, &legacy); err == nil && legacy.Error != "" {
+				t.Errorf("legacy flat shape still decodes: %q (envelope migration regression)", legacy.Error)
+			}
+		})
+	}
+}
+
 func zeroPad(n int, width int) string {
 	s := ""
 	for i := 0; i < width; i++ {

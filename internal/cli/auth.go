@@ -361,12 +361,23 @@ func postJSON(ctx context.Context, endpoint, bearer string, body, out any) error
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		errBody, _ := io.ReadAll(resp.Body)
-		// Best-effort error JSON decode.
-		var e struct {
+		// Q2: serve emits {"error": {"code", "message"}}. Best-effort
+		// decode into both the new envelope and the legacy flat shape so
+		// we keep working against an older daemon binary mid-rollout.
+		var env struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(errBody, &env) == nil && env.Error.Message != "" {
+			return fmt.Errorf("%s: %s", resp.Status, env.Error.Message)
+		}
+		var legacy struct {
 			Error string `json:"error"`
 		}
-		if json.Unmarshal(errBody, &e) == nil && e.Error != "" {
-			return fmt.Errorf("%s: %s", resp.Status, e.Error)
+		if json.Unmarshal(errBody, &legacy) == nil && legacy.Error != "" {
+			return fmt.Errorf("%s: %s", resp.Status, legacy.Error)
 		}
 		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(errBody)))
 	}

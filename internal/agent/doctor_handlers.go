@@ -29,7 +29,7 @@ func (d *Daemon) registerDoctorRoutes(mux *http.ServeMux) {
 // duplicating the bearer-token plumbing in two places.
 func (d *Daemon) handleDoctorSyncStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	ctx := r.Context()
@@ -37,7 +37,7 @@ func (d *Daemon) handleDoctorSyncStatus(w http.ResponseWriter, r *http.Request) 
 	// Outbox depth is always available (the local store is always open).
 	depth, err := d.store.Sync().OutboxDepth(ctx)
 	if err != nil {
-		http.Error(w, "outbox depth: "+err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, "outbox depth: "+err.Error())
 		return
 	}
 

@@ -235,6 +235,56 @@ func TestClient_SyncPushNowWrapsErrNoUpstream(t *testing.T) {
 	}
 }
 
+// TestSyncPushNow_ReturnsNoUpstreamEnvelope pins the Q2 wire contract on
+// the daemon side: standalone-mode push-now must return a structured
+// envelope with code="no_upstream", not the pre-Q2 text/plain
+// http.Error body. Mirrored by TestDoJSON_ParsesEnvelope on the client.
+func TestSyncPushNow_ReturnsNoUpstreamEnvelope(t *testing.T) {
+	d := newTestDaemonNoSync(t)
+	srv := httptest.NewServer(muxForDaemon(d))
+	t.Cleanup(srv.Close)
+
+	for _, path := range []string{"/v1/sync/push-now", "/v1/sync/pull-now"} {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer "+d.secret)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusConflict {
+			t.Errorf("%s status: got %d, want 409; body=%s", path, resp.StatusCode, string(body))
+			continue
+		}
+		if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+			t.Errorf("%s Content-Type: got %q, want application/json (no envelope)", path, ct)
+		}
+		var env struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(body, &env); err != nil {
+			t.Errorf("%s decode envelope: %v; body=%s", path, err, string(body))
+			continue
+		}
+		if env.Error.Code != "no_upstream" {
+			t.Errorf("%s code: got %q, want %q; body=%s", path, env.Error.Code, "no_upstream", string(body))
+		}
+		if !strings.Contains(env.Error.Message, "upstream") {
+			t.Errorf("%s message: %q does not mention upstream", path, env.Error.Message)
+		}
+		// Regression guard: legacy plain-text shape must NOT be what we
+		// return anymore (the client back-compat path is tested in
+		// client_test.go; this is the daemon-side wire contract).
+		if strings.HasPrefix(strings.TrimSpace(string(body)), "no upstream configured") {
+			t.Errorf("%s still emits legacy text/plain shape: %q", path, string(body))
+		}
+	}
+}
+
 func TestSyncHandler_MethodNotAllowed(t *testing.T) {
 	ts, _ := newSyncTestServer(t)
 	d := newTestDaemonWithSync(t, ts.URL)

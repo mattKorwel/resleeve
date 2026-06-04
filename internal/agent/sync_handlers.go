@@ -19,11 +19,14 @@ func (d *Daemon) registerSyncRoutes(mux *http.ServeMux) {
 // §"New CLI verbs".
 func (d *Daemon) handleSyncPushNow(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	if d.sync == nil {
-		http.Error(w, "no upstream configured — set --upstream on `resleeve up`", http.StatusConflict)
+		// Q2: explicit no_upstream code so the client surfaces this as
+		// ErrNoUpstream via errors.Is — no body-substring matching.
+		writeErrorEnvelope(w, http.StatusConflict, codeNoUpstream,
+			"no upstream configured — set --upstream on `resleeve up`")
 		return
 	}
 	pushed, err := d.sync.DrainNow(r.Context())
@@ -42,11 +45,13 @@ func (d *Daemon) handleSyncPushNow(w http.ResponseWriter, r *http.Request) {
 // ingest counts. Returns 409 if no upstream is configured.
 func (d *Daemon) handleSyncPullNow(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	if d.sync == nil {
-		http.Error(w, "no upstream configured — set --upstream on `resleeve up`", http.StatusConflict)
+		// Q2: see handleSyncPushNow — same no_upstream envelope.
+		writeErrorEnvelope(w, http.StatusConflict, codeNoUpstream,
+			"no upstream configured — set --upstream on `resleeve up`")
 		return
 	}
 	counts, err := d.sync.PullNowCounts(r.Context())

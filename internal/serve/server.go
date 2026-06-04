@@ -389,6 +389,11 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
+// writeError emits the structured JSON error envelope (Q2). The code is
+// inferred from the HTTP status — call writeErrorCoded directly when
+// the call site has a more specific code (e.g. the daemon's
+// CodeNoUpstream 409). See internal/serve/errors.go for the envelope
+// shape and the full code vocabulary.
 func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+	writeErrorCoded(w, status, defaultCodeForStatus(status), msg)
 }

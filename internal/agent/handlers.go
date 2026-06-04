@@ -24,7 +24,7 @@ func (d *Daemon) registerRoutes(mux *http.ServeMux) {
 // liveness probes.
 func (d *Daemon) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -37,7 +37,7 @@ func (d *Daemon) handleHealth(w http.ResponseWriter, r *http.Request) {
 // handleSessionsCollection handles GET /v1/sessions — list with filters.
 func (d *Daemon) handleSessionsCollection(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	q := r.URL.Query()
@@ -61,7 +61,7 @@ func (d *Daemon) handleSessionsCollection(w http.ResponseWriter, r *http.Request
 
 	sessions, err := d.store.Sessions().List(r.Context(), f)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if sessions == nil {
@@ -88,7 +88,7 @@ func (d *Daemon) handleSessionsItem(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			d.listEvents(w, r, sessionID)
 		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 		}
 		return
 	}
@@ -96,7 +96,7 @@ func (d *Daemon) handleSessionsItem(w http.ResponseWriter, r *http.Request) {
 	// /v1/sessions/{id}
 	if !strings.Contains(rest, "/") {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		d.getSession(w, r, rest)
@@ -107,14 +107,14 @@ func (d *Daemon) handleSessionsItem(w http.ResponseWriter, r *http.Request) {
 
 func (d *Daemon) appendEvents(w http.ResponseWriter, r *http.Request, sessionID string) {
 	if sessionID == "" {
-		http.Error(w, "empty session id", http.StatusBadRequest)
+		writeErrorStatus(w, http.StatusBadRequest, "empty session id")
 		return
 	}
 	var body struct {
 		Events []event.Event `json:"events"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "decode: "+err.Error(), http.StatusBadRequest)
+		writeErrorStatus(w, http.StatusBadRequest, "decode: "+err.Error())
 		return
 	}
 	if len(body.Events) == 0 {
@@ -122,7 +122,7 @@ func (d *Daemon) appendEvents(w http.ResponseWriter, r *http.Request, sessionID 
 		return
 	}
 	if err := d.IngestBatch(r.Context(), sessionID, body.Events); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
@@ -130,7 +130,7 @@ func (d *Daemon) appendEvents(w http.ResponseWriter, r *http.Request, sessionID 
 
 func (d *Daemon) listEvents(w http.ResponseWriter, r *http.Request, sessionID string) {
 	if sessionID == "" {
-		http.Error(w, "empty session id", http.StatusBadRequest)
+		writeErrorStatus(w, http.StatusBadRequest, "empty session id")
 		return
 	}
 	q := r.URL.Query()
@@ -148,7 +148,7 @@ func (d *Daemon) listEvents(w http.ResponseWriter, r *http.Request, sessionID st
 	}
 	events, err := d.store.Events().List(r.Context(), sessionID, sinceSeq, limit)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if events == nil {
@@ -161,10 +161,10 @@ func (d *Daemon) getSession(w http.ResponseWriter, r *http.Request, id string) {
 	ses, err := d.store.Sessions().Get(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, rsql.ErrNotFound) {
-			http.Error(w, "not found", http.StatusNotFound)
+			writeErrorStatus(w, http.StatusNotFound, "not found")
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, ses)
@@ -172,13 +172,13 @@ func (d *Daemon) getSession(w http.ResponseWriter, r *http.Request, id string) {
 
 func (d *Daemon) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	q := r.URL.Query()
 	query := q.Get("q")
 	if query == "" {
-		http.Error(w, "missing q", http.StatusBadRequest)
+		writeErrorStatus(w, http.StatusBadRequest, "missing q")
 		return
 	}
 	limit := 50
@@ -189,7 +189,7 @@ func (d *Daemon) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	hits, err := d.store.Events().Search(r.Context(), query, limit)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if hits == nil {
@@ -212,12 +212,12 @@ func (d *Daemon) requireBearer(next http.HandlerFunc) http.HandlerFunc {
 		const prefix = "Bearer "
 		h := r.Header.Get("Authorization")
 		if !strings.HasPrefix(h, prefix) {
-			http.Error(w, "missing bearer", http.StatusUnauthorized)
+			writeErrorStatus(w, http.StatusUnauthorized, "missing bearer")
 			return
 		}
 		provided := strings.TrimPrefix(h, prefix)
 		if subtle.ConstantTimeCompare([]byte(provided), []byte(d.secret)) != 1 {
-			http.Error(w, "bad bearer", http.StatusUnauthorized)
+			writeErrorStatus(w, http.StatusUnauthorized, "bad bearer")
 			return
 		}
 		next(w, r)
