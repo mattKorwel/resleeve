@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mattkorwel/resleeve/internal/agent"
+	"github.com/mattkorwel/resleeve/internal/agent/agenttest"
 	"github.com/mattkorwel/resleeve/internal/mcp"
 	"github.com/mattkorwel/resleeve/internal/memory"
 )
@@ -21,17 +22,17 @@ func memScopePtr(path, kind, title string) *memory.Scope {
 }
 
 // newDaemonClient spins up the real agent HTTP mux backed by an
-// in-memory sqlite store (via agent.TestHandler), fronts it with an
-// httptest.Server, and returns a configured *agent.Client. This
+// in-memory sqlite store (via agenttest.TestHandler), fronts it with
+// an httptest.Server, and returns a configured *agent.Client. This
 // exercises the real daemon stack — same routes, same auth — without
 // the production Serve()'s side effects (listener, endpoint file,
 // reconcile goroutines, stdout banners).
 func newDaemonClient(t *testing.T) *agent.Client {
 	t.Helper()
 	const secret = "test-secret-mcp"
-	mux, cleanup, err := agent.TestHandler(context.Background(), "", secret)
+	mux, cleanup, err := agenttest.TestHandler(context.Background(), "", secret)
 	if err != nil {
-		t.Fatalf("agent.TestHandler: %v", err)
+		t.Fatalf("agenttest.TestHandler: %v", err)
 	}
 	hs := httptest.NewServer(mux)
 	t.Cleanup(func() {

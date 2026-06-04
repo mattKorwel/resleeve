@@ -147,3 +147,26 @@ func (d *Daemon) Serve(ctx context.Context) error {
 	}
 	return serveErr
 }
+
+// Handler returns the daemon's HTTP handler (the mux with all routes
+// registered). Useful for fronting the daemon with httptest.Server in
+// downstream tests without binding a TCP listener. Note: the handler
+// is constructed by New, so this is non-nil after New returns.
+func (d *Daemon) Handler() http.Handler {
+	return d.server.Handler
+}
+
+// SetSecret overrides the bearer token used to authorize requests.
+// Serve generates a random secret at startup; tests that front the
+// daemon via Handler() need a known token to construct an authorized
+// agent.Client. Has no effect once Serve has begun.
+func (d *Daemon) SetSecret(s string) {
+	d.secret = s
+}
+
+// Close releases the daemon's storage handle. Normally Serve handles
+// cleanup via its shutdown goroutine; callers that use Handler()
+// without Serve must call Close themselves.
+func (d *Daemon) Close() error {
+	return d.store.Close()
+}

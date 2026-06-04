@@ -1,11 +1,19 @@
-package agent
+// Package agenttest provides test affordances for the agent daemon.
+//
+// It is the sibling testing subpackage for internal/agent — the
+// standard Go pattern (cf. net/http/httptest, testing/fstest) for
+// exposing testing helpers that need to import the package under test
+// without leaking those helpers into the production package's
+// compiled API. The agent package never imports agenttest; agenttest
+// imports agent.
+package agenttest
 
 import (
 	"context"
 	"fmt"
 	"net/http"
 
-	"github.com/mattkorwel/resleeve/internal/storage/sql/sqlite"
+	"github.com/mattkorwel/resleeve/internal/agent"
 )
 
 // TestHandler returns an http.Handler wired to a brand-new sqlite store
@@ -16,10 +24,6 @@ import (
 // writing endpoint files, or spawning reconcile goroutines.
 //
 // The returned cleanup function closes the underlying store.
-//
-// This is a testing affordance, not a runtime API. It lives in a
-// non-`_test.go` file because cross-package tests can't import
-// internal symbols defined only in test files.
 func TestHandler(ctx context.Context, dsn, secret string) (http.Handler, func(), error) {
 	if dsn == "" {
 		dsn = "file::memory:?cache=shared&_pragma=foreign_keys=on"
@@ -27,14 +31,11 @@ func TestHandler(ctx context.Context, dsn, secret string) (http.Handler, func(),
 	if secret == "" {
 		secret = "test-secret-for-mcp"
 	}
-	store, err := sqlite.Open(ctx, dsn)
+	d, err := agent.New(ctx, agent.Config{DSN: dsn})
 	if err != nil {
-		return nil, nil, fmt.Errorf("open store: %w", err)
+		return nil, nil, fmt.Errorf("agent.New: %w", err)
 	}
-	d := &Daemon{cfg: Config{DSN: dsn}, store: store, secret: secret}
-	mux := http.NewServeMux()
-	d.registerRoutes(mux)
-	d.registerMemoryRoutes(mux)
-	cleanup := func() { _ = store.Close() }
-	return mux, cleanup, nil
+	d.SetSecret(secret)
+	cleanup := func() { _ = d.Close() }
+	return d.Handler(), cleanup, nil
 }
