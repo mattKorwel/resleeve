@@ -61,6 +61,14 @@ func Main(args []string) int {
 		return runSync(ctx, rest)
 	case "mcp":
 		return runMCP(ctx, rest)
+	case "register":
+		return runRegister(ctx, rest)
+	case "login":
+		return runLogin(ctx, rest)
+	case "logout":
+		return runLogout(ctx, rest)
+	case "pair":
+		return runPair(ctx, rest)
 	case "help", "--help", "-h":
 		printUsage(os.Stdout)
 		return 0
@@ -89,9 +97,13 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  learning         append/list per-scope learnings")
 	fmt.Fprintln(w, "  context          print the rolled-up bridge-injectable context for a scope")
 	fmt.Fprintln(w, "  resume           re-sleeve a captured session into a fresh CLI instance")
-	fmt.Fprintln(w, "  serve            run the v2 sync HTTP server (v2 slice 1 stub)")
+	fmt.Fprintln(w, "  serve            run the v2 sync HTTP server")
 	fmt.Fprintln(w, "  sync             manual push/pull escape hatch (requires upstream)")
 	fmt.Fprintln(w, "  mcp              run the MCP server (stdio JSON-RPC) for in-agent memory curation")
+	fmt.Fprintln(w, "  register         create an account on a `resleeve serve` upstream")
+	fmt.Fprintln(w, "  login            unlock the local daemon with your master password")
+	fmt.Fprintln(w, "  logout           revoke this device + lock the local daemon")
+	fmt.Fprintln(w, "  pair             pair invite / pair accept (multi-device onboarding)")
 	fmt.Fprintln(w, "  help             show this help")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Other commands ship in later stages — see docs/design/round-4/")

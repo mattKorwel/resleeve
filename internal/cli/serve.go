@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mattkorwel/resleeve/internal/serve"
+	"github.com/mattkorwel/resleeve/internal/storage/sql/sqlite"
 	"github.com/mattkorwel/resleeve/internal/sync/local"
 )
 
@@ -26,9 +27,11 @@ func runServe(ctx context.Context, args []string) int {
 		root    string
 		token   string
 	)
+	var dsn string
 	fs.StringVar(&addr, "addr", "127.0.0.1:7860", "listen address")
 	fs.StringVar(&root, "root", "", "blob storage root (default: ~/.local/share/resleeve/serve)")
-	fs.StringVar(&token, "auth-token", "", "bearer token clients must present (default: $RESLEEVE_SERVE_TOKEN; if empty, a fresh one is generated and printed)")
+	fs.StringVar(&token, "auth-token", "", "legacy single bearer token (default: $RESLEEVE_SERVE_TOKEN; empty disables legacy auth — per-device only)")
+	fs.StringVar(&dsn, "dsn", "", "sqlite DSN for the identity database (default: ~/.local/share/resleeve/serve/identity.db)")
 
 	fs.SetOutput(os.Stderr)
 	if err := fs.Parse(args); err != nil {
@@ -43,10 +46,30 @@ func runServe(ctx context.Context, args []string) int {
 		}
 		root = filepath.Join(home, ".local", "share", "resleeve", "serve")
 	}
+	if dsn == "" {
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			fmt.Fprintln(os.Stderr, "serve: mkdir root:", err)
+			return 1
+		}
+		dsn = "file:" + filepath.Join(root, "identity.db") + "?_pragma=journal_mode=WAL&_pragma=foreign_keys=on"
+	}
 
 	if token == "" {
 		token = os.Getenv("RESLEEVE_SERVE_TOKEN")
 	}
+	// New behavior: identity (per-device tokens) is always wired. If
+	// no legacy bearer is set, register/login mint the only tokens
+	// that work; new deployments don't need RESLEEVE_SERVE_TOKEN.
+	// We still print a generated legacy bearer when no identity store
+	// has any devices yet, so first-run smoke (`resleeve up --upstream`)
+	// keeps working without a register step.
+	store, err := sqlite.Open(ctx, dsn)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "serve: open identity db:", err)
+		return 1
+	}
+	defer func() { _ = store.Close() }()
+
 	if token == "" {
 		gen, err := generateToken()
 		if err != nil {
@@ -56,6 +79,7 @@ func runServe(ctx context.Context, args []string) int {
 		token = gen
 		fmt.Fprintf(os.Stderr, "serve: generated bearer token (one-time): %s\n", token)
 		fmt.Fprintln(os.Stderr, "       set RESLEEVE_SERVE_TOKEN or --auth-token to use a stable value")
+		fmt.Fprintln(os.Stderr, "       (or use `resleeve register` + per-device tokens)")
 	}
 
 	backend, err := local.New(root)
@@ -64,7 +88,13 @@ func runServe(ctx context.Context, args []string) int {
 		return 1
 	}
 
-	srv, err := serve.New(serve.Config{Backend: backend, AuthToken: token})
+	srv, err := serve.New(serve.Config{
+		Backend:     backend,
+		AuthToken:   token,
+		ServerUsers: store.ServerUsers(),
+		Devices:     store.Devices(),
+		Pairings:    store.Pairings(),
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "serve:", err)
 		return 1
@@ -79,7 +109,9 @@ func runServe(ctx context.Context, args []string) int {
 	fmt.Fprintf(os.Stderr, "resleeve serve listening on http://%s\n", addr)
 	fmt.Fprintf(os.Stderr, "  backend  local-disk at %s\n", backend.Root())
 	fmt.Fprintln(os.Stderr, "  auth     bearer (token gated)")
-	fmt.Fprintln(os.Stderr, "  routes   POST /v2/sync/push  GET /v2/sync/pull  GET /v2/sync/health")
+	fmt.Fprintln(os.Stderr, "  routes   POST /v2/sync/push  GET /v2/sync/pull  GET /v2/sync/sse  GET /v2/sync/health")
+	fmt.Fprintln(os.Stderr, "           POST /v2/auth/register  /v2/auth/login-challenge  /v2/auth/login  /v2/auth/logout")
+	fmt.Fprintln(os.Stderr, "           POST /v2/auth/pair/publish  /v2/auth/pair/claim")
 
 	// Graceful shutdown on context cancel.
 	errCh := make(chan error, 1)

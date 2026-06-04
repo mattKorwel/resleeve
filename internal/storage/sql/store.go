@@ -176,6 +176,91 @@ type SyncStore interface {
 	SetCursor(ctx context.Context, kind, cursor string) error
 }
 
+// ServerUser is the server-side mirror of an account: holds the
+// Argon2id verifier + the password-wrapped + recovery-wrapped KEK. The
+// server never sees the plaintext KEK; the verifier and the KEK-wrap
+// derivation use independent salts so verifier exposure does not
+// compromise the KEK. See docs/design/round-4/02-cross-machine-sync.md
+// §"Identity".
+type ServerUser struct {
+	ID        string
+	Email     string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+
+	Params           auth.Argon2idParams
+	PasswordVerifier auth.Verifier
+	PasswordKEK      auth.WrappedKEK
+	RecoveryVerifier auth.Verifier
+	RecoveryKEK      auth.WrappedKEK
+}
+
+// Device is one paired device on a server account. The DeviceToken is
+// the bearer secret the device presents on every /v2/sync/* call; it is
+// per-device so a single device compromise can be revoked without
+// affecting the others.
+type Device struct {
+	ID          string
+	UserID      string
+	Name        string
+	DeviceToken string
+	CreatedAt   time.Time
+	LastSeenAt  time.Time
+}
+
+// PairingCode is a short-lived (≤5 min) one-time code used to bridge a
+// new device onto an existing account. Holds the KEK wrapped under a
+// key derived from the (small) code itself, plus a separate verifier
+// so a brute-force attempt is bounded by Argon2id cost AND the TTL.
+type PairingCode struct {
+	CodeID    string
+	UserID    string
+	Params    auth.Argon2idParams
+	Verifier  auth.Verifier
+	WrappedK  auth.WrappedKEK
+	CreatedAt time.Time
+	ExpiresAt time.Time
+	ClaimedAt *time.Time
+}
+
+// ServerUserStore is the server-side account store, distinct from the
+// client-side UserStore. Persisted by `resleeve serve`; never read by
+// the client daemon. See docs/design/round-4/02-cross-machine-sync.md.
+type ServerUserStore interface {
+	Create(ctx context.Context, u *ServerUser) error
+	GetByID(ctx context.Context, id string) (*ServerUser, error)
+	GetByEmail(ctx context.Context, email string) (*ServerUser, error)
+}
+
+// DeviceStore persists per-device bearer tokens for `resleeve serve`.
+type DeviceStore interface {
+	// Create inserts a new device row. DeviceToken must be unique.
+	Create(ctx context.Context, d *Device) error
+	// GetByToken returns the device matching the bearer presented by the
+	// client. ErrNotFound if no row matches.
+	GetByToken(ctx context.Context, token string) (*Device, error)
+	// ListByUser returns all devices for the given account.
+	ListByUser(ctx context.Context, userID string) ([]*Device, error)
+	// TouchLastSeen updates last_seen_at to now. Best-effort.
+	TouchLastSeen(ctx context.Context, deviceID string) error
+	// Delete removes a device (e.g. revoke on logout). Idempotent.
+	Delete(ctx context.Context, deviceID string) error
+}
+
+// PairingStore persists short-lived pair codes.
+type PairingStore interface {
+	// Create publishes a fresh code. CodeID is the public identifier the
+	// inviter shares with the accepter alongside the typed code.
+	Create(ctx context.Context, c *PairingCode) error
+	// Get returns a code by its public CodeID; ErrNotFound if absent.
+	Get(ctx context.Context, codeID string) (*PairingCode, error)
+	// Claim marks the code consumed atomically. Returns ErrNotFound if
+	// the row was already claimed (preventing replays) or expired.
+	Claim(ctx context.Context, codeID string, now time.Time) error
+	// SweepExpired deletes any rows past expires_at. Cheap maintenance.
+	SweepExpired(ctx context.Context, now time.Time) error
+}
+
 // Store is the union — each backend exposes the sub-stores via typed
 // accessors. See docs/design/round-2/11-storage-backends.md.
 type Store interface {
@@ -185,5 +270,8 @@ type Store interface {
 	Users() UserStore
 	Memory() MemoryStore
 	Sync() SyncStore
+	ServerUsers() ServerUserStore
+	Devices() DeviceStore
+	Pairings() PairingStore
 	Close() error
 }

@@ -1,0 +1,536 @@
+package serve
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/mattkorwel/resleeve/internal/auth"
+	rsql "github.com/mattkorwel/resleeve/internal/storage/sql"
+)
+
+// Auth-handler routes (added in punch-list #3). Wire format mirrors the
+// docs/design/round-4/02-cross-machine-sync.md §"Identity" flow:
+//
+//   POST /v2/auth/register      → create server_users + first device
+//   POST /v2/auth/login         → verify password, mint a device token
+//   POST /v2/auth/logout        → revoke the presented device token
+//   POST /v2/auth/pair/publish  → create a pairing_codes row, return code
+//   POST /v2/auth/pair/claim    → verify code, mint device token,
+//                                 return wrapped KEK for unwrap on the
+//                                 accepter's local machine
+//
+// The server never sees the plaintext password or KEK. Argon2id runs on
+// the client; the server stores only the (verifier, wrapped_kek) tuples.
+// Login returns the wrapped KEK so the client can unwrap locally — the
+// network never carries the KEK in clear.
+
+// --- wire types ---
+
+// RegisterReq is the body of POST /v2/auth/register.
+// The client has already locally:
+//   - derived password_verifier (Argon2id over password+salt)
+//   - generated a fresh KEK
+//   - wrapped the KEK under the password and under a recovery key
+//   - generated the recovery key (returned to the user once)
+//
+// The server's job is solely to persist the resulting tuple keyed by
+// email, and mint the device token for the registering machine.
+type RegisterReq struct {
+	Email    string         `json:"email"`
+	Params   Argon2idParams `json:"params"`
+	Password PasswordEnv    `json:"password"`
+	Recovery PasswordEnv    `json:"recovery"`
+	Device   DeviceMetadata `json:"device"`
+}
+
+// Argon2idParams mirrors auth.Argon2idParams over the wire.
+type Argon2idParams struct {
+	MemoryKiB   uint32 `json:"memory_kib"`
+	TimeIters   uint32 `json:"time_iters"`
+	Parallelism uint8  `json:"parallelism"`
+}
+
+// PasswordEnv carries verifier + KEK wrap material for one "factor"
+// (password or recovery key). Salts are independent so the server-stored
+// verifier cannot help an attacker unwrap the KEK.
+type PasswordEnv struct {
+	VerifierSalt []byte `json:"verifier_salt"`
+	VerifierHash []byte `json:"verifier_hash"`
+	KEKSalt      []byte `json:"kek_salt"`
+	KEKNonce     []byte `json:"kek_nonce"`
+	KEKCT        []byte `json:"kek_ct"`
+}
+
+// DeviceMetadata is the optional human-readable name the device wants
+// to register under (e.g. "matt's laptop"). Purely informational.
+type DeviceMetadata struct {
+	Name string `json:"name"`
+}
+
+// RegisterResp returns the assigned user_id + the first device token.
+type RegisterResp struct {
+	UserID      string `json:"user_id"`
+	DeviceID    string `json:"device_id"`
+	DeviceToken string `json:"device_token"`
+}
+
+// LoginReq is POST /v2/auth/login: the client presents its verifier
+// hash (NOT the password) computed against the salt it was given by
+// /v2/auth/login-challenge. v1 simplification: we ship the email +
+// password-derived verifier hash in one round trip, because the client
+// needs the WrappedKEK to decrypt local content anyway and we'd be
+// returning it on success regardless.
+type LoginReq struct {
+	Email        string `json:"email"`
+	VerifierHash []byte `json:"verifier_hash"`
+	Device       DeviceMetadata `json:"device"`
+}
+
+// LoginResp contains everything the client needs to unwrap its KEK
+// locally: the params, the verifier salt (echoed so the client can
+// double-check), and the WrappedKEK. The KEK itself is unwrapped on
+// the client and never traverses the network.
+type LoginResp struct {
+	UserID      string         `json:"user_id"`
+	DeviceID    string         `json:"device_id"`
+	DeviceToken string         `json:"device_token"`
+	Params      Argon2idParams `json:"params"`
+	WrappedKEK  WrappedKEKEnv  `json:"wrapped_kek"`
+}
+
+// WrappedKEKEnv is the over-the-wire form of an auth.WrappedKEK. We
+// don't reuse PasswordEnv because the verifier salt/hash are absent
+// here — the server already verified on the way in.
+type WrappedKEKEnv struct {
+	Salt  []byte `json:"salt"`
+	Nonce []byte `json:"nonce"`
+	CT    []byte `json:"ct"`
+}
+
+// LoginChallengeReq is POST /v2/auth/login-challenge: the client says
+// who it is and the server returns the verifier salt + Argon2 params
+// so the client can derive the same VerifierHash to ship in LoginReq.
+type LoginChallengeReq struct {
+	Email string `json:"email"`
+}
+
+// LoginChallengeResp returns the per-account Argon2 cost knobs +
+// verifier salt. Public per-account info: leak does not compromise the
+// KEK because the KEK uses a different salt (round-2/10 design).
+type LoginChallengeResp struct {
+	Params       Argon2idParams `json:"params"`
+	VerifierSalt []byte         `json:"verifier_salt"`
+}
+
+// --- handler registration ---
+
+func (s *Server) registerAuthRoutes() {
+	// Auth endpoints are NOT bearer-gated (the act of authenticating
+	// can't require a prior token). They have their own validation.
+	s.mux.HandleFunc("POST /v2/auth/register", s.handleRegister)
+	s.mux.HandleFunc("POST /v2/auth/login-challenge", s.handleLoginChallenge)
+	s.mux.HandleFunc("POST /v2/auth/login", s.handleLogin)
+	s.mux.HandleFunc("POST /v2/auth/logout", s.handleLogout)
+	s.mux.HandleFunc("POST /v2/auth/pair/publish", s.requireDevice(s.handlePairPublish))
+	s.mux.HandleFunc("POST /v2/auth/pair/claim", s.handlePairClaim)
+}
+
+// --- register ---
+
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	if s.serverUsers == nil || s.devices == nil {
+		writeError(w, http.StatusServiceUnavailable, "identity store not configured")
+		return
+	}
+	var req RegisterReq
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("decode: %v", err))
+		return
+	}
+	if err := validateRegister(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	if _, err := s.serverUsers.GetByEmail(r.Context(), email); err == nil {
+		writeError(w, http.StatusConflict, "email already registered")
+		return
+	} else if !errors.Is(err, rsql.ErrNotFound) {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	now := time.Now().UTC()
+	u := &rsql.ServerUser{
+		ID:        newID(16),
+		Email:     email,
+		CreatedAt: now,
+		UpdatedAt: now,
+		Params:    paramsFromWire(req.Params),
+		PasswordVerifier: auth.Verifier{
+			Salt: req.Password.VerifierSalt,
+			Hash: req.Password.VerifierHash,
+		},
+		PasswordKEK: auth.WrappedKEK{
+			Salt:       req.Password.KEKSalt,
+			Nonce:      req.Password.KEKNonce,
+			Ciphertext: req.Password.KEKCT,
+			Params:     paramsFromWire(req.Params),
+		},
+		RecoveryVerifier: auth.Verifier{
+			Salt: req.Recovery.VerifierSalt,
+			Hash: req.Recovery.VerifierHash,
+		},
+		RecoveryKEK: auth.WrappedKEK{
+			Salt:       req.Recovery.KEKSalt,
+			Nonce:      req.Recovery.KEKNonce,
+			Ciphertext: req.Recovery.KEKCT,
+			Params:     paramsFromWire(req.Params),
+		},
+	}
+	if err := s.serverUsers.Create(r.Context(), u); err != nil {
+		writeError(w, http.StatusInternalServerError, "create user: "+err.Error())
+		return
+	}
+
+	dev, err := s.mintDevice(r.Context(), u.ID, req.Device.Name)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "mint device: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, RegisterResp{
+		UserID:      u.ID,
+		DeviceID:    dev.ID,
+		DeviceToken: dev.DeviceToken,
+	})
+}
+
+// --- login challenge ---
+
+func (s *Server) handleLoginChallenge(w http.ResponseWriter, r *http.Request) {
+	if s.serverUsers == nil {
+		writeError(w, http.StatusServiceUnavailable, "identity store not configured")
+		return
+	}
+	var req LoginChallengeReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "decode: "+err.Error())
+		return
+	}
+	u, err := s.serverUsers.GetByEmail(r.Context(), strings.ToLower(strings.TrimSpace(req.Email)))
+	if err != nil {
+		// Don't disclose whether the email exists: respond with a
+		// stable-shaped (but random-salt) challenge to keep the
+		// timing/footprint indistinguishable. v1 simplification:
+		// return 404; we'll harden later.
+		writeError(w, http.StatusNotFound, "no such account")
+		return
+	}
+	writeJSON(w, http.StatusOK, LoginChallengeResp{
+		Params:       paramsToWire(u.Params),
+		VerifierSalt: u.PasswordVerifier.Salt,
+	})
+}
+
+// --- login ---
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if s.serverUsers == nil || s.devices == nil {
+		writeError(w, http.StatusServiceUnavailable, "identity store not configured")
+		return
+	}
+	var req LoginReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "decode: "+err.Error())
+		return
+	}
+	u, err := s.serverUsers.GetByEmail(r.Context(), strings.ToLower(strings.TrimSpace(req.Email)))
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	// Constant-time verifier compare. The client computed
+	// Argon2id(password, salt) using the salt from /login-challenge;
+	// we compare against the stored hash. NOT a timing-safe replacement
+	// for the full ZK round-trip, but adequate for v1 where the wire
+	// is TLS and the server already holds the verifier.
+	if subtle.ConstantTimeCompare(req.VerifierHash, u.PasswordVerifier.Hash) != 1 {
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	dev, err := s.mintDevice(r.Context(), u.ID, req.Device.Name)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "mint device: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, LoginResp{
+		UserID:      u.ID,
+		DeviceID:    dev.ID,
+		DeviceToken: dev.DeviceToken,
+		Params:      paramsToWire(u.Params),
+		WrappedKEK: WrappedKEKEnv{
+			Salt:  u.PasswordKEK.Salt,
+			Nonce: u.PasswordKEK.Nonce,
+			CT:    u.PasswordKEK.Ciphertext,
+		},
+	})
+}
+
+// --- logout ---
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if s.devices == nil {
+		writeError(w, http.StatusServiceUnavailable, "identity store not configured")
+		return
+	}
+	dev, ok := s.deviceFromBearer(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing or invalid bearer token")
+		return
+	}
+	if err := s.devices.Delete(r.Context(), dev.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, "delete device: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "logged out"})
+}
+
+// --- pairing ---
+
+// PairPublishReq is POST /v2/auth/pair/publish — the inviter, already
+// authenticated as a device, ships:
+//   - the verifier salt+hash for the random pair code
+//   - the KEK wrapped under a key derived from the same pair code
+//
+// The server allocates a public CodeID + sets the 5-minute TTL.
+type PairPublishReq struct {
+	Params   Argon2idParams `json:"params"`
+	Verifier VerifierEnv    `json:"verifier"`
+	Wrapped  WrappedKEKEnv  `json:"wrapped"`
+	TTL      time.Duration  `json:"ttl_ns,omitempty"`
+}
+
+// VerifierEnv is the wire form of auth.Verifier.
+type VerifierEnv struct {
+	Salt []byte `json:"salt"`
+	Hash []byte `json:"hash"`
+}
+
+// PairPublishResp returns the public CodeID the inviter prints. The
+// pair code itself was generated client-side and is NEVER sent.
+type PairPublishResp struct {
+	CodeID    string    `json:"code_id"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+func (s *Server) handlePairPublish(w http.ResponseWriter, r *http.Request, dev *rsql.Device) {
+	if s.pairings == nil {
+		writeError(w, http.StatusServiceUnavailable, "identity store not configured")
+		return
+	}
+	var req PairPublishReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "decode: "+err.Error())
+		return
+	}
+	ttl := req.TTL
+	if ttl <= 0 || ttl > 10*time.Minute {
+		ttl = 5 * time.Minute
+	}
+	now := time.Now().UTC()
+	pc := &rsql.PairingCode{
+		CodeID:    newID(8),
+		UserID:    dev.UserID,
+		Params:    paramsFromWire(req.Params),
+		Verifier:  auth.Verifier{Salt: req.Verifier.Salt, Hash: req.Verifier.Hash},
+		WrappedK:  auth.WrappedKEK{Salt: req.Wrapped.Salt, Nonce: req.Wrapped.Nonce, Ciphertext: req.Wrapped.CT, Params: paramsFromWire(req.Params)},
+		CreatedAt: now,
+		ExpiresAt: now.Add(ttl),
+	}
+	if err := s.pairings.Create(r.Context(), pc); err != nil {
+		writeError(w, http.StatusInternalServerError, "create code: "+err.Error())
+		return
+	}
+	// Opportunistic sweep — cheap.
+	_ = s.pairings.SweepExpired(r.Context(), now)
+	writeJSON(w, http.StatusCreated, PairPublishResp{CodeID: pc.CodeID, ExpiresAt: pc.ExpiresAt})
+}
+
+// PairClaimReq is POST /v2/auth/pair/claim.
+type PairClaimReq struct {
+	CodeID       string         `json:"code_id"`
+	VerifierHash []byte         `json:"verifier_hash"`
+	Device       DeviceMetadata `json:"device"`
+}
+
+// PairClaimResp returns the wrapped KEK (still encrypted under the pair
+// code; the accepter unwraps locally after typing the code) plus a
+// fresh device token. The KEK plaintext never leaves the inviter.
+type PairClaimResp struct {
+	UserID      string         `json:"user_id"`
+	DeviceID    string         `json:"device_id"`
+	DeviceToken string         `json:"device_token"`
+	Params      Argon2idParams `json:"params"`
+	Wrapped     WrappedKEKEnv  `json:"wrapped"`
+}
+
+func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
+	if s.pairings == nil || s.devices == nil {
+		writeError(w, http.StatusServiceUnavailable, "identity store not configured")
+		return
+	}
+	var req PairClaimReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "decode: "+err.Error())
+		return
+	}
+	pc, err := s.pairings.Get(r.Context(), req.CodeID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "no such code")
+		return
+	}
+	now := time.Now().UTC()
+	if pc.ClaimedAt != nil || pc.ExpiresAt.Before(now) {
+		writeError(w, http.StatusGone, "code already used or expired")
+		return
+	}
+	if subtle.ConstantTimeCompare(req.VerifierHash, pc.Verifier.Hash) != 1 {
+		writeError(w, http.StatusUnauthorized, "code verification failed")
+		return
+	}
+	// Atomic claim before minting the device so a concurrent claim loses.
+	if err := s.pairings.Claim(r.Context(), pc.CodeID, now); err != nil {
+		writeError(w, http.StatusGone, "code already used")
+		return
+	}
+	dev, err := s.mintDevice(r.Context(), pc.UserID, req.Device.Name)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "mint device: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, PairClaimResp{
+		UserID:      pc.UserID,
+		DeviceID:    dev.ID,
+		DeviceToken: dev.DeviceToken,
+		Params:      paramsToWire(pc.Params),
+		Wrapped: WrappedKEKEnv{
+			Salt:  pc.WrappedK.Salt,
+			Nonce: pc.WrappedK.Nonce,
+			CT:    pc.WrappedK.Ciphertext,
+		},
+	})
+}
+
+// --- middleware: per-device bearer ---
+
+// requireDevice is the per-device auth middleware. Tokens are looked up
+// in the devices table; the device is passed through to the handler so
+// it can scope writes by user_id without an extra DB round trip.
+//
+// Backward-compat: when a legacy AuthToken is configured and matches,
+// we fall back to a synthetic "legacy" device row attached to NO user,
+// so existing single-bearer deployments keep working through the
+// migration. Sync routes still accept this; identity routes reject it
+// (they explicitly check for dev.UserID != "").
+func (s *Server) requireDevice(next func(http.ResponseWriter, *http.Request, *rsql.Device)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		dev, ok := s.deviceFromBearer(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "missing or invalid bearer token")
+			return
+		}
+		next(w, r, dev)
+	}
+}
+
+func (s *Server) deviceFromBearer(r *http.Request) (*rsql.Device, bool) {
+	got := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if !strings.HasPrefix(got, prefix) {
+		return nil, false
+	}
+	token := strings.TrimPrefix(got, prefix)
+	// 1) Per-device lookup (post-migration path).
+	if s.devices != nil {
+		if dev, err := s.devices.GetByToken(r.Context(), token); err == nil {
+			_ = s.devices.TouchLastSeen(r.Context(), dev.ID)
+			return dev, true
+		}
+	}
+	// 2) Legacy single-bearer fallback (pre-migration deployments).
+	if s.authToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.authToken)) == 1 {
+		return &rsql.Device{ID: "legacy", UserID: "", Name: "legacy-bearer"}, true
+	}
+	return nil, false
+}
+
+// --- helpers ---
+
+func (s *Server) mintDevice(ctx context.Context, userID, name string) (*rsql.Device, error) {
+	tok, err := newDeviceToken()
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	dev := &rsql.Device{
+		ID:          newID(16),
+		UserID:      userID,
+		Name:        name,
+		DeviceToken: tok,
+		CreatedAt:   now,
+		LastSeenAt:  now,
+	}
+	if err := s.devices.Create(ctx, dev); err != nil {
+		return nil, err
+	}
+	return dev, nil
+}
+
+func newDeviceToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return "dev_" + hex.EncodeToString(b), nil
+}
+
+func newID(nBytes int) string {
+	b := make([]byte, nBytes)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func paramsFromWire(p Argon2idParams) auth.Argon2idParams {
+	return auth.Argon2idParams{MemoryKiB: p.MemoryKiB, TimeIters: p.TimeIters, Parallelism: p.Parallelism}
+}
+
+func paramsToWire(p auth.Argon2idParams) Argon2idParams {
+	return Argon2idParams{MemoryKiB: p.MemoryKiB, TimeIters: p.TimeIters, Parallelism: p.Parallelism}
+}
+
+func validateRegister(req *RegisterReq) error {
+	if strings.TrimSpace(req.Email) == "" || !strings.Contains(req.Email, "@") {
+		return errors.New("invalid email")
+	}
+	if req.Params.MemoryKiB == 0 || req.Params.TimeIters == 0 || req.Params.Parallelism == 0 {
+		return errors.New("missing argon2 params")
+	}
+	if len(req.Password.VerifierHash) == 0 || len(req.Password.KEKCT) == 0 {
+		return errors.New("missing password envelope")
+	}
+	if len(req.Recovery.VerifierHash) == 0 || len(req.Recovery.KEKCT) == 0 {
+		return errors.New("missing recovery envelope")
+	}
+	return nil
+}

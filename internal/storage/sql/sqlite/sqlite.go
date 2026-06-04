@@ -22,13 +22,16 @@ var migrationsFS embed.FS
 
 // Store implements rsql.Store backed by SQLite.
 type Store struct {
-	db       *sql.DB
-	sessions *sessionStore
-	events   *eventStore
-	slots    *slotStore
-	users    *userStore
-	memory   *memoryStore
-	sync     *syncStore
+	db          *sql.DB
+	sessions    *sessionStore
+	events      *eventStore
+	slots       *slotStore
+	users       *userStore
+	memory      *memoryStore
+	sync        *syncStore
+	serverUsers *serverUserStore
+	devices     *deviceStore
+	pairings    *pairingStore
 }
 
 // Open opens (and auto-migrates) a SQLite database at the given DSN.
@@ -53,6 +56,9 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	s.users = &userStore{db: db}
 	s.memory = &memoryStore{db: db}
 	s.sync = &syncStore{db: db}
+	s.serverUsers = &serverUserStore{db: db}
+	s.devices = &deviceStore{db: db}
+	s.pairings = &pairingStore{db: db}
 	if err := s.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -74,6 +80,18 @@ func (s *Store) Users() rsql.UserStore { return s.users }
 
 // Memory returns the MemoryStore view.
 func (s *Store) Memory() rsql.MemoryStore { return s.memory }
+
+// ServerUsers returns the server-side account store. Only `resleeve serve`
+// reads from this; the client daemon never touches it.
+func (s *Store) ServerUsers() rsql.ServerUserStore { return s.serverUsers }
+
+// Devices returns the per-device token store. Only `resleeve serve` reads
+// from this — devices are server-side identities.
+func (s *Store) Devices() rsql.DeviceStore { return s.devices }
+
+// Pairings returns the short-lived pairing-code store. Only `resleeve
+// serve` reads from this.
+func (s *Store) Pairings() rsql.PairingStore { return s.pairings }
 
 // Close releases the underlying database handle.
 func (s *Store) Close() error { return s.db.Close() }

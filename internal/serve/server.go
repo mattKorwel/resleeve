@@ -21,20 +21,39 @@ import (
 	"sync"
 	"time"
 
+	rsql "github.com/mattkorwel/resleeve/internal/storage/sql"
 	rsync "github.com/mattkorwel/resleeve/internal/sync"
 )
 
 // Config bundles the inputs needed to construct a Server.
+//
+// Two auth modes coexist:
+//   - AuthToken (legacy): a single shared bearer presented by every
+//     client. Pre-#3 stub identity. Tests still use this.
+//   - ServerUsers + Devices + Pairings (post-#3): per-device tokens
+//     persisted in a database. When these are set, /v2/auth/* routes
+//     light up and /v2/sync/* accepts EITHER a per-device bearer OR
+//     the legacy AuthToken (for migration overlap).
+//
+// At least one of (AuthToken, Devices) must be set or New returns an
+// error — accidentally exposing a serve without auth would defeat the
+// zero-knowledge stance.
 type Config struct {
-	Backend   rsync.Backend
-	AuthToken string // required; the server rejects with 503 if empty
+	Backend     rsync.Backend
+	AuthToken   string // legacy single bearer; empty when only per-device auth is desired
+	ServerUsers rsql.ServerUserStore
+	Devices     rsql.DeviceStore
+	Pairings    rsql.PairingStore
 }
 
-// Server is the HTTP handler exposed at /v2/sync/*.
+// Server is the HTTP handler exposed at /v2/sync/* and /v2/auth/*.
 type Server struct {
-	mux       *http.ServeMux
-	backend   rsync.Backend
-	authToken string
+	mux         *http.ServeMux
+	backend     rsync.Backend
+	authToken   string
+	serverUsers rsql.ServerUserStore
+	devices     rsql.DeviceStore
+	pairings    rsql.PairingStore
 
 	// sseSubscribers is the live SSE fan-out set for kind=memory.
 	// Each subscriber owns a buffered channel; slow subscribers get
@@ -43,23 +62,29 @@ type Server struct {
 	sseSubscribers map[chan PushRow]struct{}
 }
 
-// New builds a Server. AuthToken must be non-empty (the safe default
-// is "this server is unconfigured" — accidentally exposing a serve
-// without auth would defeat the zero-knowledge stance).
+// New builds a Server. At least one auth mode (legacy AuthToken or
+// per-device Devices store) must be configured; without either, New
+// errors. Mixing both is supported for migration overlap.
 func New(cfg Config) (*Server, error) {
 	if cfg.Backend == nil {
 		return nil, errors.New("serve: nil backend")
 	}
-	if cfg.AuthToken == "" {
-		return nil, errors.New("serve: empty AuthToken (configure --auth-token or RESLEEVE_SERVE_TOKEN)")
+	if cfg.AuthToken == "" && cfg.Devices == nil {
+		return nil, errors.New("serve: no auth configured (set AuthToken or Devices)")
 	}
 	s := &Server{
 		mux:            http.NewServeMux(),
 		backend:        cfg.Backend,
 		authToken:      cfg.AuthToken,
+		serverUsers:    cfg.ServerUsers,
+		devices:        cfg.Devices,
+		pairings:       cfg.Pairings,
 		sseSubscribers: map[chan PushRow]struct{}{},
 	}
 	s.routes()
+	if cfg.ServerUsers != nil && cfg.Devices != nil {
+		s.registerAuthRoutes()
+	}
 	return s, nil
 }
 
@@ -77,11 +102,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // --- middleware ---
 
+// requireAuth accepts EITHER a per-device bearer (looked up in the
+// devices table) OR the legacy single-bearer AuthToken if configured.
+// The shared deviceFromBearer helper handles both. We deliberately
+// don't surface the device to /v2/sync/* handlers — the sync routes
+// are content-blind (server stores opaque ciphertext keyed by client),
+// so per-device scoping doesn't apply there yet. That ships when we
+// move to per-user backend partitions in a follow-up slice.
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
-	expected := "Bearer " + s.authToken
 	return func(w http.ResponseWriter, r *http.Request) {
-		got := r.Header.Get("Authorization")
-		if got == "" || got != expected {
+		if _, ok := s.deviceFromBearer(r); !ok {
 			writeError(w, http.StatusUnauthorized, "missing or invalid bearer token")
 			return
 		}
