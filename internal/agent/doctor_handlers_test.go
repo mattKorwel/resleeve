@@ -22,7 +22,7 @@ func TestSyncStats_RecordAndSnapshot(t *testing.T) {
 	if snap.SSEConnected {
 		t.Errorf("SSEConnected true before any record")
 	}
-	if snap.PullLastPerKind != nil && len(snap.PullLastPerKind) != 0 {
+	if len(snap.PullLastPerKind) != 0 {
 		t.Errorf("PullLastPerKind non-empty before record: %+v", snap.PullLastPerKind)
 	}
 

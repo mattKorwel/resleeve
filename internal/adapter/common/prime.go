@@ -391,9 +391,8 @@ func indentQuote(s string) string {
 		lines[i] = "> " + l
 	}
 	// First line already prefixed by caller's "> "; trim our prefix
-	// off line 0 to avoid double-quoting.
-	if strings.HasPrefix(lines[0], "> ") {
-		lines[0] = strings.TrimPrefix(lines[0], "> ")
-	}
+	// off line 0 to avoid double-quoting. TrimPrefix is a no-op when
+	// the prefix isn't present.
+	lines[0] = strings.TrimPrefix(lines[0], "> ")
 	return strings.Join(lines, "\n")
 }

@@ -142,6 +142,18 @@ data dir, keys are filesystem paths, List is a lexicographic walk for
 cursor pagination. Object-store and git backends slot in here per
 `round-2/11-storage-backends.md`.
 
+#### Backend support matrix
+
+| Backend | Status | Notes |
+|---|---|---|
+| `sync/local` (local disk) | ✓ shipped | Reference implementation. Directory tree under the upstream's data dir; keys are filesystem paths. |
+| S3-compatible object store | ✗ planned | Targets AWS S3, R2, MinIO, B2. Design hooks in `round-2/11-storage-backends.md`. |
+| Git-backed | ✗ planned | Append-only blobs in a git repo; appeals to ops folks who already have git infra. Design hooks in the same doc. |
+| Postgres LO | ✗ speculative | Useful if the deployment already has Postgres operationally. Not on the round-8 roadmap. |
+| IPFS / content-addressed | ✗ speculative | Interesting for the "stack roams the public net" property; threat model needs reworking. |
+
+The `Backend` interface is the seam. A new backend means one file implementing four methods + a registration site. Everything above the seam (`internal/serve`, the sealer, the SSE fan-out) stays unchanged.
+
 ### `internal/auth`
 
 `argon2.go` derives keys from passwords / recovery keys / pair codes

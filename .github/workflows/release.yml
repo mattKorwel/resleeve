@@ -119,19 +119,19 @@ jobs:
         run: |
           set -e
           VERSION="${{ steps.meta.outputs.version }}"
-          # Grab the section for this version from CHANGELOG.md.
+          # Grab the section for this version from docs/CHANGELOG.md.
           # Format: "## [<version>] - <date>" through to the next "## " line.
           # Falls back to a generic notice if the section is missing.
-          if [ -f CHANGELOG.md ] && grep -q "^## \[${VERSION}\]" CHANGELOG.md; then
+          if [ -f docs/CHANGELOG.md ] && grep -q "^## \[${VERSION}\]" docs/CHANGELOG.md; then
             awk -v v="${VERSION}" '
               $0 ~ "^## \\[" v "\\]" {flag=1; next}
               flag && /^## \[/ {exit}
               flag {print}
-            ' CHANGELOG.md > release-notes.md
+            ' docs/CHANGELOG.md > release-notes.md
           else
             echo "Release ${VERSION}." > release-notes.md
             echo "" >> release-notes.md
-            echo "See CHANGELOG.md for details." >> release-notes.md
+            echo "See docs/CHANGELOG.md for details." >> release-notes.md
           fi
           echo "Notes preview:"
           head -40 release-notes.md

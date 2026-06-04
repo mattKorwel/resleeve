@@ -120,12 +120,11 @@ func TestBackend_ListPagination(t *testing.T) {
 	if page2[0] != "sessions/S1/events/000003" || page2[1] != "sessions/S1/events/000004" {
 		t.Errorf("page2 contents: %v", page2)
 	}
-	if cur2 != "" {
-		// Returned exactly the last 2 items — cursor may or may not be empty
-		// depending on whether we filled the page; current impl emits the
-		// last key as cursor when len(page)==limit. Acceptable; next call
-		// will return empty.
-	}
+	// cur2 may or may not be empty depending on whether the page is
+	// exactly full; current impl emits the last key as cursor when
+	// len(page)==limit. Either is acceptable — the next call returns
+	// empty in both cases.
+	_ = cur2
 	// Page 3 from cur2: should be empty.
 	page3, _, err := b.List(ctx, "sessions/S1/events", cur2, 2)
 	if err != nil {
