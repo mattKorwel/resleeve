@@ -1,0 +1,157 @@
+name: release
+
+# Tag-triggered release. Pushing a tag of the form `v<major>.<minor>.<patch>`
+# (e.g. `v0.2.0`) builds the resleeve binary for {linux,darwin}x{amd64,arm64}
+# with the tag's version stamped in, then publishes a GitHub Release with the
+# binaries + per-artifact SHA-256 checksums attached.
+#
+# Pre-1.0 cadence (see docs/RELEASING.md):
+#   - Tag explicitly when you're ready to ship. No auto-bump on push to main.
+#   - Pre-release tags (`v0.x.y-rc.N`, `v0.x.y-beta.N`) are auto-flagged as
+#     prereleases on the GitHub Release.
+#
+# To cut a release locally (full how-to in docs/RELEASING.md):
+#   git tag -a v0.2.0 -m "v0.2.0"
+#   git push origin v0.2.0
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to (re)build, e.g. v0.2.0. Must already exist."
+        required: true
+
+permissions:
+  contents: write   # create release + upload assets
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,  goarch: amd64 }
+          - { goos: linux,  goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # workflow_dispatch path: check out the given tag.
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: resolve version
+        id: ver
+        run: |
+          set -e
+          REF="${{ inputs.tag || github.ref_name }}"
+          # Strip the leading 'v' from the tag for the embedded version string.
+          # Tag v0.2.0 -> version 0.2.0.
+          VERSION="${REF#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${REF}" >> "$GITHUB_OUTPUT"
+          echo "Building resleeve ${VERSION} (tag ${REF})"
+
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -e
+          mkdir -p dist
+          BIN="resleeve-${GOOS}-${GOARCH}"
+          go build -trimpath \
+            -ldflags="-s -w \
+              -X github.com/mattkorwel/resleeve/internal/cli.Version=${VERSION} \
+              -X github.com/mattkorwel/resleeve/internal/cli.BuildSHA=${GITHUB_SHA::7}" \
+            -o "dist/${BIN}" ./cmd/resleeve
+          (cd dist && shasum -a 256 "${BIN}" > "${BIN}.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: resleeve-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: resolve release metadata
+        id: meta
+        run: |
+          set -e
+          REF="${{ inputs.tag || github.ref_name }}"
+          VERSION="${REF#v}"
+          # Pre-release if the version contains a hyphen (rc, beta, alpha, etc.)
+          # Per semver: 0.2.0-rc.1 is a pre-release of 0.2.0.
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=${REF}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: extract changelog section
+        id: changelog
+        run: |
+          set -e
+          VERSION="${{ steps.meta.outputs.version }}"
+          # Grab the section for this version from CHANGELOG.md.
+          # Format: "## [<version>] - <date>" through to the next "## " line.
+          # Falls back to a generic notice if the section is missing.
+          if [ -f CHANGELOG.md ] && grep -q "^## \[${VERSION}\]" CHANGELOG.md; then
+            awk -v v="${VERSION}" '
+              $0 ~ "^## \\[" v "\\]" {flag=1; next}
+              flag && /^## \[/ {exit}
+              flag {print}
+            ' CHANGELOG.md > release-notes.md
+          else
+            echo "Release ${VERSION}." > release-notes.md
+            echo "" >> release-notes.md
+            echo "See CHANGELOG.md for details." >> release-notes.md
+          fi
+          echo "Notes preview:"
+          head -40 release-notes.md
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          set -e
+          FLAGS=""
+          if [ "$PRERELEASE" = "true" ]; then
+            FLAGS="--prerelease"
+          else
+            FLAGS="--latest"
+          fi
+          gh release create "$TAG" \
+            --title "resleeve ${VERSION}" \
+            --notes-file release-notes.md \
+            $FLAGS \
+            dist/*

@@ -4,6 +4,8 @@
 
 Resleeve is in pre-release (`v0.x.y`). No version is yet production-ready or eligible for security backports. Coordinated disclosure begins at `v1.0.0`.
 
+For the current internal posture (threat model, accepted risks, recent audit findings), see [docs/REVIEW_SECURITY.md](docs/REVIEW_SECURITY.md). Release-by-release security-relevant changes are tracked in the **Security** sections of [CHANGELOG.md](CHANGELOG.md).
+
 ## Reporting a vulnerability
 
 Email `security@resleeve.dev` (once the domain is registered). Until then, use GitHub's "Report a vulnerability" private reporting feature on the [repo's security tab](https://github.com/mattkorwel/resleeve/security/advisories).

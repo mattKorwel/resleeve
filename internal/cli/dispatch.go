@@ -9,8 +9,18 @@ import (
 	"syscall"
 )
 
-// Version is overridden at build time via -ldflags. Defaults to dev.
-var Version = "0.0.0-dev"
+// Version and BuildSHA are overridden at build time via -ldflags. Defaults to
+// dev placeholders. Release builds inject the real values:
+//
+//	go build -ldflags="-X github.com/mattkorwel/resleeve/internal/cli.Version=0.2.0 \
+//	                   -X github.com/mattkorwel/resleeve/internal/cli.BuildSHA=abc1234" \
+//	         ./cmd/resleeve
+//
+// See docs/RELEASING.md.
+var (
+	Version  = "0.0.0-dev"
+	BuildSHA = "dev"
+)
 
 // Main is the CLI entry point. Returns the process exit code.
 func Main(args []string) int {
@@ -25,7 +35,7 @@ func Main(args []string) int {
 	verb, rest := args[0], args[1:]
 	switch verb {
 	case "version", "--version", "-v":
-		fmt.Println("resleeve", Version)
+		fmt.Printf("resleeve %s (%s)\n", Version, BuildSHA)
 		return 0
 	case "agent":
 		return runAgent(ctx, rest)
