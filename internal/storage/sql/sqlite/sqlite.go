@@ -218,8 +218,14 @@ func (s *sessionStore) SyncEventCount(ctx context.Context, sessionID string) err
 
 // List returns sessions matching f, ordered by started_at DESC.
 func (s *sessionStore) List(ctx context.Context, f rsql.SessionFilter) ([]*rsql.Session, error) {
+	// Limit semantics:
+	//   f.Limit == 0  → default 50
+	//   f.Limit > 0   → clamped to 500
+	//   f.Limit < 0   → unlimited (no LIMIT clause); used by maintenance
+	//                   passes like `resleeve doctor --backfill-counts`.
 	limit := f.Limit
-	if limit <= 0 {
+	unlimited := limit < 0
+	if limit == 0 {
 		limit = 50
 	}
 	if limit > 500 {
@@ -246,8 +252,11 @@ func (s *sessionStore) List(ctx context.Context, f rsql.SessionFilter) ([]*rsql.
 		q += ` AND started_at >= ?`
 		args = append(args, f.Since.UTC().Format(time.RFC3339Nano))
 	}
-	q += ` ORDER BY started_at DESC LIMIT ?`
-	args = append(args, limit)
+	q += ` ORDER BY started_at DESC`
+	if !unlimited {
+		q += ` LIMIT ?`
+		args = append(args, limit)
+	}
 
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {

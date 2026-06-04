@@ -18,6 +18,7 @@ import (
 	"github.com/mattkorwel/resleeve/internal/adapter"
 	"github.com/mattkorwel/resleeve/internal/agent"
 	rsql "github.com/mattkorwel/resleeve/internal/storage/sql"
+	"github.com/mattkorwel/resleeve/internal/storage/sql/sqlite"
 )
 
 // runUp installs bridges + starts the daemon in the background.
@@ -164,6 +165,20 @@ func runPurge(ctx context.Context, args []string) int {
 
 // runDoctor reports daemon + bridge + CLI status.
 func runDoctor(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	backfillCounts := fs.Bool("backfill-counts", false, "recompute sessions.event_count for every session (one-shot maintenance pass)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	// Maintenance passes short-circuit the cards. Each flag prints its
+	// own outcome line and returns; they don't compose with the status
+	// report (or with each other) in a single run.
+	if *backfillCounts {
+		return runDoctorBackfillCounts(ctx)
+	}
+
 	fmt.Println("resleeve doctor")
 	fmt.Println("===============")
 
@@ -220,6 +235,47 @@ func runDoctor(ctx context.Context, args []string) int {
 	// Resleeve binary self
 	if self, err := os.Executable(); err == nil {
 		fmt.Printf("  resleeve binary  %s\n", self)
+	}
+	return 0
+}
+
+// runDoctorBackfillCounts recomputes sessions.event_count for every row
+// in the local DB. Cleanup pass for sessions captured before the F7 fix
+// (commit fde1c40) wired SyncEventCount into the IngestBatch path —
+// pre-F7 rows stayed at event_count=0 until their next batch arrived.
+// Safe to re-run; SyncEventCount is COUNT(*) over events, not a delta.
+func runDoctorBackfillCounts(ctx context.Context) int {
+	store, err := sqlite.Open(ctx, defaultDSN())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "doctor: open store:", err)
+		return 1
+	}
+	defer store.Close()
+
+	sessions, err := store.Sessions().List(ctx, rsql.SessionFilter{Limit: -1})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "doctor: list sessions:", err)
+		return 1
+	}
+	var recomputed, failed int
+	for i, s := range sessions {
+		if err := store.Sessions().SyncEventCount(ctx, s.ID); err != nil {
+			fmt.Fprintf(os.Stderr, "doctor: sync %s: %v\n", s.ID, err)
+			failed++
+			continue
+		}
+		recomputed++
+		if (i+1)%100 == 0 {
+			fmt.Printf("  scanned %d/%d sessions...\n", i+1, len(sessions))
+		}
+	}
+	fmt.Printf("recomputed %d session event_counts", recomputed)
+	if failed > 0 {
+		fmt.Printf(" (%d failed)", failed)
+	}
+	fmt.Println(".")
+	if failed > 0 {
+		return 1
 	}
 	return 0
 }

@@ -45,7 +45,7 @@ type SessionFilter struct {
 	AgentName string        // exact match; empty = any
 	Status    SessionStatus // empty = any
 	Since     *time.Time    // started_at >= since
-	Limit     int           // <= 0 ⇒ default 50; capped at 500
+	Limit     int           // 0 ⇒ default 50; >0 capped at 500; <0 ⇒ unlimited
 }
 
 // SlotState is the durable view of one slot.
