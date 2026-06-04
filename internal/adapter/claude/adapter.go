@@ -2,12 +2,10 @@ package claude
 
 import (
 	"context"
-	"fmt"
 	"os/exec"
 	"strings"
 
 	"github.com/mattkorwel/resleeve/internal/adapter"
-	"github.com/mattkorwel/resleeve/internal/event"
 )
 
 // Name is the adapter identifier registered with the daemon.
@@ -40,22 +38,6 @@ func (a *Adapter) Detect(ctx context.Context) (adapter.Detection, error) {
 	return d, nil
 }
 
-// InstallBridge / UninstallBridge are implemented in install.go.
-
-// ToNative renders normalized events back into Claude Code's native
-// JSONL format. Deferred to Stage 5 (re-sleeving).
-func (a *Adapter) ToNative(ctx context.Context, events []event.Event, target adapter.NativeFormat) ([]byte, error) {
-	return nil, fmt.Errorf("%w: claude.ToNative (Stage 5)", adapter.ErrNotImplemented)
-}
-
-// Hydrate materializes the harness's native session file in a target
-// workspace. Deferred to Stage 5.
-func (a *Adapter) Hydrate(ctx context.Context, session adapter.SessionView, target adapter.Workspace) error {
-	return fmt.Errorf("%w: claude.Hydrate (Stage 5)", adapter.ErrNotImplemented)
-}
-
-// NativeResumeCmd returns the command + args to launch Claude Code in
-// resume mode for a given session.
-func (a *Adapter) NativeResumeCmd(session adapter.SessionView) (string, []string) {
-	return "claude", []string{"--resume", session.SessionID}
-}
+// InstallBridge / UninstallBridge live in install.go.
+// FromNative lives in fromnative.go.
+// ToNative / Hydrate / NativeResumeCmd live in tonative.go / hydrate.go / native_resume.go.

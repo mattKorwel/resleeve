@@ -14,7 +14,9 @@ var ErrNotImplemented = errors.New("adapter: not implemented")
 
 // Adapter is the contract every CLI adapter implements. v1 ships only
 // the Claude Code adapter; opencode / Codex / Gemini implementations
-// live in v3. See docs/design/round-2/09-adapter-interface.md.
+// live in v3. See docs/design/round-2/09-adapter-interface.md and
+// docs/design/round-4/01-conversation-transport.md for the Stage 5
+// re-sleeve verbs.
 type Adapter interface {
 	// Identity
 	Name() string
@@ -27,10 +29,10 @@ type Adapter interface {
 	// Capture (translate native input to normalized events)
 	FromNative(ctx context.Context, raw []byte, src Source) ([]event.Event, error)
 
-	// Re-sleeving paths (Stage 5+)
-	ToNative(ctx context.Context, events []event.Event, target NativeFormat) ([]byte, error)
-	Hydrate(ctx context.Context, session SessionView, target Workspace) error
-	NativeResumeCmd(session SessionView) (cmd string, args []string)
+	// Re-sleeve (Stage 5) — see round-4/01-conversation-transport.md.
+	ToNative(ctx context.Context, events []event.Event, mode RenderMode) ([]byte, error)
+	Hydrate(ctx context.Context, session SessionView, opts HydrateOpts) (HydrateResult, error)
+	NativeResumeCmd(ctx context.Context, session SessionView, result HydrateResult) (cmd string, args []string, err error)
 }
 
 // Detection describes the state of a CLI's installation on the host.
@@ -64,7 +66,9 @@ const (
 )
 
 // SessionView is a read-only projection of a stored session, used by
-// Hydrate (not yet implemented in v1).
+// Hydrate. EventStream is a lazy closure so callers that only need
+// metadata (e.g. a future `resleeve show --remote`) don't have to pay
+// for an events load.
 type SessionView struct {
 	SessionID   string
 	CLI         string
@@ -77,15 +81,35 @@ type SessionView struct {
 	EventStream func() ([]event.Event, error)
 }
 
-// Workspace is the target host's environment for Hydrate.
-type Workspace struct {
-	Cwd     string
-	HomeDir string
-	Env     map[string]string
+// RenderMode discriminates how ToNative / Hydrate emit the target
+// CLI's local state. See round-4/01-conversation-transport.md.
+type RenderMode string
+
+const (
+	// RenderModeAuto lets the adapter pick: replay when source CLI ==
+	// target CLI and the adapter supports it; prime otherwise. This is
+	// the default when HydrateOpts.Mode is empty.
+	RenderModeAuto RenderMode = ""
+
+	// RenderModeReplay emits the target CLI's native local format
+	// (JSONL for claude). Full fidelity; same-CLI same-machine flows.
+	RenderModeReplay RenderMode = "replay"
+
+	// RenderModePrime emits a synthesized opening prompt summarizing
+	// prior activity. Lossy by design; cross-CLI universal path.
+	RenderModePrime RenderMode = "prime"
+)
+
+// HydrateOpts configures Hydrate.
+type HydrateOpts struct {
+	Mode RenderMode // empty / Auto = adapter chooses
+	Cwd  string     // override session.Cwd; empty = use session's cwd as-captured
 }
 
-// NativeFormat selects the on-disk format Adapter.ToNative produces.
-type NativeFormat struct {
-	Vendor  string
-	Version string // empty = latest known
+// HydrateResult reports what the adapter actually materialized.
+type HydrateResult struct {
+	Mode      RenderMode // what the adapter chose (never Auto)
+	Path      string     // file path where state was materialized
+	SessionID string     // may differ from input (prime mode mints a new id)
+	Notes     []string   // human-readable warnings ("3 tool_calls flattened to text")
 }

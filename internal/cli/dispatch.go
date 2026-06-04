@@ -53,6 +53,8 @@ func Main(args []string) int {
 		return runLearning(ctx, rest)
 	case "context":
 		return runContext(ctx, rest)
+	case "resume":
+		return runResume(ctx, rest)
 	case "help", "--help", "-h":
 		printUsage(os.Stdout)
 		return 0
@@ -80,7 +82,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  plan             write/read/list plans (per scope, named slots)")
 	fmt.Fprintln(w, "  learning         append/list per-scope learnings")
 	fmt.Fprintln(w, "  context          print the rolled-up bridge-injectable context for a scope")
+	fmt.Fprintln(w, "  resume           re-sleeve a captured session into a fresh CLI instance")
 	fmt.Fprintln(w, "  help             show this help")
 	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "Other commands ship in later stages — see docs/design/round-3/00-v1-cut.md")
+	fmt.Fprintln(w, "Other commands ship in later stages — see docs/design/round-4/")
 }
