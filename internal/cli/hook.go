@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"time"
 
 	"github.com/mattkorwel/resleeve/internal/adapter"
 	"github.com/mattkorwel/resleeve/internal/adapter/claude"
@@ -68,11 +70,20 @@ func runHook(ctx context.Context, args []string) int {
 }
 
 // sessionStartHookOutput is the JSON envelope Claude Code expects from
-// a SessionStart hook to inject additionalContext into the conversation.
-// Shape comes from Claude Code's hook contract: the flat
-// {"additionalContext": "..."} form (which a v1 dogfood iteration of
-// this code emitted) is silently dropped by current CC versions.
+// a SessionStart hook. Two layers:
+//
+//   - hookSpecificOutput.additionalContext is silently injected into
+//     the system prompt (model sees it, user doesn't).
+//   - systemMessage at the top level is a visible notice the user sees
+//     in the CC UI when the hook fires — this is the breadcrumb that
+//     tells the user "resleeve loaded N bytes of memory for scope X."
+//
+// The flat {"additionalContext": "..."} form (which a v1 dogfood
+// iteration of this code emitted) is silently dropped by current CC
+// versions — F13 fix introduced the wrapping; F14 added systemMessage
+// after dogfood revealed users had no signal anything had loaded.
 type sessionStartHookOutput struct {
+	SystemMessage      string             `json:"systemMessage,omitempty"`
 	HookSpecificOutput hookSpecificOutput `json:"hookSpecificOutput"`
 }
 
@@ -89,7 +100,12 @@ func injectContext(ctx context.Context, c *agent.Client, scope string) {
 	if err != nil || body == "" {
 		return
 	}
+	// Also persist what we just injected, so users can `cat
+	// ~/.resleeve/last-injected.md` to audit exactly what reached the
+	// model. Best-effort — write errors don't suppress the hook.
+	writeLastInjected(scope, body)
 	out := sessionStartHookOutput{
+		SystemMessage: fmt.Sprintf("resleeve: loaded scope %q (%d bytes)", scope, len(body)),
 		HookSpecificOutput: hookSpecificOutput{
 			HookEventName:     "SessionStart",
 			AdditionalContext: body,
@@ -100,6 +116,24 @@ func injectContext(ctx context.Context, c *agent.Client, scope string) {
 		return
 	}
 	fmt.Println(string(b))
+}
+
+// writeLastInjected persists the most recent SessionStart injection to
+// ~/.resleeve/last-injected.md. Lets users audit exactly what reached
+// the model post-hoc (`cat ~/.resleeve/last-injected.md`). Best-effort:
+// errors are swallowed since this is a debug breadcrumb, not a contract.
+func writeLastInjected(scope, body string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	dir := filepath.Join(home, ".resleeve")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	path := filepath.Join(dir, "last-injected.md")
+	header := fmt.Sprintf("<!-- scope: %s\n     injected at: %s -->\n\n", scope, time.Now().UTC().Format(time.RFC3339))
+	_ = os.WriteFile(path, []byte(header+body), 0o600)
 }
 
 // pickAdapter returns an adapter.Adapter for the given name. v1 only
