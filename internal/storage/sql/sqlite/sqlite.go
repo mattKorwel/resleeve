@@ -216,6 +216,17 @@ func (s *sessionStore) SyncEventCount(ctx context.Context, sessionID string) err
 	return err
 }
 
+// UpdateCwd repairs sessions.cwd and sessions.scope for a single row.
+// Backfill use case: legacy sessions created before the F1+F2+F3
+// reconcile-fix have cwd='' / scope='unknown'. A no-op for an unknown
+// session_id (UPDATE matches zero rows, no error).
+func (s *sessionStore) UpdateCwd(ctx context.Context, sessionID, cwd, scope string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE sessions
+		SET cwd = ?, scope = ?
+		WHERE id = ?`, cwd, scope, sessionID)
+	return err
+}
+
 // List returns sessions matching f, ordered by started_at DESC.
 func (s *sessionStore) List(ctx context.Context, f rsql.SessionFilter) ([]*rsql.Session, error) {
 	// Limit semantics:

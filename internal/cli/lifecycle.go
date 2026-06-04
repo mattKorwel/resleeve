@@ -168,15 +168,21 @@ func runDoctor(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	backfillCounts := fs.Bool("backfill-counts", false, "recompute sessions.event_count for every session (one-shot maintenance pass)")
+	backfillCwd := fs.Bool("backfill-cwd", false, "repair sessions.cwd for pre-existing reconcile-only sessions (#6)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
 	// Maintenance passes short-circuit the cards. Each flag prints its
 	// own outcome line and returns; they don't compose with the status
-	// report (or with each other) in a single run.
+	// report (or with each other) in a single run. --backfill-cwd in
+	// particular requires the daemon to be DOWN (raw UPDATEs bypass
+	// the ingest pipeline).
 	if *backfillCounts {
 		return runDoctorBackfillCounts(ctx)
+	}
+	if *backfillCwd {
+		return runDoctorBackfillCwd(ctx)
 	}
 
 	fmt.Println("resleeve doctor")
@@ -277,6 +283,33 @@ func runDoctorBackfillCounts(ctx context.Context) int {
 	if failed > 0 {
 		return 1
 	}
+	return 0
+}
+
+// runDoctorBackfillCwd repairs sessions.cwd for pre-existing
+// reconcile-only sessions (polish punch list #6). It refuses to run
+// when the daemon is up: the migration performs raw UPDATEs that
+// bypass the ingest pipeline, and a live daemon could re-overwrite
+// rows from a concurrent reconcile sweep.
+func runDoctorBackfillCwd(ctx context.Context) int {
+	if alive, pid := daemonAlive(); alive {
+		fmt.Fprintf(os.Stderr, "doctor --backfill-cwd: daemon is running (pid %d) — run `resleeve down` first\n", pid)
+		return 1
+	}
+	st, err := sqlite.Open(ctx, defaultDSN())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "doctor --backfill-cwd: open store:", err)
+		return 1
+	}
+	defer st.Close()
+
+	logf := func(format string, args ...any) { fmt.Printf(format, args...) }
+	repaired, skipped, err := agent.BackfillSessionCwd(ctx, st, logf)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "doctor --backfill-cwd:", err)
+		return 1
+	}
+	fmt.Printf("scanned: repaired %d, skipped %d\n", repaired, skipped)
 	return 0
 }
 

@@ -411,6 +411,11 @@ func synthesizeSessionStart(sessionID, cwd, version string, ts time.Time) event.
 
 // --- helpers ---
 
+// DeriveScope is the exported entry point for the scope-from-cwd
+// resolver. Used by cross-package backfill helpers (see
+// agent.BackfillSessionCwd). Behavior is identical to deriveScope.
+func DeriveScope(cwd string) string { return deriveScope(cwd) }
+
 // deriveScope picks a scope path for an event given its cwd. Resolution
 // order:
 //  1. $RESLEEVE_SCOPE — verbatim override, if set.

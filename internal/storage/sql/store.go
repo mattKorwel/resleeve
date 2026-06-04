@@ -77,6 +77,13 @@ type SessionStore interface {
 	// INSERT OR IGNORE, so re-appending the same batch must not
 	// double-count. The COUNT(*) on events is authoritative.
 	SyncEventCount(ctx context.Context, sessionID string) error
+
+	// UpdateCwd repairs sessions.cwd (and scope) for a row that was
+	// created before the F1+F2+F3 reconcile fix synthesized a
+	// session_start record. Used by `resleeve doctor --backfill-cwd`.
+	// A no-op for an unknown session_id (UPDATE matches zero rows, no
+	// error).
+	UpdateCwd(ctx context.Context, sessionID, cwd, scope string) error
 }
 
 // EventStore persists session events. Appends are idempotent on
