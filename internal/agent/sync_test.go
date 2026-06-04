@@ -37,11 +37,23 @@ func newSyncTestServer(t *testing.T) (*httptest.Server, *local.Backend) {
 	return ts, backend
 }
 
-// newSyncTestStore returns a fresh in-memory SQLite store with all v1+v2
+// newSyncTestStore returns a fresh SQLite store with all v1+v2
 // migrations applied.
+//
+// Uses a unique tempfile DSN (NOT `file::memory:?cache=shared`) — the
+// shared-cache memory pattern routes every Open() in the process to
+// the SAME backing memory DB, which leaks outbox/sync_state/events
+// rows across tests in a `go test` run and made several flakes harder
+// to triangulate. The actual root cause of the SealedMemoryBlobs flake
+// (round-5 followups #2/#7) was a separate lexicographic-ordering bug
+// in the outbox next_attempt_at column — see the outboxTimeLayout
+// comment in internal/storage/sql/sqlite/sync.go — but the shared
+// memory DB was masking and amplifying it. A per-test tempfile gives
+// every test a clean DB; t.TempDir() handles cleanup automatically.
 func newSyncTestStore(t *testing.T) *sqlite.Store {
 	t.Helper()
-	st, err := sqlite.Open(context.Background(), "file::memory:?cache=shared&_pragma=foreign_keys=on")
+	dsn := "file:" + t.TempDir() + "/store.db?_pragma=foreign_keys=on"
+	st, err := sqlite.Open(context.Background(), dsn)
 	if err != nil {
 		t.Fatalf("sqlite.Open: %v", err)
 	}

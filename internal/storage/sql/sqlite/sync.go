@@ -17,11 +17,30 @@ type syncStore struct {
 // Sync exposes the SyncStore implementation.
 func (s *Store) Sync() rsql.SyncStore { return s.sync }
 
+// outboxTimeLayout is a fixed-width RFC 3339 layout with full
+// nanosecond precision (always 9 fractional digits). The outbox
+// dequeue uses lexicographic comparison on next_attempt_at, so the
+// stored timestamp MUST have a width-stable representation. The
+// stdlib time.RFC3339Nano layout strips trailing zeros (e.g.
+// "...12.93422Z" vs "...12.934221Z") which makes the lex order
+// disagree with the time order at sub-microsecond boundaries — the
+// flake hit by TestSyncClient_SealedMemoryBlobsAreOpaqueOnUpstream
+// (and a few cousin tests) under -count=N: an enqueued row whose
+// formatted timestamp lexically exceeds the dequeue probe's
+// timestamp gets filtered out as "still in the future" even though
+// it's strictly in the past. Padded layout (".000000000Z") preserves
+// monotonicity.
+const outboxTimeLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+func formatOutboxTime(t time.Time) string {
+	return t.UTC().Format(outboxTimeLayout)
+}
+
 func (s *syncStore) EnqueueOutbox(ctx context.Context, kind, key string, blob []byte, nextAttemptAt time.Time) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT OR IGNORE INTO outbox (kind, key, blob, attempts, next_attempt_at)
 		VALUES (?, ?, ?, 0, ?)`,
-		kind, key, blob, nextAttemptAt.UTC().Format(time.RFC3339Nano),
+		kind, key, blob, formatOutboxTime(nextAttemptAt),
 	)
 	if err != nil {
 		return fmt.Errorf("outbox enqueue: %w", err)
@@ -39,7 +58,7 @@ func (s *syncStore) DequeueOutbox(ctx context.Context, batchSize int) ([]rsql.Ou
 		WHERE next_attempt_at <= ?
 		ORDER BY seq ASC
 		LIMIT ?`,
-		time.Now().UTC().Format(time.RFC3339Nano), batchSize,
+		formatOutboxTime(time.Now()), batchSize,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("outbox dequeue: %w", err)
@@ -52,7 +71,13 @@ func (s *syncStore) DequeueOutbox(ctx context.Context, batchSize int) ([]rsql.Ou
 		if err := rows.Scan(&r.Seq, &r.Kind, &r.Key, &r.Blob, &r.Attempts, &nextStr, &r.LastError); err != nil {
 			return nil, err
 		}
-		t, _ := time.Parse(time.RFC3339Nano, nextStr)
+		// Accept either the new fixed-width layout or the legacy
+		// time.RFC3339Nano so any rows written by older daemon binaries
+		// still parse cleanly.
+		t, err := time.Parse(outboxTimeLayout, nextStr)
+		if err != nil {
+			t, _ = time.Parse(time.RFC3339Nano, nextStr)
+		}
 		r.NextAttemptAt = t
 		out = append(out, r)
 	}
@@ -83,7 +108,7 @@ func (s *syncStore) BumpOutboxAttempt(ctx context.Context, seq int64, nextAttemp
 		    next_attempt_at = ?,
 		    last_error = ?
 		WHERE seq = ?`,
-		nextAttemptAt.UTC().Format(time.RFC3339Nano), errMsg, seq,
+		formatOutboxTime(nextAttemptAt), errMsg, seq,
 	)
 	if err != nil {
 		return fmt.Errorf("outbox bump: %w", err)

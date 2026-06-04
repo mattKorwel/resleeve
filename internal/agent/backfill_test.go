@@ -50,7 +50,7 @@ func TestBackfillSessionCwd_RepairsLegacyRows(t *testing.T) {
 	//   sess-broken — legacy: empty cwd, has JSONL on disk — REPAIRED
 	//   sess-no-jsonl — legacy: empty cwd, no on-disk JSONL — SKIPPED
 	//   sess-ok — already has cwd — left alone
-	st, err := sqlite.Open(ctx, "file::memory:?cache=shared&_pragma=foreign_keys=on")
+	st, err := sqlite.Open(ctx, "file:"+t.TempDir()+"/store.db?_pragma=foreign_keys=on")
 	if err != nil {
 		t.Fatalf("sqlite.Open: %v", err)
 	}
