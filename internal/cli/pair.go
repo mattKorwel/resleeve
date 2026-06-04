@@ -96,11 +96,27 @@ func runPairInvite(ctx context.Context, args []string) int {
 	}
 
 	// 1) login-challenge → 2) derive verifier → 3) login → 4) unwrap KEK.
-	kek, _, err := unwrapKEKViaLogin(ctx, *upstream, email, pw)
+	// The login call mints a "pair-invite-ephemeral" device token we'll
+	// never use for sync; revoke it on the way out (success OR error)
+	// so it doesn't linger as a usable bearer credential. Best-effort —
+	// a network failure on the revoke shouldn't mask a successful publish.
+	kek, ephemeralTok, err := unwrapKEKViaLogin(ctx, *upstream, email, pw)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "pair invite:", err)
 		return 1
 	}
+	defer func() {
+		if ephemeralTok == "" {
+			return
+		}
+		// Use a fresh context: if the parent ctx was canceled (e.g. user
+		// hit ^C after publish), we still want a brief window to revoke.
+		revokeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := postJSON(revokeCtx, *upstream+"/v2/auth/logout", ephemeralTok, struct{}{}, nil); err != nil {
+			fmt.Fprintln(os.Stderr, "pair invite: revoke ephemeral token failed (continuing):", err)
+		}
+	}()
 
 	// 5) Generate a fresh pair code. 60 bits ≈ 12 base32 chars; we
 	// chunk as XXXX-XXXX-XXXX for readability. Brief says "60s
