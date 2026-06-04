@@ -1,12 +1,16 @@
 package serve
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mattkorwel/resleeve/internal/sync/local"
 )
@@ -190,6 +194,132 @@ func TestPull_RejectsUnknownKind(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("unknown kind: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// --- SSE (slice 3) ---
+
+func TestSSE_RequiresAuth(t *testing.T) {
+	_, base := newTestServer(t)
+	resp, err := http.Get(base + "/v2/sync/sse?kind=memory")
+	if err != nil {
+		t.Fatalf("GET sse: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("sse no-auth: got %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestSSE_OnlyMemoryKindSupported(t *testing.T) {
+	_, base := newTestServer(t)
+	req, _ := http.NewRequest("GET", base+"/v2/sync/sse?kind=sessions", nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("sse wrong kind: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestSSE_BacklogThenLive seeds two memory rows, subscribes, asserts
+// backlog delivery, pushes a third row, asserts live delivery.
+func TestSSE_BacklogThenLive(t *testing.T) {
+	_, base := newTestServer(t)
+
+	// Seed two memory rows directly via POST /push. Keys use the
+	// slice-3 shape: memory/<encoded-scope-path>.
+	pushRows(t, base, []PushRow{
+		{Key: "memory/alpha", Blob: []byte("scope-a")},
+		{Key: "memory/beta", Blob: []byte("scope-b")},
+	})
+
+	// Open SSE in a goroutine; collect events into a channel.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", base+"/v2/sync/sse?kind=memory", nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("sse GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sse status: got %d, want 200", resp.StatusCode)
+	}
+
+	events := make(chan PushRow, 16)
+	go readSSE(resp.Body, events)
+
+	// Expect 2 backlog events.
+	for i := 0; i < 2; i++ {
+		select {
+		case ev := <-events:
+			if !strings.HasPrefix(ev.Key, "memory/") {
+				t.Errorf("backlog event %d key: %q", i, ev.Key)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for backlog event %d", i)
+		}
+	}
+
+	// Push a third row — should arrive live.
+	pushRows(t, base, []PushRow{
+		{Key: "memory/gamma", Blob: []byte("scope-g")},
+	})
+	select {
+	case ev := <-events:
+		if ev.Key != "memory/gamma" {
+			t.Errorf("live event key: got %q, want memory/gamma", ev.Key)
+		}
+		if string(ev.Blob) != "scope-g" {
+			t.Errorf("live event blob: got %q, want scope-g", string(ev.Blob))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for live event")
+	}
+}
+
+// --- SSE helpers ---
+
+func pushRows(t *testing.T, base string, rows []PushRow) {
+	t.Helper()
+	body, _ := json.Marshal(PushReq{Batch: rows})
+	req, _ := http.NewRequest("POST", base+"/v2/sync/push", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("seed push: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("seed push status %d", resp.StatusCode)
+	}
+}
+
+// readSSE parses the SSE byte stream and sends each PushRow into out.
+// Heartbeats (lines starting with ':') are ignored.
+func readSSE(r io.Reader, out chan<- PushRow) {
+	scanner := bufio.NewScanner(r)
+	var data strings.Builder
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case line == "":
+			if data.Len() == 0 {
+				continue
+			}
+			var row PushRow
+			if err := json.Unmarshal([]byte(data.String()), &row); err == nil {
+				out <- row
+			}
+			data.Reset()
+		case strings.HasPrefix(line, "data:"):
+			data.WriteString(strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+		}
 	}
 }
 

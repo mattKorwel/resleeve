@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mattkorwel/resleeve/internal/event"
+	"github.com/mattkorwel/resleeve/internal/memory"
 	"github.com/mattkorwel/resleeve/internal/serve"
 	rsql "github.com/mattkorwel/resleeve/internal/storage/sql"
 	"github.com/mattkorwel/resleeve/internal/storage/sql/sqlite"
@@ -189,6 +190,144 @@ func TestSyncClient_PullThenPushDoesNotLoop(t *testing.T) {
 	}
 	if d, _ := store.Sync().OutboxDepth(ctx); d != 0 {
 		t.Errorf("pull side-effect: outbox grew to %d (should be 0 — pull bypasses IngestBatch)", d)
+	}
+}
+
+// --- memory sync (slice 3) ---
+
+// TestSyncClient_MemoryEnqueueAndPush verifies that the new
+// EnqueueScope / EnqueuePlan / EnqueueLearning helpers land rows in
+// the outbox and the drain ships them upstream with the documented
+// key shapes (memory/scopes/..., memory/plans/.../<slot>,
+// memory/learnings/.../<id>).
+func TestSyncClient_MemoryEnqueueAndPush(t *testing.T) {
+	ctx := context.Background()
+	ts, backend := newSyncTestServer(t)
+	store := newSyncTestStore(t)
+	sc := NewSyncClient(store, ts.URL, testSyncToken)
+
+	now := time.Now().UTC()
+	scope := &memory.Scope{Path: "monorepo/svc-billing", Kind: memory.ScopeKindProject, Title: "billing", CreatedAt: now, UpdatedAt: now}
+	plan := &memory.Plan{Scope: "monorepo/svc-billing", Name: memory.DefaultPlanSlot, Content: "## plan", UpdatedAt: now}
+	learning := &memory.Learning{ID: "L_123_abc", Scope: "monorepo/svc-billing", Content: "watch the FK ordering", CreatedAt: now}
+
+	if err := sc.EnqueueScope(ctx, scope); err != nil {
+		t.Fatalf("EnqueueScope: %v", err)
+	}
+	if err := sc.EnqueuePlan(ctx, plan); err != nil {
+		t.Fatalf("EnqueuePlan: %v", err)
+	}
+	if err := sc.EnqueueLearning(ctx, learning); err != nil {
+		t.Fatalf("EnqueueLearning: %v", err)
+	}
+
+	if d, _ := store.Sync().OutboxDepth(ctx); d != 3 {
+		t.Fatalf("outbox depth after enqueues: got %d, want 3", d)
+	}
+
+	if err := sc.drainOnce(ctx); err != nil {
+		t.Fatalf("drainOnce: %v", err)
+	}
+
+	if d, _ := store.Sync().OutboxDepth(ctx); d != 0 {
+		t.Errorf("outbox depth after drain: got %d, want 0", d)
+	}
+
+	// The backend should now hold the three rows under their documented
+	// keys. We assert by listing the memory prefix and checking exact keys.
+	keys, _, err := backend.List(ctx, "memory", "", 100)
+	if err != nil {
+		t.Fatalf("backend.List: %v", err)
+	}
+	want := map[string]bool{
+		"memory/monorepo:svc-billing":                              true,
+		"memory/monorepo:svc-billing/plans/" + memory.DefaultPlanSlot: true,
+		"memory/monorepo:svc-billing/learnings/L_123_abc":          true,
+	}
+	for _, k := range keys {
+		if !want[k] {
+			t.Errorf("unexpected key on backend: %q", k)
+		}
+		delete(want, k)
+	}
+	if len(want) != 0 {
+		for k := range want {
+			t.Errorf("missing key on backend: %q", k)
+		}
+	}
+}
+
+// TestSyncClient_PullMemoryDispatchesByPrefix preloads the upstream
+// backend with one scope + plan + learning row each, calls PullNow,
+// and asserts each landed in the local memory store via its proper
+// MemoryStore method (dispatched by key prefix in ingestMemoryRow).
+func TestSyncClient_PullMemoryDispatchesByPrefix(t *testing.T) {
+	ctx := context.Background()
+	ts, backend := newSyncTestServer(t)
+	store := newSyncTestStore(t)
+	sc := NewSyncClient(store, ts.URL, testSyncToken)
+
+	// Seed upstream backend. Key shape places scope first
+	// (memory/<path>) and resources under sub-segments
+	// (memory/<path>/plans/..., memory/<path>/learnings/...) so the
+	// scope row sorts before its dependants — satisfies the local FK
+	// constraint when pulled in lexicographic order.
+	scope := &memory.Scope{Path: "monorepo/svc-x", Kind: memory.ScopeKindProject, Title: "x"}
+	sb, _ := json.Marshal(scope)
+	if err := backend.Put(ctx, "memory/monorepo:svc-x", sb); err != nil {
+		t.Fatal(err)
+	}
+
+	plan := &memory.Plan{Scope: "monorepo/svc-x", Name: memory.DefaultPlanSlot, Content: "## seeded plan"}
+	pb, _ := json.Marshal(plan)
+	if err := backend.Put(ctx, "memory/monorepo:svc-x/plans/"+memory.DefaultPlanSlot, pb); err != nil {
+		t.Fatal(err)
+	}
+
+	learning := &memory.Learning{ID: "L_999_ff", Scope: "monorepo/svc-x", Content: "remote insight"}
+	lb, _ := json.Marshal(learning)
+	if err := backend.Put(ctx, "memory/monorepo:svc-x/learnings/L_999_ff", lb); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := sc.PullNow(ctx); err != nil {
+		t.Fatalf("PullNow: %v", err)
+	}
+
+	// Scope should be local now.
+	gotScope, err := store.Memory().GetScope(ctx, "monorepo/svc-x")
+	if err != nil {
+		t.Fatalf("GetScope: %v", err)
+	}
+	if gotScope.Title != "x" {
+		t.Errorf("scope title: got %q, want x", gotScope.Title)
+	}
+
+	gotPlan, err := store.Memory().GetPlan(ctx, "monorepo/svc-x", memory.DefaultPlanSlot)
+	if err != nil {
+		t.Fatalf("GetPlan: %v", err)
+	}
+	if gotPlan.Content != "## seeded plan" {
+		t.Errorf("plan content: got %q", gotPlan.Content)
+	}
+
+	gotLearning, err := store.Memory().GetLearning(ctx, "L_999_ff")
+	if err != nil {
+		t.Fatalf("GetLearning: %v", err)
+	}
+	if gotLearning.Content != "remote insight" {
+		t.Errorf("learning content: got %q", gotLearning.Content)
+	}
+
+	// Cursor should have advanced.
+	cur, _ := store.Sync().GetCursor(ctx, "memory")
+	if cur == "" {
+		t.Errorf("memory cursor not advanced")
+	}
+
+	// And: PullNow MUST NOT enqueue back to the outbox.
+	if d, _ := store.Sync().OutboxDepth(ctx); d != 0 {
+		t.Errorf("pull-side-effect: outbox grew to %d (want 0)", d)
 	}
 }
 

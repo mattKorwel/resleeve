@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 
@@ -77,6 +78,15 @@ func (d *Daemon) putScope(w http.ResponseWriter, r *http.Request, path string) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	// Fast-tier sync: enqueue the canonical (post-write) scope so other
+	// machines see the same created_at/updated_at we returned to the
+	// caller. Enqueue failure is logged but non-fatal — the next
+	// write will retry; the local store is already committed.
+	if d.sync != nil {
+		if err := d.sync.EnqueueScope(r.Context(), got); err != nil {
+			logSyncEnqueueErr("scope", path, err)
+		}
 	}
 	writeJSON(w, http.StatusOK, got)
 }
@@ -164,6 +174,11 @@ func (d *Daemon) putPlan(w http.ResponseWriter, r *http.Request, scope, slot str
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if d.sync != nil {
+		if err := d.sync.EnqueuePlan(r.Context(), got); err != nil {
+			logSyncEnqueueErr("plan", scope+"/"+slot, err)
+		}
 	}
 	writeJSON(w, http.StatusOK, got)
 }
@@ -254,6 +269,11 @@ func (d *Daemon) appendLearning(w http.ResponseWriter, r *http.Request, scope, s
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if d.sync != nil {
+		if err := d.sync.EnqueueLearning(r.Context(), got); err != nil {
+			logSyncEnqueueErr("learning", scope+"/"+id, err)
+		}
+	}
 	writeJSON(w, http.StatusCreated, got)
 }
 
@@ -300,4 +320,11 @@ func newLearningID() string {
 	var buf [12]byte
 	_, _ = rand.Read(buf[:])
 	return "L_" + strconv.FormatInt(timeNowNano(), 10) + "_" + hex.EncodeToString(buf[:])
+}
+
+// logSyncEnqueueErr is non-fatal: the local store is already committed,
+// so the request still returns success. The next write attempt or the
+// next reconcile pass will retry.
+func logSyncEnqueueErr(resource, ident string, err error) {
+	log.Printf("sync enqueue %s %q: %v", resource, ident, err)
 }
