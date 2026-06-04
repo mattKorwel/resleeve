@@ -34,6 +34,12 @@ type AESGCMSealer struct {
 	aead cipher.AEAD
 }
 
+// Compile-time assertion that AESGCMSealer implements Sealer. Lives
+// here (next to the concrete type) rather than in a downstream package
+// per Q6: the assertion is load-bearing for the Sealer contract, not a
+// keep-import-alive crutch.
+var _ Sealer = (*AESGCMSealer)(nil)
+
 // NewAESGCMSealer constructs an AESGCMSealer from a 32-byte key
 // (AES-256). Returns an error if the key length is wrong.
 func NewAESGCMSealer(key []byte) (*AESGCMSealer, error) {

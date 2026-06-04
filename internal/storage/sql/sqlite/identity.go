@@ -6,7 +6,6 @@ import (
 	"errors"
 	"time"
 
-	"github.com/mattkorwel/resleeve/internal/auth"
 	rsql "github.com/mattkorwel/resleeve/internal/storage/sql"
 )
 
@@ -271,5 +270,4 @@ var (
 	_ rsql.ServerUserStore = (*serverUserStore)(nil)
 	_ rsql.DeviceStore     = (*deviceStore)(nil)
 	_ rsql.PairingStore    = (*pairingStore)(nil)
-	_ auth.Sealer          = (*auth.AESGCMSealer)(nil) // keep auth import live
 )

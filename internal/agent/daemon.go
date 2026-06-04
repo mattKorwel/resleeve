@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/mattkorwel/resleeve/internal/adapter/claude"
 	"github.com/mattkorwel/resleeve/internal/auth"
 	"github.com/mattkorwel/resleeve/internal/storage/sql/sqlite"
 )
@@ -48,6 +47,20 @@ type Config struct {
 	// derives the KEK from the master password. A non-nil Sealer here
 	// is the legacy --seal-key=PATH back-compat path only.
 	Sealer auth.Sealer
+
+	// Reconcilers are fired once at startup (in their own goroutines)
+	// after Serve binds the listener. Empty means "no startup sweep".
+	// The CLI layer is the canonical place to register adapter-specific
+	// reconcilers — daemon stays neutral. See Q12 / reconciler.go.
+	Reconcilers []Reconciler
+
+	// Secret pins the bearer token used to authorize requests. Empty
+	// means Serve will generate a random token at startup (the
+	// production path). Test code that fronts the daemon via Handler()
+	// without calling Serve uses this to install a known token — see
+	// internal/agent/agenttest. Q15 promoted this from a post-hoc
+	// SetSecret seam to a constructor option.
+	Secret string
 }
 
 // New opens the storage backend and prepares the daemon. Call Serve to
@@ -58,7 +71,7 @@ func New(ctx context.Context, cfg Config) (*Daemon, error) {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
 
-	d := &Daemon{cfg: cfg, store: store}
+	d := &Daemon{cfg: cfg, store: store, secret: cfg.Secret}
 	if cfg.Upstream != "" {
 		if cfg.Sealer != nil {
 			d.sync = NewSyncClientWithSealer(store, cfg.Upstream, cfg.UpstreamToken, cfg.Sealer)
@@ -89,15 +102,21 @@ func (d *Daemon) Serve(ctx context.Context) error {
 	}
 	d.listener = ln
 
-	secret, err := generateSecret()
-	if err != nil {
-		_ = ln.Close()
-		return fmt.Errorf("generate secret: %w", err)
+	// d.secret was seeded by New from Config.Secret. Generate a fresh
+	// random one only if the caller didn't pin one (the production
+	// path; cfg.Secret is set today only by agenttest, which never
+	// reaches Serve).
+	if d.secret == "" {
+		secret, err := generateSecret()
+		if err != nil {
+			_ = ln.Close()
+			return fmt.Errorf("generate secret: %w", err)
+		}
+		d.secret = secret
 	}
-	d.secret = secret
 
 	url := fmt.Sprintf("http://%s", ln.Addr().String())
-	endpointPath, err := WriteEndpoint(url, secret)
+	endpointPath, err := WriteEndpoint(url, d.secret)
 	if err != nil {
 		_ = ln.Close()
 		return fmt.Errorf("write endpoint: %w", err)
@@ -131,15 +150,20 @@ func (d *Daemon) Serve(ctx context.Context) error {
 		_ = d.store.Close()
 	}()
 
-	// One-shot reconcile sweep over Claude Code's session JSONL files.
-	// Backfills any events the live hook path missed. Deterministic
-	// UUIDs + INSERT OR IGNORE handle dedup against already-captured rows.
-	go func() {
-		a := claude.New()
-		if err := a.ReconcileOnce(ctx, d); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("reconcile: %v", err)
-		}
-	}()
+	// One-shot reconcile sweep per registered adapter. Backfills any
+	// events the live hook path missed. Deterministic UUIDs +
+	// INSERT OR IGNORE on (session_id, event_uuid) make this safe
+	// against rows the live hook already captured. The daemon is
+	// adapter-neutral here: the CLI layer registers concrete
+	// reconcilers (e.g. claude) via Config.Reconcilers — see Q12.
+	for i, rec := range d.cfg.Reconcilers {
+		i, rec := i, rec
+		go func() {
+			if err := rec(ctx, d); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("reconcile[%d]: %v", i, err)
+			}
+		}()
+	}
 
 	serveErr := d.server.Serve(ln)
 	if errors.Is(serveErr, http.ErrServerClosed) {
@@ -154,14 +178,6 @@ func (d *Daemon) Serve(ctx context.Context) error {
 // is constructed by New, so this is non-nil after New returns.
 func (d *Daemon) Handler() http.Handler {
 	return d.server.Handler
-}
-
-// SetSecret overrides the bearer token used to authorize requests.
-// Serve generates a random secret at startup; tests that front the
-// daemon via Handler() need a known token to construct an authorized
-// agent.Client. Has no effect once Serve has begun.
-func (d *Daemon) SetSecret(s string) {
-	d.secret = s
 }
 
 // Close releases the daemon's storage handle. Normally Serve handles

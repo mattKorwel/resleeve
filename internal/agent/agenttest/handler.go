@@ -31,11 +31,10 @@ func TestHandler(ctx context.Context, dsn, secret string) (http.Handler, func(),
 	if secret == "" {
 		secret = "test-secret-for-mcp"
 	}
-	d, err := agent.New(ctx, agent.Config{DSN: dsn})
+	d, err := agent.New(ctx, agent.Config{DSN: dsn, Secret: secret})
 	if err != nil {
 		return nil, nil, fmt.Errorf("agent.New: %w", err)
 	}
-	d.SetSecret(secret)
 	cleanup := func() { _ = d.Close() }
 	return d.Handler(), cleanup, nil
 }

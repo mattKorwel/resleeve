@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -50,12 +51,11 @@ func (d *Daemon) putScope(w http.ResponseWriter, r *http.Request, path string) {
 		Cwd          string `json:"cwd"`
 		DoNotInherit bool   `json:"do_not_inherit"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, http.ErrBodyNotAllowed) {
-		// Empty body is OK; surface other decode errors.
-		if err.Error() != "EOF" {
-			writeErrorStatus(w, http.StatusBadRequest, "decode: "+err.Error())
-			return
-		}
+	// Empty body is OK (callers can create a scope with just the path
+	// query param + later PUT to set kind); surface other decode errors.
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeErrorStatus(w, http.StatusBadRequest, "decode: "+err.Error())
+		return
 	}
 	kind := memory.ScopeKind(body.Kind)
 	if !kind.Valid() {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base32"
-	"errors"
 	"flag"
 	"fmt"
 	"os"

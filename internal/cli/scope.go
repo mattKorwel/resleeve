@@ -183,7 +183,7 @@ func runScopeDelete(ctx context.Context, args []string) int {
 		return 1
 	}
 	if err := c.DeleteScope(ctx, args[0]); err != nil {
-		if strings.Contains(err.Error(), "has children") || errors.Is(err, memory.ErrScopeHasChildren) {
+		if errors.Is(err, memory.ErrScopeHasChildren) {
 			fmt.Fprintln(os.Stderr, "scope delete: refused — scope has children. Delete them first.")
 			return 1
 		}

@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/mattkorwel/resleeve/internal/memory"
 )
@@ -33,9 +35,37 @@ func (c *Client) GetScope(ctx context.Context, path string) (*memory.Scope, erro
 }
 
 // DeleteScope removes a scope (refuses with 409 if it has children).
+// On the children-present case the returned error wraps the typed
+// sentinel memory.ErrScopeHasChildren so callers can use errors.Is —
+// same pattern as ErrNoUpstream in client.go's doJSON. Until the
+// daemon emits structured error envelopes (see Q2 / round-5 lesson on
+// one-sided sentinel wrapping), we still have to match the body
+// fragment here; if the daemon message drifts the wrap silently
+// degrades to a plain "daemon: 409 Conflict" — that's the same risk
+// the ErrNoUpstream wrap carries.
 func (c *Client) DeleteScope(ctx context.Context, path string) error {
 	endpoint := c.BaseURL + "/v1/scope?path=" + url.QueryEscape(path)
-	return c.doNoBody(ctx, http.MethodDelete, endpoint, nil, "")
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	if c.Secret != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Secret)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("delete %s: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		bodyStr := strings.TrimSpace(string(b))
+		if resp.StatusCode == http.StatusConflict && strings.Contains(bodyStr, "scope has children") {
+			return fmt.Errorf("daemon %s: %s: %w", resp.Status, bodyStr, memory.ErrScopeHasChildren)
+		}
+		return fmt.Errorf("daemon %s: %s", resp.Status, bodyStr)
+	}
+	return nil
 }
 
 // ListScopes returns all scopes.
