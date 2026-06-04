@@ -602,6 +602,69 @@ func TestSyncClient_DecryptFailureWithWrongKey(t *testing.T) {
 	}
 }
 
+// --- escape-hatch endpoints (item #1) ---
+
+// TestSyncClient_DrainNowAndPullNowCounts exercises the count-returning
+// wrappers used by POST /v1/sync/push-now and /v1/sync/pull-now.
+// Locks in the wire-shape contract: DrainNow returns total rows pushed,
+// PullNowCounts returns per-kind ingest counts.
+func TestSyncClient_DrainNowAndPullNowCounts(t *testing.T) {
+	ctx := context.Background()
+	ts, backend := newSyncTestServer(t)
+	store := newSyncTestStore(t)
+	sc := NewSyncClient(store, ts.URL, testSyncToken)
+
+	// Seed two events into the local outbox, then drain via DrainNow.
+	now := time.Now().UTC()
+	evs := []event.Event{
+		{EventUUID: "DN-1", SessionID: "S-DN", Seq: 1000, Kind: event.KindUserMessage, Timestamp: now},
+		{EventUUID: "DN-2", SessionID: "S-DN", Seq: 2000, Kind: event.KindAssistantMessage, Timestamp: now},
+	}
+	if err := sc.EnqueueEvents(ctx, evs); err != nil {
+		t.Fatalf("EnqueueEvents: %v", err)
+	}
+	pushed, err := sc.DrainNow(ctx)
+	if err != nil {
+		t.Fatalf("DrainNow: %v", err)
+	}
+	if pushed != 2 {
+		t.Errorf("DrainNow pushed: got %d, want 2", pushed)
+	}
+	// Subsequent call with empty outbox returns 0, no error.
+	pushed2, err := sc.DrainNow(ctx)
+	if err != nil {
+		t.Fatalf("DrainNow (empty): %v", err)
+	}
+	if pushed2 != 0 {
+		t.Errorf("DrainNow on empty outbox: got %d, want 0", pushed2)
+	}
+
+	// Seed upstream rows for a clean second store to pull.
+	store2 := newSyncTestStore(t)
+	sc2 := NewSyncClient(store2, ts.URL, testSyncToken)
+
+	ses := &rsql.Session{ID: "S-DN", CLI: "claude", StartedAt: now, Status: rsql.SessionStatusActive}
+	sb, _ := json.Marshal(ses)
+	if err := backend.Put(ctx, "sessions/S-DN", sb); err != nil {
+		t.Fatal(err)
+	}
+
+	counts, err := sc2.PullNowCounts(ctx)
+	if err != nil {
+		t.Fatalf("PullNowCounts: %v", err)
+	}
+	// Two events were drained from sc above; both landed on backend.
+	if counts["sessions"] < 1 {
+		t.Errorf("PullNowCounts sessions: got %d, want >= 1", counts["sessions"])
+	}
+	if counts["events"] < 2 {
+		t.Errorf("PullNowCounts events: got %d, want >= 2", counts["events"])
+	}
+	if _, ok := counts["memory"]; !ok {
+		t.Errorf("PullNowCounts missing memory key (should be present even when 0)")
+	}
+}
+
 // encodeEventKey mirrors the key shape SyncClient.EnqueueEvents emits.
 // Duplicated in tests rather than exported because key format is an
 // internal contract between Enqueue and the upstream backend.

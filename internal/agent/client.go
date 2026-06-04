@@ -122,6 +122,48 @@ func (c *Client) Search(ctx context.Context, query string, limit int) ([]rsql.Ev
 	return resp.Hits, nil
 }
 
+// SyncPushResp is the wire shape returned by POST /v1/sync/push-now.
+// Pushed is the count of rows the daemon successfully drained from the
+// outbox. Error is set when the drain returned a non-nil error after
+// (potentially) pushing some rows — the count is still authoritative.
+type SyncPushResp struct {
+	Pushed int    `json:"pushed"`
+	Error  string `json:"error,omitempty"`
+}
+
+// SyncPullResp is the wire shape returned by POST /v1/sync/pull-now.
+// Pulled maps kind ("sessions"|"events"|"memory") to the number of
+// rows ingested this cycle. Error is set on partial failure; counts
+// still reflect what landed before the error.
+type SyncPullResp struct {
+	Pulled map[string]int `json:"pulled"`
+	Error  string         `json:"error,omitempty"`
+}
+
+// SyncPushNow asks the daemon to drain the local outbox immediately.
+// Returns 409 (surfaced as a Go error) if the daemon has no upstream
+// configured.
+func (c *Client) SyncPushNow(ctx context.Context) (*SyncPushResp, error) {
+	endpoint := c.BaseURL + "/v1/sync/push-now"
+	var out SyncPushResp
+	if err := c.doJSON(ctx, http.MethodPost, endpoint, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SyncPullNow asks the daemon to pull from upstream immediately.
+// Returns 409 (surfaced as a Go error) if the daemon has no upstream
+// configured.
+func (c *Client) SyncPullNow(ctx context.Context) (*SyncPullResp, error) {
+	endpoint := c.BaseURL + "/v1/sync/pull-now"
+	var out SyncPullResp
+	if err := c.doJSON(ctx, http.MethodPost, endpoint, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 func (c *Client) doJSON(ctx context.Context, method, endpoint string, body io.Reader, into any) error {
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 	if err != nil {

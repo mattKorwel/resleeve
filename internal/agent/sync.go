@@ -159,7 +159,58 @@ func (s *SyncClient) EnqueueEvents(ctx context.Context, events []event.Event) er
 // (e.g. `resleeve resume` before resolving) to skip the periodic-pull
 // wait. Slice 2 doesn't wire this into existing verbs yet — see round-4/03.
 func (s *SyncClient) PullNow(ctx context.Context) error {
-	return s.pullAllKinds(ctx)
+	_, err := s.pullAllKindsCounts(ctx)
+	return err
+}
+
+// PullNowCounts is PullNow that returns per-kind ingest counts. Used by
+// the `resleeve sync pull` escape-hatch endpoint so the CLI can print
+// e.g. "pulled 3 sessions, 12 events, 1 memory". Counts are the number
+// of rows successfully dispatched into the local stores during this
+// call; idempotent re-ingests of already-known rows still count (we
+// can't cheaply distinguish them here without per-store change probes).
+func (s *SyncClient) PullNowCounts(ctx context.Context) (map[string]int, error) {
+	return s.pullAllKindsCounts(ctx)
+}
+
+// DrainNow drains the outbox in tight back-to-back batches until either
+// (a) the outbox is empty, (b) a batch makes no progress (transient
+// upstream failure — bumpAll already pushed the rows past
+// next_attempt_at), or (c) maxBatches is reached as a safety cap.
+// Returns the number of successfully-pushed rows.
+//
+// Used by the `resleeve sync push` escape-hatch endpoint when the
+// caller wants the pipe drained NOW instead of waiting for the 1s
+// drain ticker. Background drainLoop continues to tick independently.
+func (s *SyncClient) DrainNow(ctx context.Context) (int, error) {
+	const maxBatches = 100 // 100 * batchSize(100) = 10k row cap per call
+	total := 0
+	for i := 0; i < maxBatches; i++ {
+		depthBefore, err := s.store.Sync().OutboxDepth(ctx)
+		if err != nil {
+			return total, err
+		}
+		if depthBefore == 0 {
+			return total, nil
+		}
+		if err := s.drainOnce(ctx); err != nil {
+			return total, err
+		}
+		depthAfter, err := s.store.Sync().OutboxDepth(ctx)
+		if err != nil {
+			return total, err
+		}
+		pushed := depthBefore - depthAfter
+		if pushed <= 0 {
+			// drainOnce ran but no rows came off the queue. Either there
+			// were none ready (next_attempt_at gating) or upstream
+			// rejected them and bumpAll pushed them past now+backoff.
+			// Either way, we're done.
+			return total, nil
+		}
+		total += pushed
+	}
+	return total, nil
 }
 
 // --- internal ---
@@ -275,39 +326,52 @@ func (s *SyncClient) pullLoop(ctx context.Context) {
 }
 
 func (s *SyncClient) pullAllKinds(ctx context.Context) error {
-	for _, kind := range []string{"sessions", "events", "memory"} {
-		if err := s.pullKind(ctx, kind); err != nil {
-			return fmt.Errorf("pull %s: %w", kind, err)
-		}
-	}
-	return nil
+	_, err := s.pullAllKindsCounts(ctx)
+	return err
 }
 
-func (s *SyncClient) pullKind(ctx context.Context, kind string) error {
+// pullAllKindsCounts runs the standard pull cycle and returns a
+// per-kind count of successfully ingested rows. The background pullLoop
+// uses pullAllKinds (counts discarded); the escape-hatch endpoint uses
+// this variant so the CLI can print a summary.
+func (s *SyncClient) pullAllKindsCounts(ctx context.Context) (map[string]int, error) {
+	counts := make(map[string]int, 3)
+	for _, kind := range []string{"sessions", "events", "memory"} {
+		n, err := s.pullKind(ctx, kind)
+		counts[kind] = n
+		if err != nil {
+			return counts, fmt.Errorf("pull %s: %w", kind, err)
+		}
+	}
+	return counts, nil
+}
+
+func (s *SyncClient) pullKind(ctx context.Context, kind string) (int, error) {
 	cursor, err := s.store.Sync().GetCursor(ctx, kind)
 	if err != nil {
-		return err
+		return 0, err
 	}
+	ingested := 0
 	for {
 		u := fmt.Sprintf("%s/v2/sync/pull?kind=%s&since=%s&limit=500",
 			s.upstream, kind, url.QueryEscape(cursor))
 		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 		if err != nil {
-			return err
+			return ingested, err
 		}
 		req.Header.Set("Authorization", "Bearer "+s.token)
 		resp, err := s.httpc.Do(req)
 		if err != nil {
-			return err
+			return ingested, err
 		}
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
-			return fmt.Errorf("pull status %d", resp.StatusCode)
+			return ingested, fmt.Errorf("pull status %d", resp.StatusCode)
 		}
 		var pull serve.PullResp
 		if err := json.NewDecoder(resp.Body).Decode(&pull); err != nil {
 			resp.Body.Close()
-			return err
+			return ingested, err
 		}
 		resp.Body.Close()
 
@@ -326,17 +390,18 @@ func (s *SyncClient) pullKind(ctx context.Context, kind string) error {
 				continue
 			}
 			cursor = row.Key
+			ingested++
 		}
 		if cursor != "" {
 			if err := s.store.Sync().SetCursor(ctx, kind, cursor); err != nil {
-				return err
+				return ingested, err
 			}
 		}
 		if pull.NextCursor == "" {
 			break
 		}
 	}
-	return nil
+	return ingested, nil
 }
 
 func (s *SyncClient) ingestPulled(ctx context.Context, kind string, blob []byte) error {
