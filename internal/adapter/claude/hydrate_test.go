@@ -164,6 +164,57 @@ func TestHydrate_PrimeWritesScratchFile(t *testing.T) {
 	}
 }
 
+// TestHydrate_PrimeForwardsPlanContent verifies item #8 wiring:
+// HydrateOpts.PlanContent reaches the prime synthesizer and shows up
+// under "## Plan" instead of the empty-state "(none captured)"
+// placeholder. Guards against future refactors that drop the field
+// silently — the integration is "additive field flows through" so a
+// regression looks like an unchanged signature with a missing copy.
+func TestHydrate_PrimeForwardsPlanContent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	a := New()
+	session := adapter.SessionView{
+		SessionID: "S1",
+		CLI:       Name,
+		Cwd:       "/x",
+		EventStream: func() ([]event.Event, error) {
+			return []event.Event{
+				{
+					EventUUID: "E1",
+					SessionID: "S1",
+					Seq:       1,
+					Kind:      event.KindUserMessage,
+					Content:   json.RawMessage(`{"text":"hi"}`),
+				},
+			}, nil
+		},
+	}
+	planBody := "## Plan (resleeve)\n\nShip the punch list. Item #8 is wiring." +
+		"\n\n## Learnings (resleeve)\n\n- Caller injects, adapter renders.\n"
+	result, err := a.Hydrate(context.Background(), session, adapter.HydrateOpts{
+		Mode:        adapter.RenderModePrime,
+		PlanContent: planBody,
+	})
+	if err != nil {
+		t.Fatalf("Hydrate prime: %v", err)
+	}
+	body, err := os.ReadFile(result.Path)
+	if err != nil {
+		t.Fatalf("read written file: %v", err)
+	}
+	got := string(body)
+	if strings.Contains(got, "(none captured)") {
+		t.Errorf("plan section still shows empty-state placeholder; PlanContent didn't flow through. Body:\n%s", got)
+	}
+	if !strings.Contains(got, "Ship the punch list. Item #8 is wiring.") {
+		t.Errorf("rendered prime missing PlanContent body. Body:\n%s", got)
+	}
+	if !strings.Contains(got, "Caller injects, adapter renders.") {
+		t.Errorf("rendered prime missing PlanContent learnings line. Body:\n%s", got)
+	}
+}
+
 func TestEncodeCwdForProjectDir(t *testing.T) {
 	cases := map[string]string{
 		"/Users/x/proj":       "-Users-x-proj",

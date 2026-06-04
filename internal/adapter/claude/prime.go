@@ -27,9 +27,12 @@ func (a *Adapter) toNativePrime(session adapter.SessionView, events []event.Even
 // under ~/.resleeve/hydrate/<new-uuid>.md and returns the path. The
 // session id in the result is freshly minted because, conceptually,
 // prime mode starts a new conversation in the target CLI — even when
-// the target is also claude.
-func (a *Adapter) hydratePrime(ctx context.Context, session adapter.SessionView, events []event.Event) (adapter.HydrateResult, error) {
-	body, err := common.SynthesizePrime(session, events, common.PrimeOpts{})
+// the target is also claude. opts.PlanContent (if non-empty) is
+// forwarded to the prime synthesizer to populate the "## Plan" body.
+func (a *Adapter) hydratePrime(ctx context.Context, session adapter.SessionView, events []event.Event, opts adapter.HydrateOpts) (adapter.HydrateResult, error) {
+	body, err := common.SynthesizePrime(session, events, common.PrimeOpts{
+		PlanContent: opts.PlanContent,
+	})
 	if err != nil {
 		return adapter.HydrateResult{}, fmt.Errorf("claude.Hydrate: synthesize prime: %w", err)
 	}

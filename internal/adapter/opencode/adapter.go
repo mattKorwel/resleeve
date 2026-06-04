@@ -91,7 +91,9 @@ func (a *Adapter) Hydrate(ctx context.Context, session adapter.SessionView, opts
 		return adapter.HydrateResult{}, fmt.Errorf("opencode.Hydrate: load events: %w", err)
 	}
 
-	body, err := common.SynthesizePrime(session, events, common.PrimeOpts{})
+	body, err := common.SynthesizePrime(session, events, common.PrimeOpts{
+		PlanContent: opts.PlanContent,
+	})
 	if err != nil {
 		return adapter.HydrateResult{}, fmt.Errorf("opencode.Hydrate: synthesize prime: %w", err)
 	}

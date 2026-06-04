@@ -140,7 +140,28 @@ func runResume(ctx context.Context, args []string) int {
 		EventStream: func() ([]event.Event, error) { return loadAllEvents(ctx, c, sessionID) },
 	}
 
-	result, err := a.Hydrate(ctx, view, adapter.HydrateOpts{Mode: mode, Cwd: cwdOverride})
+	// Prime mode renders a "## Plan" section from the session's scope's
+	// rolled-up memory context (item #8 on the polish punch list). We
+	// fetch via the same daemon endpoint the SessionStart hook uses
+	// (GET /v1/context); replay mode skips this entirely (the section
+	// is prime-only). Empty / "unknown" scopes are skipped: BuildContext
+	// would have nothing useful to return and "unknown" is a sentinel
+	// the slot writer uses when the source CLI never sent a scope.
+	var planContent string
+	if mode == adapter.RenderModePrime {
+		scope := ses.Slot.Scope
+		if scope != "" && scope != "unknown" {
+			ctxBody, ctxErr := c.GetContext(ctx, scope)
+			if ctxErr != nil {
+				// Non-fatal: prime can still render with an empty plan.
+				fmt.Fprintf(os.Stderr, "resume: warning: fetch context for scope %q: %v\n", scope, ctxErr)
+			} else {
+				planContent = ctxBody
+			}
+		}
+	}
+
+	result, err := a.Hydrate(ctx, view, adapter.HydrateOpts{Mode: mode, Cwd: cwdOverride, PlanContent: planContent})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "resume: hydrate:", err)
 		return 1

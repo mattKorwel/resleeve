@@ -104,6 +104,13 @@ const (
 type HydrateOpts struct {
 	Mode RenderMode // empty / Auto = adapter chooses
 	Cwd  string     // override session.Cwd; empty = use session's cwd as-captured
+	// PlanContent is a pre-rendered "## Plan" body forwarded to the
+	// prime-mode synthesizer (common.PrimeOpts.PlanContent). The caller
+	// (typically `resleeve resume`) is responsible for resolving the
+	// session's scope and calling memory.BuildContext; the adapter
+	// stays free of memory-store coupling. Ignored in replay mode.
+	// Empty → prime renders "(none captured)".
+	PlanContent string
 }
 
 // HydrateResult reports what the adapter actually materialized.

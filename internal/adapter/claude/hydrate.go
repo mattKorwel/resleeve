@@ -37,7 +37,7 @@ func (a *Adapter) Hydrate(ctx context.Context, session adapter.SessionView, opts
 	}
 
 	if mode == adapter.RenderModePrime {
-		return a.hydratePrime(ctx, session, events)
+		return a.hydratePrime(ctx, session, events, opts)
 	}
 	if mode != adapter.RenderModeReplay {
 		return adapter.HydrateResult{}, fmt.Errorf("claude.Hydrate: unknown mode %q", mode)
