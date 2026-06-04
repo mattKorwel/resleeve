@@ -153,6 +153,30 @@ func versionOf(name string) int {
 	return n
 }
 
+// sessionTimeLayout is a fixed-width RFC 3339 layout with full
+// nanosecond precision (always 9 fractional digits). sessions.started_at
+// is lexicographically compared by the `List` query when callers
+// pass SessionFilter.Since (`WHERE started_at >= ?`), so the stored
+// timestamp MUST be width-stable. See outboxTimeLayout in sync.go for
+// the longer rationale — same bug class. ended_at and events.ts share
+// the helper for consistency even though they're never lex-compared:
+// cheap insurance against a future ORDER BY paired with a `<` clause.
+const sessionTimeLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+func formatSessionTime(t time.Time) string {
+	return t.UTC().Format(sessionTimeLayout)
+}
+
+// parseSessionTime accepts either the new fixed-width layout or the
+// legacy time.RFC3339Nano so rows written by older daemon binaries
+// still parse cleanly.
+func parseSessionTime(s string) (time.Time, error) {
+	if t, err := time.Parse(sessionTimeLayout, s); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339Nano, s)
+}
+
 // ---- sessionStore ----
 
 type sessionStore struct{ db *sql.DB }
@@ -166,7 +190,7 @@ type sessionStore struct{ db *sql.DB }
 func (s *sessionStore) Create(ctx context.Context, ses *rsql.Session) error {
 	var endedAt sql.NullString
 	if ses.EndedAt != nil {
-		endedAt = sql.NullString{Valid: true, String: ses.EndedAt.UTC().Format(time.RFC3339Nano)}
+		endedAt = sql.NullString{Valid: true, String: formatSessionTime(*ses.EndedAt)}
 	}
 	var exitStatus sql.NullInt64
 	if ses.ExitStatus != nil {
@@ -176,7 +200,7 @@ func (s *sessionStore) Create(ctx context.Context, ses *rsql.Session) error {
 		(id, scope, agent_name, cli, cli_version, cwd, git_branch, model, started_at, ended_at, event_count, status, exit_status)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		ses.ID, ses.Slot.Scope, ses.Slot.AgentName, ses.CLI, ses.CLIVersion, ses.Cwd, ses.GitBranch, ses.Model,
-		ses.StartedAt.UTC().Format(time.RFC3339Nano), endedAt, ses.EventCount, string(ses.Status), exitStatus,
+		formatSessionTime(ses.StartedAt), endedAt, ses.EventCount, string(ses.Status), exitStatus,
 	)
 	return err
 }
@@ -200,11 +224,11 @@ func (s *sessionStore) Get(ctx context.Context, id string) (*rsql.Session, error
 		}
 		return nil, err
 	}
-	if t, err := time.Parse(time.RFC3339Nano, startedAt); err == nil {
+	if t, err := parseSessionTime(startedAt); err == nil {
 		ses.StartedAt = t
 	}
 	if endedAt.Valid {
-		if t, err := time.Parse(time.RFC3339Nano, endedAt.String); err == nil {
+		if t, err := parseSessionTime(endedAt.String); err == nil {
 			ses.EndedAt = &t
 		}
 	}
@@ -274,7 +298,7 @@ func (s *sessionStore) List(ctx context.Context, f rsql.SessionFilter) ([]*rsql.
 	}
 	if f.Since != nil {
 		q += ` AND started_at >= ?`
-		args = append(args, f.Since.UTC().Format(time.RFC3339Nano))
+		args = append(args, formatSessionTime(*f.Since))
 	}
 	q += ` ORDER BY started_at DESC`
 	if !unlimited {
@@ -302,11 +326,11 @@ func (s *sessionStore) List(ctx context.Context, f rsql.SessionFilter) ([]*rsql.
 		); err != nil {
 			return nil, err
 		}
-		if t, err := time.Parse(time.RFC3339Nano, startedAt); err == nil {
+		if t, err := parseSessionTime(startedAt); err == nil {
 			ses.StartedAt = t
 		}
 		if endedAt.Valid {
-			if t, err := time.Parse(time.RFC3339Nano, endedAt.String); err == nil {
+			if t, err := parseSessionTime(endedAt.String); err == nil {
 				ses.EndedAt = &t
 			}
 		}

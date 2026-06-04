@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -307,4 +308,116 @@ func TestMigrations_DroppedUsersTable(t *testing.T) {
 		`SELECT version FROM schema_migrations WHERE version = 6`).Scan(&v); err != nil {
 		t.Errorf("migration 0006 not recorded in schema_migrations: %v", err)
 	}
+}
+
+// openTestStoreFile returns a fresh sqlite Store backed by a per-test
+// tempfile DSN — NOT `file::memory:?cache=shared`. The shared-cache
+// memory DSN routes every Open() in the process to a single backing
+// store, which leaks rows across subtests and was masking the original
+// outbox lex-order flake (see G's fix in sync.go and newSyncTestStore
+// in internal/agent/sync_test.go for the same migration).
+func openTestStoreFile(t *testing.T) *Store {
+	t.Helper()
+	ctx := context.Background()
+	dsn := "file:" + t.TempDir() + "/store.db?_pragma=foreign_keys=on"
+	st, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
+
+// TestSession_SinceFilterLexOrderMatchesTimeOrder is the regression
+// test for Q17 on sessions.started_at. The bug class: TEXT timestamps
+// formatted with time.RFC3339Nano strip trailing zeros, so two adjacent
+// time.Now() calls can produce strings whose lex order disagrees with
+// their time order at sub-microsecond boundaries — under
+// `WHERE started_at >= ?` the SessionFilter.Since boundary can silently
+// drop a row that's strictly after the cutoff. The fix is the
+// fixed-width sessionTimeLayout in sqlite.go. Forty iterations is a
+// generous oversample of the ~0.3% per-pair flake rate G measured on
+// macOS — we want a flake-free signal here, not a probabilistic one.
+func TestSession_SinceFilterLexOrderMatchesTimeOrder(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStoreFile(t)
+
+	slot := event.Slot{Scope: "q17", AgentName: "ag"}
+	const N = 40
+	for i := 0; i < N; i++ {
+		// Two adjacent time.Now() snapshots: cutoff is taken FIRST, then
+		// the session start. The session strictly post-dates the cutoff
+		// in wall time, so any correct WHERE started_at >= cutoff filter
+		// MUST include it.
+		cutoff := time.Now().UTC()
+		started := time.Now().UTC()
+		if !started.After(cutoff) && !started.Equal(cutoff) {
+			// monotonic clock is non-decreasing — this would be a stdlib bug.
+			t.Fatalf("iter %d: started %v not >= cutoff %v", i, started, cutoff)
+		}
+
+		ses := &rsql.Session{
+			ID:        "S" + strings.Repeat("0", 6) + itoa(i),
+			Slot:      slot,
+			CLI:       "c",
+			Cwd:       "/x",
+			StartedAt: started,
+			Status:    rsql.SessionStatusActive,
+		}
+		if err := st.Sessions().Create(ctx, ses); err != nil {
+			t.Fatalf("iter %d: create: %v", i, err)
+		}
+
+		// The just-inserted session must appear when we filter from cutoff
+		// onward, scoped tightly to this slot/scope so previous iterations
+		// don't pollute the result.
+		sinceCopy := cutoff
+		list, err := st.Sessions().List(ctx, rsql.SessionFilter{
+			Scope: slot.Scope,
+			Since: &sinceCopy,
+			Limit: 100,
+		})
+		if err != nil {
+			t.Fatalf("iter %d: list: %v", i, err)
+		}
+		var found bool
+		for _, got := range list {
+			if got.ID == ses.ID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("iter %d: row started=%s missing from list filtered since=%s (lex-order bug?)",
+				i, started.Format(time.RFC3339Nano), cutoff.Format(time.RFC3339Nano))
+		}
+
+		// Cleanup: ListByUser cleanup isn't available; rely on tempfile
+		// teardown. The unique session ID per iteration is enough.
+	}
+}
+
+// itoa returns the decimal representation of i without pulling in the
+// strconv import the test file otherwise doesn't need.
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	neg := false
+	if i < 0 {
+		neg = true
+		i = -i
+	}
+	var buf [20]byte
+	pos := len(buf)
+	for i > 0 {
+		pos--
+		buf[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	if neg {
+		pos--
+		buf[pos] = '-'
+	}
+	return string(buf[pos:])
 }

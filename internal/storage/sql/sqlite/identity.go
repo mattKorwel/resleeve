@@ -10,6 +10,29 @@ import (
 	rsql "github.com/mattkorwel/resleeve/internal/storage/sql"
 )
 
+// pairingTimeLayout is a fixed-width RFC 3339 layout with full
+// nanosecond precision (always 9 fractional digits). pairing_codes.expires_at
+// is lexicographically compared by Claim (`WHERE expires_at > ?`) and
+// SweepExpired (`WHERE expires_at <= ?`), so the stored timestamp MUST
+// be width-stable. See outboxTimeLayout in sync.go for the longer
+// rationale — same bug class. created_at and claimed_at share the
+// helper for consistency even though they aren't currently lex-compared.
+const pairingTimeLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+func formatPairingTime(t time.Time) string {
+	return t.UTC().Format(pairingTimeLayout)
+}
+
+// parsePairingTime accepts either the new fixed-width layout or the
+// legacy time.RFC3339Nano so rows written by older daemon binaries
+// still parse cleanly.
+func parsePairingTime(s string) (time.Time, error) {
+	if t, err := time.Parse(pairingTimeLayout, s); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339Nano, s)
+}
+
 // serverUserStore implements rsql.ServerUserStore against the
 // server-side `server_users` table introduced in migration 0005. It is
 // intentionally distinct from userStore (which serves the client-side
@@ -171,8 +194,8 @@ func (s *pairingStore) Create(ctx context.Context, c *rsql.PairingCode) error {
 		c.Params.MemoryKiB, c.Params.TimeIters, c.Params.Parallelism,
 		c.Verifier.Salt, c.Verifier.Hash,
 		c.WrappedK.Salt, c.WrappedK.Nonce, c.WrappedK.Ciphertext,
-		c.CreatedAt.UTC().Format(time.RFC3339Nano),
-		c.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		formatPairingTime(c.CreatedAt),
+		formatPairingTime(c.ExpiresAt),
 	)
 	return err
 }
@@ -195,14 +218,14 @@ func (s *pairingStore) Get(ctx context.Context, codeID string) (*rsql.PairingCod
 		}
 		return nil, err
 	}
-	if t, err := time.Parse(time.RFC3339Nano, created); err == nil {
+	if t, err := parsePairingTime(created); err == nil {
 		c.CreatedAt = t
 	}
-	if t, err := time.Parse(time.RFC3339Nano, expires); err == nil {
+	if t, err := parsePairingTime(expires); err == nil {
 		c.ExpiresAt = t
 	}
 	if claimed.Valid {
-		if t, err := time.Parse(time.RFC3339Nano, claimed.String); err == nil {
+		if t, err := parsePairingTime(claimed.String); err == nil {
 			c.ClaimedAt = &t
 		}
 	}
@@ -215,8 +238,8 @@ func (s *pairingStore) Claim(ctx context.Context, codeID string, now time.Time) 
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE pairing_codes SET claimed_at = ?
 		   WHERE code_id = ? AND claimed_at IS NULL AND expires_at > ?`,
-		now.UTC().Format(time.RFC3339Nano), codeID,
-		now.UTC().Format(time.RFC3339Nano),
+		formatPairingTime(now), codeID,
+		formatPairingTime(now),
 	)
 	if err != nil {
 		return err
@@ -239,7 +262,7 @@ func (s *pairingStore) Delete(ctx context.Context, codeID string) error {
 func (s *pairingStore) SweepExpired(ctx context.Context, now time.Time) error {
 	_, err := s.db.ExecContext(ctx,
 		`DELETE FROM pairing_codes WHERE expires_at <= ?`,
-		now.UTC().Format(time.RFC3339Nano))
+		formatPairingTime(now))
 	return err
 }
 
