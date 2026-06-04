@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/mattkorwel/resleeve/internal/auth"
+	rsql "github.com/mattkorwel/resleeve/internal/storage/sql"
 	"github.com/mattkorwel/resleeve/internal/storage/sql/sqlite"
 	"github.com/mattkorwel/resleeve/internal/sync/local"
 )
@@ -323,6 +324,68 @@ func TestSync_LegacyBearerStillWorks(t *testing.T) {
 	_, base, _ := newIdentityServer(t)
 	postStatus(t, base+"/v2/sync/push", testToken,
 		PushReq{Batch: []PushRow{{Key: "sessions/legacy", Blob: []byte("b")}}}, 200)
+}
+
+// TestPairPublish_RejectsLegacyBearerWithEmptyUID guards sec-H3: the
+// legacy single-bearer fallback returns a synthetic device with
+// UserID="". Before the fix, that synthetic device could mint a
+// pairing_codes row under an empty user. After the fix, pair/publish
+// must reject with 401 — only a real per-device token can publish.
+func TestPairPublish_RejectsLegacyBearerWithEmptyUID(t *testing.T) {
+	_, base, _ := newIdentityServer(t)
+	// Body shape is irrelevant — the guard fires before decode.
+	postStatus(t, base+"/v2/auth/pair/publish", testToken, PairPublishReq{
+		CodeID: "anything",
+	}, 401)
+}
+
+// TestSyncPush_StillAcceptsLegacyBearer is the regression companion:
+// the sec-H3 guard must NOT bleed into content-blind sync endpoints.
+// Legacy bearer + /v2/sync/push remains 200 until operators rotate
+// devices.
+func TestSyncPush_StillAcceptsLegacyBearer(t *testing.T) {
+	_, base, _ := newIdentityServer(t)
+	postStatus(t, base+"/v2/sync/push", testToken,
+		PushReq{Batch: []PushRow{{Key: "sessions/regression", Blob: []byte("b")}}}, 200)
+}
+
+// TestRequireUserDevice_RejectsEmptyUID is a direct unit test on the
+// helper — verifies that an empty UserID device is rejected (writes
+// 401) and a real-user device is accepted (returns true, no write).
+func TestRequireUserDevice_RejectsEmptyUID(t *testing.T) {
+	s, _, _ := newIdentityServer(t)
+	_ = s // server is only constructed for parity with other tests; we use a fresh Server below.
+
+	srv := &Server{}
+	r := httptest.NewRequest("POST", "/v2/auth/pair/publish", nil)
+
+	// 1) Legacy synthetic device (UserID=="") → rejected, 401 written.
+	rec := httptest.NewRecorder()
+	if ok := srv.requireUserDevice(rec, r, &rsql.Device{ID: "legacy", UserID: ""}); ok {
+		t.Fatal("requireUserDevice: legacy-synthetic device returned true; want false")
+	}
+	if rec.Code != 401 {
+		t.Errorf("requireUserDevice: legacy-synthetic status = %d, want 401", rec.Code)
+	}
+
+	// 2) Real device (UserID set) → accepted, nothing written.
+	rec2 := httptest.NewRecorder()
+	if ok := srv.requireUserDevice(rec2, r, &rsql.Device{ID: "dev_xxx", UserID: "u_real"}); !ok {
+		t.Fatal("requireUserDevice: real device returned false; want true")
+	}
+	if rec2.Code != 200 {
+		// httptest.NewRecorder defaults to 200 if WriteHeader was not called.
+		t.Errorf("requireUserDevice: real-device write occurred (status=%d); want no write", rec2.Code)
+	}
+
+	// 3) Nil device → rejected as well (defense-in-depth).
+	rec3 := httptest.NewRecorder()
+	if ok := srv.requireUserDevice(rec3, r, nil); ok {
+		t.Fatal("requireUserDevice: nil device returned true; want false")
+	}
+	if rec3.Code != 401 {
+		t.Errorf("requireUserDevice: nil-device status = %d, want 401", rec3.Code)
+	}
 }
 
 // --- helpers ---

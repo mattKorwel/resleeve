@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -351,6 +352,15 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "missing or invalid bearer token")
 		return
 	}
+	// sec-H3: logout deletes a device row by ID. The synthetic legacy
+	// device has ID="legacy" and was never persisted; calling Delete on
+	// it would silently no-op (or, worse, target a real row if someone
+	// later registered a device with that name). Reject the legacy
+	// fallback explicitly so logout only operates on real per-device
+	// tokens.
+	if !s.requireUserDevice(w, r, dev) {
+		return
+	}
 	if err := s.devices.Delete(r.Context(), dev.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, "delete device: "+err.Error())
 		return
@@ -392,6 +402,12 @@ type PairPublishResp struct {
 func (s *Server) handlePairPublish(w http.ResponseWriter, r *http.Request, dev *rsql.Device) {
 	if s.pairings == nil {
 		writeError(w, http.StatusServiceUnavailable, "identity store not configured")
+		return
+	}
+	// sec-H3: pair/publish writes a pairing_codes row scoped by user_id.
+	// The legacy single-bearer fallback has no user, so it must NOT be
+	// able to mint pairing rows under an empty user.
+	if !s.requireUserDevice(w, r, dev) {
 		return
 	}
 	var req PairPublishReq
@@ -601,6 +617,26 @@ func (s *Server) deviceFromBearer(r *http.Request) (*rsql.Device, bool) {
 		return &rsql.Device{ID: "legacy", UserID: "", Name: "legacy-bearer"}, true
 	}
 	return nil, false
+}
+
+// requireUserDevice gates endpoints that require a real user identity
+// (i.e. anything that writes rows scoped by user_id). The legacy
+// single-bearer fallback in deviceFromBearer returns a synthetic device
+// with UserID="" — that's fine for content-blind /v2/sync/* routes, but
+// NOT fine for identity routes like pair/publish (sec-H3): otherwise a
+// legacy bearer can mint pairing rows under an empty user.
+//
+// Returns true when the caller may proceed. Writes 401 + logs a warning
+// when the bearer is a legacy single-token (no user). The warning is
+// the operator's nudge to migrate off the legacy path.
+func (s *Server) requireUserDevice(w http.ResponseWriter, r *http.Request, dev *rsql.Device) bool {
+	if dev != nil && dev.UserID != "" {
+		return true
+	}
+	log.Printf("serve: legacy bearer used for %s %s, which requires a real user identity; consider running `resleeve register` + per-device tokens",
+		r.Method, r.URL.Path)
+	writeError(w, http.StatusUnauthorized, "endpoint requires a per-device token; legacy bearer cannot identify a user")
+	return false
 }
 
 // --- helpers ---
