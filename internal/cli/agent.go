@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/mattkorwel/resleeve/internal/agent"
+	"github.com/mattkorwel/resleeve/internal/auth"
 )
 
 func runAgent(ctx context.Context, args []string) int {
@@ -29,11 +30,34 @@ func runAgent(ctx context.Context, args []string) int {
 		*upstreamToken = os.Getenv("RESLEEVE_UPSTREAM_TOKEN")
 	}
 
+	// When upstream is configured, build the slice-2.5 placeholder
+	// Sealer from a daemon-local random key persisted at
+	// <data-dir>/seal.key. Round 5+ replaces this with a KEK derived
+	// from `resleeve login` (same Sealer interface; only the bytes'
+	// provenance changes).
+	var sealer auth.Sealer
+	sealKeyPath := defaultSealKeyPath()
+	if *upstream != "" {
+		key, err := auth.LoadOrCreateSealKey(sealKeyPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "resleeve agent: seal key:", err)
+			return 1
+		}
+		s, err := auth.NewAESGCMSealer(key)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "resleeve agent: sealer:", err)
+			return 1
+		}
+		sealer = s
+	}
+
 	d, err := agent.New(ctx, agent.Config{
 		DSN:           *dsn,
 		Addr:          *addr,
 		Upstream:      *upstream,
 		UpstreamToken: *upstreamToken,
+		Sealer:        sealer,
+		SealKeyPath:   sealKeyPath,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "resleeve agent:", err)
@@ -53,4 +77,12 @@ func defaultDSN() string {
 	}
 	dbPath := filepath.Join(home, ".resleeve", "data.db")
 	return "file:" + dbPath + "?_pragma=journal_mode=WAL&_pragma=foreign_keys=on"
+}
+
+func defaultSealKeyPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	return filepath.Join(home, ".resleeve", "seal.key")
 }

@@ -1,12 +1,15 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/mattkorwel/resleeve/internal/auth"
 	"github.com/mattkorwel/resleeve/internal/event"
 	"github.com/mattkorwel/resleeve/internal/memory"
 	"github.com/mattkorwel/resleeve/internal/serve"
@@ -193,13 +196,7 @@ func TestSyncClient_PullThenPushDoesNotLoop(t *testing.T) {
 	}
 }
 
-// --- memory sync (slice 3) ---
-
-// TestSyncClient_MemoryEnqueueAndPush verifies that the new
-// EnqueueScope / EnqueuePlan / EnqueueLearning helpers land rows in
-// the outbox and the drain ships them upstream with the documented
-// key shapes (memory/scopes/..., memory/plans/.../<slot>,
-// memory/learnings/.../<id>).
+// --- slice 2.5: envelope encryption at the sync boundary ---
 func TestSyncClient_MemoryEnqueueAndPush(t *testing.T) {
 	ctx := context.Background()
 	ts, backend := newSyncTestServer(t)
@@ -328,6 +325,226 @@ func TestSyncClient_PullMemoryDispatchesByPrefix(t *testing.T) {
 	// And: PullNow MUST NOT enqueue back to the outbox.
 	if d, _ := store.Sync().OutboxDepth(ctx); d != 0 {
 		t.Errorf("pull-side-effect: outbox grew to %d (want 0)", d)
+	}
+}
+
+// encodeEventKey mirrors the key shape SyncClient.EnqueueEvents emits.
+// Duplicated in tests rather than exported because key format is an
+// internal contract between Enqueue and the upstream backend.
+func newTestSealer(t *testing.T) auth.Sealer {
+	t.Helper()
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatalf("rand seal key: %v", err)
+	}
+	s, err := auth.NewAESGCMSealer(key)
+	if err != nil {
+		t.Fatalf("NewAESGCMSealer: %v", err)
+	}
+	return s
+}
+
+// TestSyncClient_SealedBlobsAreOpaqueOnUpstream verifies that with a
+// Sealer configured, the blobs landing in the upstream backend do NOT
+// contain any plaintext from the event (zero-knowledge invariant).
+func TestSyncClient_SealedBlobsAreOpaqueOnUpstream(t *testing.T) {
+	ctx := context.Background()
+	ts, backend := newSyncTestServer(t)
+	store := newSyncTestStore(t)
+	sealer := newTestSealer(t)
+	sc := NewSyncClientWithSealer(store, ts.URL, testSyncToken, sealer)
+
+	const marker = "TOPSECRET-EVENT-UUID-7777"
+	ev := event.Event{
+		EventUUID: marker,
+		SessionID: "S-SEAL",
+		Seq:       1000,
+		Kind:      event.KindUserMessage,
+		Vendor:    event.Vendor{Name: "claude"},
+		Content:   json.RawMessage(`{"text":"plaintext-marker-PASSWORD123"}`),
+		Timestamp: time.Now().UTC(),
+	}
+	if err := sc.EnqueueEvents(ctx, []event.Event{ev}); err != nil {
+		t.Fatalf("EnqueueEvents: %v", err)
+	}
+	if err := sc.drainOnce(ctx); err != nil {
+		t.Fatalf("drainOnce: %v", err)
+	}
+
+	keys, _, err := backend.List(ctx, "events", "", 100)
+	if err != nil {
+		t.Fatalf("backend.List: %v", err)
+	}
+	if len(keys) != 1 {
+		t.Fatalf("backend keys after drain: got %d, want 1", len(keys))
+	}
+	blob, err := backend.Get(ctx, keys[0])
+	if err != nil {
+		t.Fatalf("backend.Get: %v", err)
+	}
+	if bytes.Contains(blob, []byte(marker)) {
+		t.Errorf("upstream blob leaks event UUID %q", marker)
+	}
+	if bytes.Contains(blob, []byte("plaintext-marker-PASSWORD123")) {
+		t.Errorf("upstream blob leaks event content plaintext")
+	}
+	if bytes.Contains(blob, []byte("claude")) {
+		t.Errorf("upstream blob leaks vendor name (plaintext)")
+	}
+}
+
+// TestSyncClient_RoundTripWithSealer pushes encrypted on client A and
+// verifies client B (same key, distinct store) decrypts and ingests
+// the event with original fields intact.
+func TestSyncClient_RoundTripWithSealer(t *testing.T) {
+	ctx := context.Background()
+	ts, _ := newSyncTestServer(t)
+
+	// Two distinct file-backed stores so client B's pull lands in its
+	// own SQLite, not client A's shared-cache memory DB.
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	storeA, err := sqlite.Open(ctx, "file:"+dirA+"/a.db?_pragma=foreign_keys=on")
+	if err != nil {
+		t.Fatalf("open A: %v", err)
+	}
+	t.Cleanup(func() { _ = storeA.Close() })
+	storeB, err := sqlite.Open(ctx, "file:"+dirB+"/b.db?_pragma=foreign_keys=on")
+	if err != nil {
+		t.Fatalf("open B: %v", err)
+	}
+	t.Cleanup(func() { _ = storeB.Close() })
+
+	// Same seal key on both sides.
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	sealerA, _ := auth.NewAESGCMSealer(key)
+	sealerB, _ := auth.NewAESGCMSealer(key)
+
+	scA := NewSyncClientWithSealer(storeA, ts.URL, testSyncToken, sealerA)
+	scB := NewSyncClientWithSealer(storeB, ts.URL, testSyncToken, sealerB)
+
+	// A first pushes a session (parent row) and then the event.
+	ses := &rsql.Session{ID: "S-RT", CLI: "claude", StartedAt: time.Now().UTC(), Status: rsql.SessionStatusActive}
+	if err := scA.EnqueueSession(ctx, ses); err != nil {
+		t.Fatalf("EnqueueSession: %v", err)
+	}
+	ev := event.Event{
+		EventUUID:     "EV-ROUNDTRIP",
+		SessionID:     "S-RT",
+		Seq:           1000,
+		Kind:          event.KindUserMessage,
+		SchemaVersion: 1,
+		Vendor:        event.Vendor{Name: "claude"},
+		Content:       json.RawMessage(`{"text":"hello-from-A"}`),
+		Timestamp:     time.Now().UTC(),
+	}
+	if err := scA.EnqueueEvents(ctx, []event.Event{ev}); err != nil {
+		t.Fatalf("EnqueueEvents: %v", err)
+	}
+	if err := scA.drainOnce(ctx); err != nil {
+		t.Fatalf("drainOnce A: %v", err)
+	}
+
+	if err := scB.PullNow(ctx); err != nil {
+		t.Fatalf("PullNow B: %v", err)
+	}
+
+	gotSes, err := storeB.Sessions().Get(ctx, "S-RT")
+	if err != nil {
+		t.Fatalf("B has no session: %v", err)
+	}
+	if gotSes.CLI != "claude" {
+		t.Errorf("session CLI: got %q, want %q", gotSes.CLI, "claude")
+	}
+	events, err := storeB.Events().List(ctx, "S-RT", 0, 100)
+	if err != nil {
+		t.Fatalf("B events list: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("B event count: got %d, want 1", len(events))
+	}
+	if events[0].EventUUID != "EV-ROUNDTRIP" {
+		t.Errorf("B event UUID: got %q, want %q", events[0].EventUUID, "EV-ROUNDTRIP")
+	}
+	if !bytes.Contains([]byte(events[0].Content), []byte("hello-from-A")) {
+		t.Errorf("B event content: got %s, want contains hello-from-A", events[0].Content)
+	}
+}
+
+// TestSyncClient_DecryptFailureWithWrongKey ensures that when client B
+// has the wrong seal key, the pull ingests nothing AND the events
+// cursor stays empty (the failed row is not counted as committed).
+func TestSyncClient_DecryptFailureWithWrongKey(t *testing.T) {
+	ctx := context.Background()
+	ts, _ := newSyncTestServer(t)
+
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	storeA, err := sqlite.Open(ctx, "file:"+dirA+"/a.db?_pragma=foreign_keys=on")
+	if err != nil {
+		t.Fatalf("open A: %v", err)
+	}
+	t.Cleanup(func() { _ = storeA.Close() })
+	storeB, err := sqlite.Open(ctx, "file:"+dirB+"/b.db?_pragma=foreign_keys=on")
+	if err != nil {
+		t.Fatalf("open B: %v", err)
+	}
+	t.Cleanup(func() { _ = storeB.Close() })
+
+	keyA := make([]byte, 32)
+	keyB := make([]byte, 32)
+	_, _ = rand.Read(keyA)
+	_, _ = rand.Read(keyB)
+	sealerA, _ := auth.NewAESGCMSealer(keyA)
+	sealerB, _ := auth.NewAESGCMSealer(keyB)
+
+	scA := NewSyncClientWithSealer(storeA, ts.URL, testSyncToken, sealerA)
+	scB := NewSyncClientWithSealer(storeB, ts.URL, testSyncToken, sealerB)
+
+	ses := &rsql.Session{ID: "S-BAD", CLI: "claude", StartedAt: time.Now().UTC(), Status: rsql.SessionStatusActive}
+	if err := scA.EnqueueSession(ctx, ses); err != nil {
+		t.Fatalf("EnqueueSession: %v", err)
+	}
+	ev := event.Event{
+		EventUUID: "EV-BAD",
+		SessionID: "S-BAD",
+		Seq:       1000,
+		Kind:      event.KindUserMessage,
+		Vendor:    event.Vendor{Name: "claude"},
+		Timestamp: time.Now().UTC(),
+	}
+	if err := scA.EnqueueEvents(ctx, []event.Event{ev}); err != nil {
+		t.Fatalf("EnqueueEvents: %v", err)
+	}
+	if err := scA.drainOnce(ctx); err != nil {
+		t.Fatalf("drainOnce A: %v", err)
+	}
+
+	// B pulls — every row should fail to decrypt, logged but no crash.
+	if err := scB.PullNow(ctx); err != nil {
+		t.Fatalf("PullNow B (should not crash): %v", err)
+	}
+
+	// Nothing landed in B.
+	if _, err := storeB.Sessions().Get(ctx, "S-BAD"); err == nil {
+		t.Errorf("B should not have session — decryption should have failed")
+	}
+	events, _ := storeB.Events().List(ctx, "S-BAD", 0, 100)
+	if len(events) != 0 {
+		t.Errorf("B event count: got %d, want 0", len(events))
+	}
+
+	// Cursor should NOT advance: every row in this pull failed.
+	cur, _ := storeB.Sync().GetCursor(ctx, "events")
+	if cur != "" {
+		t.Errorf("events cursor advanced on decrypt-failure-only pull: got %q, want empty", cur)
+	}
+	sesCur, _ := storeB.Sync().GetCursor(ctx, "sessions")
+	if sesCur != "" {
+		t.Errorf("sessions cursor advanced on decrypt-failure-only pull: got %q, want empty", sesCur)
 	}
 }
 

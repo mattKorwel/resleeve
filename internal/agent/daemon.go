@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mattkorwel/resleeve/internal/adapter/claude"
+	"github.com/mattkorwel/resleeve/internal/auth"
 	"github.com/mattkorwel/resleeve/internal/storage/sql/sqlite"
 )
 
@@ -34,6 +35,17 @@ type Config struct {
 	Addr          string // listen address; ":0" for random port
 	Upstream      string // v2 sync: base URL of resleeve serve (empty = standalone, no sync)
 	UpstreamToken string // bearer token presented to upstream (empty allowed if Upstream is empty)
+
+	// Sealer, when non-nil and Upstream is set, encrypts outbox blobs
+	// before push and decrypts pulled blobs before ingest. Slice 2.5
+	// uses a daemon-local random key; round 5+ swaps in a KEK derived
+	// from the user's master password.
+	Sealer auth.Sealer
+
+	// SealKeyPath is where the CLI persists the placeholder seal key.
+	// Informational only on Config — the CLI resolves it and builds
+	// Sealer before calling New.
+	SealKeyPath string
 }
 
 // New opens the storage backend and prepares the daemon. Call Serve to
@@ -46,7 +58,11 @@ func New(ctx context.Context, cfg Config) (*Daemon, error) {
 
 	d := &Daemon{cfg: cfg, store: store}
 	if cfg.Upstream != "" {
-		d.sync = NewSyncClient(store, cfg.Upstream, cfg.UpstreamToken)
+		if cfg.Sealer != nil {
+			d.sync = NewSyncClientWithSealer(store, cfg.Upstream, cfg.UpstreamToken, cfg.Sealer)
+		} else {
+			d.sync = NewSyncClient(store, cfg.Upstream, cfg.UpstreamToken)
+		}
 	}
 	mux := http.NewServeMux()
 	d.registerRoutes(mux)

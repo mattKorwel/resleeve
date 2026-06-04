@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mattkorwel/resleeve/internal/auth"
 	"github.com/mattkorwel/resleeve/internal/event"
 	"github.com/mattkorwel/resleeve/internal/memory"
 	"github.com/mattkorwel/resleeve/internal/serve"
@@ -50,6 +51,12 @@ type SyncClient struct {
 
 	stop context.CancelFunc
 	done chan struct{}
+
+	// sealer wraps outbound blobs and unwraps inbound blobs at the
+	// push/pull boundary. nil = plaintext mode (used by tests and by
+	// daemons with no --upstream). See round-4/02-cross-machine-sync.md
+	// §"Zero-knowledge layer".
+	sealer auth.Sealer
 }
 
 // NewSyncClient builds a client. upstream is the base URL of a
@@ -67,6 +74,16 @@ func NewSyncClient(store rsql.Store, upstream, token string) *SyncClient {
 		batchSize:     100,
 		done:          make(chan struct{}, 3),
 	}
+}
+
+// NewSyncClientWithSealer is NewSyncClient plus a Sealer that wraps
+// every outbox blob before push and unwraps every pulled blob before
+// ingest. With a Sealer the server-side backend stores only opaque
+// ciphertext — the zero-knowledge property of round-4/02.
+func NewSyncClientWithSealer(store rsql.Store, upstream, token string, sealer auth.Sealer) *SyncClient {
+	c := NewSyncClient(store, upstream, token)
+	c.sealer = sealer
+	return c
 }
 
 // Start kicks off the background drain + pull loops. Idempotent — a
@@ -103,6 +120,12 @@ func (s *SyncClient) EnqueueSession(ctx context.Context, ses *rsql.Session) erro
 	if err != nil {
 		return fmt.Errorf("sync: marshal session: %w", err)
 	}
+	if s.sealer != nil {
+		blob, err = s.sealer.Seal(blob)
+		if err != nil {
+			return fmt.Errorf("sync: seal session: %w", err)
+		}
+	}
 	key := "sessions/" + ses.ID
 	return s.store.Sync().EnqueueOutbox(ctx, "sessions", key, blob, time.Now().UTC())
 }
@@ -117,6 +140,12 @@ func (s *SyncClient) EnqueueEvents(ctx context.Context, events []event.Event) er
 		blob, err := json.Marshal(e)
 		if err != nil {
 			return fmt.Errorf("sync: marshal event %s: %w", e.EventUUID, err)
+		}
+		if s.sealer != nil {
+			blob, err = s.sealer.Seal(blob)
+			if err != nil {
+				return fmt.Errorf("sync: seal event %s: %w", e.EventUUID, err)
+			}
 		}
 		key := fmt.Sprintf("events/%s/%020d-%s", e.SessionID, e.Seq, e.EventUUID)
 		if err := s.store.Sync().EnqueueOutbox(ctx, "events", key, blob, now); err != nil {
@@ -311,6 +340,13 @@ func (s *SyncClient) pullKind(ctx context.Context, kind string) error {
 }
 
 func (s *SyncClient) ingestPulled(ctx context.Context, kind string, blob []byte) error {
+	if s.sealer != nil {
+		opened, err := s.sealer.Open(blob)
+		if err != nil {
+			return fmt.Errorf("open envelope: %w", err)
+		}
+		blob = opened
+	}
 	switch kind {
 	case "sessions":
 		var ses rsql.Session
