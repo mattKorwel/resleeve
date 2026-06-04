@@ -22,9 +22,35 @@ var hookEventsToInstall = []string{
 	"UserPromptSubmit",
 }
 
+// matcherAll is the matcher value installed for resleeve's hook groups.
+// Empty string means "no filter" — fire on every event regardless of
+// tool name (for tool-scoped events) or unconditionally (for events
+// without a tool concept like SessionStart).
+const matcherAll = ""
+
+// Hook entries in ~/.claude/settings.json use a matcher-wrapped shape:
+//
+//   "PostToolUse": [
+//     {
+//       "matcher": "",
+//       "hooks": [
+//         { "type": "command", "command": "...", "_resleeve": true }
+//       ]
+//     }
+//   ]
+//
+// Older versions of Claude Code accepted a flat shape (command objects
+// directly inside the event array). Current CC validates against the
+// wrapped shape and warns on the flat shape; we emit wrapped and
+// migrate any pre-existing flat-format resleeve entries on install.
+// User-authored flat entries are NOT migrated (we don't touch their
+// data); users who want to silence CC's warnings on their own entries
+// must migrate them themselves.
+
 // InstallBridge writes resleeve hook entries to ~/.claude/settings.json.
 // Idempotent: re-installation detects existing _resleeve-tagged entries
-// and updates them in place; unrelated user-authored hooks are preserved.
+// (in either flat or wrapped format) and replaces them with a fresh
+// wrapped entry; unrelated user-authored hooks are preserved untouched.
 func (a *Adapter) InstallBridge(ctx context.Context, opts adapter.InstallOpts) error {
 	binPath, err := resolveBinPath(opts.ResleeveBinPath)
 	if err != nil {
@@ -47,34 +73,20 @@ func (a *Adapter) InstallBridge(ctx context.Context, opts adapter.InstallOpts) e
 		settings["hooks"] = hooks
 	}
 
-	command := fmt.Sprintf("%s hook --adapter %s", binPath, Name)
+	handler := makeResleeveHandler(binPath)
 
 	for _, eventName := range hookEventsToInstall {
 		existing, _ := hooks[eventName].([]any)
-		newHandler := map[string]any{
-			"type":      "command",
-			"command":   command,
-			"_resleeve": true,
+		// Strip prior resleeve entries (flat or wrapped) before
+		// appending our own wrapped group. This is what makes
+		// re-install idempotent AND migrates flat-format installs
+		// from older resleeve versions.
+		stripped := stripResleeveFromEvent(existing)
+		ourGroup := map[string]any{
+			"matcher": matcherAll,
+			"hooks":   []any{handler},
 		}
-		merged := make([]any, 0, len(existing)+1)
-		replaced := false
-		for _, h := range existing {
-			hm, ok := h.(map[string]any)
-			if !ok {
-				merged = append(merged, h)
-				continue
-			}
-			if isResleeve, _ := hm["_resleeve"].(bool); isResleeve {
-				merged = append(merged, newHandler)
-				replaced = true
-				continue
-			}
-			merged = append(merged, h)
-		}
-		if !replaced {
-			merged = append(merged, newHandler)
-		}
-		hooks[eventName] = merged
+		hooks[eventName] = append(stripped, ourGroup)
 	}
 
 	if opts.DryRun {
@@ -87,7 +99,8 @@ func (a *Adapter) InstallBridge(ctx context.Context, opts adapter.InstallOpts) e
 }
 
 // UninstallBridge removes resleeve hook entries from settings.json,
-// preserving user-authored hooks.
+// preserving user-authored hooks. Handles both flat and wrapped formats
+// so an uninstall after an old-format install still cleans up correctly.
 func (a *Adapter) UninstallBridge(ctx context.Context) error {
 	path, err := settingsPath()
 	if err != nil {
@@ -106,18 +119,7 @@ func (a *Adapter) UninstallBridge(ctx context.Context) error {
 		if !ok {
 			continue
 		}
-		kept := make([]any, 0, len(handlers))
-		for _, h := range handlers {
-			hm, ok := h.(map[string]any)
-			if !ok {
-				kept = append(kept, h)
-				continue
-			}
-			if isResleeve, _ := hm["_resleeve"].(bool); isResleeve {
-				continue
-			}
-			kept = append(kept, h)
-		}
+		kept := stripResleeveFromEvent(handlers)
 		if len(kept) == 0 {
 			delete(hooks, eventName)
 		} else {
@@ -128,6 +130,75 @@ func (a *Adapter) UninstallBridge(ctx context.Context) error {
 		delete(settings, "hooks")
 	}
 	return writeSettings(path, settings)
+}
+
+// makeResleeveHandler builds the inner command object resleeve installs.
+// Same shape under both flat and wrapped formats — only the surrounding
+// container changes.
+func makeResleeveHandler(binPath string) map[string]any {
+	return map[string]any{
+		"type":      "command",
+		"command":   fmt.Sprintf("%s hook --adapter %s", binPath, Name),
+		"_resleeve": true,
+	}
+}
+
+// isResleeveHandler reports whether a handler object (the leaf
+// "command" entry — under either format) is one of ours.
+func isResleeveHandler(h any) bool {
+	hm, _ := h.(map[string]any)
+	if hm == nil {
+		return false
+	}
+	v, _ := hm["_resleeve"].(bool)
+	return v
+}
+
+// stripResleeveFromEvent walks an event's handler array (which may be a
+// mix of flat command entries and matcher-wrapped groups) and returns a
+// new slice with all _resleeve-tagged entries removed. Wrapped groups
+// whose inner hooks become empty are dropped entirely; wrapped groups
+// retaining non-resleeve hooks are preserved with only their inner
+// _resleeve entries filtered out.
+func stripResleeveFromEvent(handlers []any) []any {
+	out := make([]any, 0, len(handlers))
+	for _, h := range handlers {
+		hm, ok := h.(map[string]any)
+		if !ok {
+			out = append(out, h)
+			continue
+		}
+		// Wrapped format? An entry is wrapped if it carries a `hooks`
+		// array (the matcher is optional in some schemas).
+		if rawInner, hasInner := hm["hooks"]; hasInner {
+			innerArr, _ := rawInner.([]any)
+			keptInner := make([]any, 0, len(innerArr))
+			for _, ih := range innerArr {
+				if !isResleeveHandler(ih) {
+					keptInner = append(keptInner, ih)
+				}
+			}
+			if len(keptInner) == 0 {
+				// Whole group was ours; drop it.
+				continue
+			}
+			// Preserve all of the wrapper's other keys (matcher, etc.)
+			// and substitute the filtered hooks array.
+			newGroup := make(map[string]any, len(hm))
+			for k, v := range hm {
+				newGroup[k] = v
+			}
+			newGroup["hooks"] = keptInner
+			out = append(out, newGroup)
+			continue
+		}
+		// Flat format.
+		if isResleeveHandler(h) {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
 }
 
 // resolveBinPath returns the absolute, symlink-resolved path of the
