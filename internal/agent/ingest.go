@@ -32,7 +32,8 @@ func (d *Daemon) IngestBatch(ctx context.Context, sessionID string, events []eve
 	// is INSERT OR IGNORE, so two near-simultaneous first-event hooks
 	// for the same session can both call here without racing into a
 	// PK-violation error (and silently dropping events).
-	if err := d.createSessionFromFirstEvent(ctx, sessionID, events[0]); err != nil {
+	ses, err := d.createSessionFromFirstEvent(ctx, sessionID, events[0])
+	if err != nil {
 		return fmt.Errorf("ingest: create session: %w", err)
 	}
 
@@ -50,14 +51,28 @@ func (d *Daemon) IngestBatch(ctx context.Context, sessionID string, events []eve
 
 	// Heartbeat the slot from the first event. All events in a batch
 	// should share the same slot in practice; if not, the first event's
-	// slot wins for the heartbeat.
+	// slot wins for the heartbeat. Slots are machine-local — never
+	// synced upstream.
 	if err := d.store.Slots().Heartbeat(ctx, events[0].Slot, sessionID); err != nil {
 		return fmt.Errorf("ingest: heartbeat: %w", err)
+	}
+
+	// Push-on-commit: enqueue the session row + each event to the local
+	// outbox so the SyncClient's drain goroutine ships them to upstream.
+	// Outbox enqueue is idempotent on (kind, key) so re-ingest of the
+	// same batch (e.g. from sync pull on a peer device) doesn't duplicate.
+	if d.sync != nil {
+		if err := d.sync.EnqueueSession(ctx, ses); err != nil {
+			return fmt.Errorf("ingest: enqueue session: %w", err)
+		}
+		if err := d.sync.EnqueueEvents(ctx, events); err != nil {
+			return fmt.Errorf("ingest: enqueue events: %w", err)
+		}
 	}
 	return nil
 }
 
-func (d *Daemon) createSessionFromFirstEvent(ctx context.Context, sessionID string, first event.Event) error {
+func (d *Daemon) createSessionFromFirstEvent(ctx context.Context, sessionID string, first event.Event) (*rsql.Session, error) {
 	cwd := ""
 	if first.Kind == event.KindSessionStart && len(first.Content) > 0 {
 		// Try to pull cwd from session_start content.
@@ -80,5 +95,8 @@ func (d *Daemon) createSessionFromFirstEvent(ctx context.Context, sessionID stri
 		StartedAt:  startedAt,
 		Status:     rsql.SessionStatusActive,
 	}
-	return d.store.Sessions().Create(ctx, ses)
+	if err := d.store.Sessions().Create(ctx, ses); err != nil {
+		return nil, err
+	}
+	return ses, nil
 }

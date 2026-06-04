@@ -28,6 +28,7 @@ type Store struct {
 	slots    *slotStore
 	users    *userStore
 	memory   *memoryStore
+	sync     *syncStore
 }
 
 // Open opens (and auto-migrates) a SQLite database at the given DSN.
@@ -51,6 +52,7 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	s.slots = &slotStore{db: db}
 	s.users = &userStore{db: db}
 	s.memory = &memoryStore{db: db}
+	s.sync = &syncStore{db: db}
 	if err := s.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err

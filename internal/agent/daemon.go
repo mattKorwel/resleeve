@@ -25,12 +25,15 @@ type Daemon struct {
 	listener net.Listener
 	endpoint string
 	secret   string
+	sync     *SyncClient // nil when no --upstream is configured
 }
 
 // Config holds daemon configuration.
 type Config struct {
-	DSN  string // sqlite DSN
-	Addr string // listen address; ":0" for random port
+	DSN           string // sqlite DSN
+	Addr          string // listen address; ":0" for random port
+	Upstream      string // v2 sync: base URL of resleeve serve (empty = standalone, no sync)
+	UpstreamToken string // bearer token presented to upstream (empty allowed if Upstream is empty)
 }
 
 // New opens the storage backend and prepares the daemon. Call Serve to
@@ -42,6 +45,9 @@ func New(ctx context.Context, cfg Config) (*Daemon, error) {
 	}
 
 	d := &Daemon{cfg: cfg, store: store}
+	if cfg.Upstream != "" {
+		d.sync = NewSyncClient(store, cfg.Upstream, cfg.UpstreamToken)
+	}
 	mux := http.NewServeMux()
 	d.registerRoutes(mux)
 	d.registerMemoryRoutes(mux)
@@ -77,6 +83,10 @@ func (d *Daemon) Serve(ctx context.Context) error {
 	}
 	d.endpoint = endpointPath
 	fmt.Printf("resleeve agent listening on %s\nendpoint: %s\n", url, endpointPath)
+	if d.sync != nil {
+		fmt.Printf("sync upstream: %s\n", d.cfg.Upstream)
+		d.sync.Start(ctx)
+	}
 
 	// Write PID file so `resleeve down` / `doctor` can find this daemon.
 	pidPath, _ := PIDPath()
@@ -87,6 +97,9 @@ func (d *Daemon) Serve(ctx context.Context) error {
 	// Shutdown goroutine.
 	go func() {
 		<-ctx.Done()
+		if d.sync != nil {
+			d.sync.Stop()
+		}
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = d.server.Shutdown(shutCtx)

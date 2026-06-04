@@ -125,6 +125,50 @@ type MemoryStore interface {
 	ListLearnings(ctx context.Context, scope string, includeSuperseded bool) ([]*memory.Learning, error)
 }
 
+// OutboxRow is one pending row in the local sync outbox.
+type OutboxRow struct {
+	Seq           int64
+	Kind          string
+	Key           string
+	Blob          []byte
+	Attempts      int
+	NextAttemptAt time.Time
+	LastError     string
+}
+
+// SyncStore persists the local sync state: the outbox of rows pending
+// upload to upstream `resleeve serve`, and the per-kind cursor tracking
+// the high-water-mark we've already pulled from upstream.
+// See docs/design/round-4/02-cross-machine-sync.md.
+type SyncStore interface {
+	// EnqueueOutbox inserts a row pending upload. Idempotent on
+	// (kind, key) — a second enqueue with the same key is a no-op.
+	EnqueueOutbox(ctx context.Context, kind, key string, blob []byte, nextAttemptAt time.Time) error
+
+	// DequeueOutbox returns up to batchSize rows where next_attempt_at
+	// <= now, in seq ascending order (FIFO). Does NOT delete — caller
+	// must AckOutbox after successful upload.
+	DequeueOutbox(ctx context.Context, batchSize int) ([]OutboxRow, error)
+
+	// AckOutbox removes successfully-uploaded rows by seq.
+	AckOutbox(ctx context.Context, seqs []int64) error
+
+	// BumpOutboxAttempt records a transient failure: increments
+	// attempts, sets next_attempt_at, records the error.
+	BumpOutboxAttempt(ctx context.Context, seq int64, nextAttemptAt time.Time, errMsg string) error
+
+	// OutboxDepth returns the count of pending outbox rows; surfaced
+	// in `resleeve doctor`.
+	OutboxDepth(ctx context.Context) (int, error)
+
+	// GetCursor returns the last upstream pull cursor for kind, or
+	// empty when none recorded.
+	GetCursor(ctx context.Context, kind string) (string, error)
+
+	// SetCursor records a new upstream pull cursor for the kind.
+	SetCursor(ctx context.Context, kind, cursor string) error
+}
+
 // Store is the union — each backend exposes the sub-stores via typed
 // accessors. See docs/design/round-2/11-storage-backends.md.
 type Store interface {
@@ -133,5 +177,6 @@ type Store interface {
 	Slots() SlotStore
 	Users() UserStore
 	Memory() MemoryStore
+	Sync() SyncStore
 	Close() error
 }

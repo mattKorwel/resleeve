@@ -25,8 +25,16 @@ func runUp(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("up", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	noBridge := fs.Bool("no-bridge", false, "skip bridge plugin install")
+	upstream := fs.String("upstream", "", "v2 sync upstream URL (default: $RESLEEVE_UPSTREAM)")
+	upstreamToken := fs.String("upstream-token", "", "v2 sync bearer token (default: $RESLEEVE_UPSTREAM_TOKEN)")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if *upstream == "" {
+		*upstream = os.Getenv("RESLEEVE_UPSTREAM")
+	}
+	if *upstreamToken == "" {
+		*upstreamToken = os.Getenv("RESLEEVE_UPSTREAM_TOKEN")
 	}
 
 	dataDir, err := agent.DataDir()
@@ -43,7 +51,7 @@ func runUp(ctx context.Context, args []string) int {
 	if alive, pid := daemonAlive(); alive {
 		fmt.Printf("[1/2] daemon already running (pid %d) — skipping\n", pid)
 	} else {
-		if err := spawnDaemon(dataDir); err != nil {
+		if err := spawnDaemon(dataDir, *upstream, *upstreamToken); err != nil {
 			fmt.Fprintln(os.Stderr, "up: spawn daemon:", err)
 			return 1
 		}
@@ -260,7 +268,7 @@ func runUsage(ctx context.Context, args []string) int {
 
 // --- helpers ---
 
-func spawnDaemon(dataDir string) error {
+func spawnDaemon(dataDir, upstream, upstreamToken string) error {
 	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolve resleeve binary: %w", err)
@@ -277,7 +285,14 @@ func spawnDaemon(dataDir string) error {
 	}
 
 	dsn := defaultDSN()
-	cmd := exec.Command(self, "agent", "--dsn", dsn, "--addr", "127.0.0.1:0")
+	cmdArgs := []string{"agent", "--dsn", dsn, "--addr", "127.0.0.1:0"}
+	if upstream != "" {
+		cmdArgs = append(cmdArgs, "--upstream", upstream)
+	}
+	if upstreamToken != "" {
+		cmdArgs = append(cmdArgs, "--upstream-token", upstreamToken)
+	}
+	cmd := exec.Command(self, cmdArgs...)
 	cmd.Stdout = logF
 	cmd.Stderr = logF
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
