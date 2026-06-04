@@ -41,6 +41,23 @@ Building from source? `go install github.com/mattkorwel/resleeve/cmd/resleeve@la
 - **`resleeve resume`** replays a captured session into a fresh CLI process — same vendor (full fidelity) or cross-vendor (synthesized prime).
 - **MCP server** so an agent in-session can curate its own memory (`resleeve_scope_set`, `resleeve_plan_write`, `resleeve_learning_append`, …).
 
+## CLI support matrix
+
+| | Claude Code | opencode | Codex | Gemini CLI |
+|---|---|---|---|---|
+| Hook-based capture | ✓ | ✗ (stub) | ✗ (planned) | ✗ (planned) |
+| JSONL reconcile sweep | ✓ | ✗ | ✗ | ✗ |
+| `resume` — same-vendor replay (full fidelity) | ✓ | ✗ | ✗ | ✗ |
+| `resume` — prime synthesis (target side) | ✓ | ✓ | n/a | n/a |
+| MCP client picks up `resleeve mcp` | ✓ | ⚠ untested | ✗ | ✗ |
+| `--memory-only` mode | ✓ | n/a (no capture) | n/a | n/a |
+
+**Legend.** ✓ shipped · ⚠ should work but unvalidated · ✗ not implemented · n/a not applicable
+
+The Claude Code adapter is the reference implementation. The opencode adapter compiles + implements `Hydrate` for prime mode; capture and replay are stubs pending vendor stability. Codex / Gemini / others are interface-ready (the `Adapter` contract is in `internal/adapter/adapter.go`) but unimplemented.
+
+Platform support: macOS and Linux are CI-tested every PR. Windows support is in flight under the [`resleeve/windows-port`](docs/use-cases/) scope — currently blocks at compile time on `syscall.Kill` / `Setsid`; build-tag split coming.
+
 ## Docs
 
 | | |
