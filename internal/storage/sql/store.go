@@ -100,15 +100,6 @@ type SlotStore interface {
 	Get(ctx context.Context, slot event.Slot) (*SlotState, error)
 }
 
-// UserStore persists user accounts and their KEK-wrap material.
-// See docs/design/round-2/10-auth-subsystem.md.
-type UserStore interface {
-	Create(ctx context.Context, u *auth.User) error
-	GetByID(ctx context.Context, id string) (*auth.User, error)
-	GetByEmail(ctx context.Context, email string) (*auth.User, error)
-	UpdateAuth(ctx context.Context, u *auth.User) error
-}
-
 // MemoryStore persists the memory module: scope tree, per-scope
 // plans (named slots), append-only learnings with supersede chains.
 // See docs/design/round-3/01-memory-module.md.
@@ -180,8 +171,10 @@ type SyncStore interface {
 // Argon2id verifier + the password-wrapped + recovery-wrapped KEK. The
 // server never sees the plaintext KEK; the verifier and the KEK-wrap
 // derivation use independent salts so verifier exposure does not
-// compromise the KEK. See docs/design/round-4/02-cross-machine-sync.md
-// §"Identity".
+// compromise the KEK. There is no client-side counterpart — the
+// pre-pivot client-side User persistence (UserStore, migration 0002)
+// was removed in Q1 — see docs/REVIEW_QUALITY.md. See
+// docs/design/round-4/02-cross-machine-sync.md §"Identity".
 type ServerUser struct {
 	ID        string
 	Email     string
@@ -223,9 +216,9 @@ type PairingCode struct {
 	ClaimedAt *time.Time
 }
 
-// ServerUserStore is the server-side account store, distinct from the
-// client-side UserStore. Persisted by `resleeve serve`; never read by
-// the client daemon. See docs/design/round-4/02-cross-machine-sync.md.
+// ServerUserStore is the server-side account store, persisted by
+// `resleeve serve`; never read by the client daemon. See
+// docs/design/round-4/02-cross-machine-sync.md.
 type ServerUserStore interface {
 	Create(ctx context.Context, u *ServerUser) error
 	GetByID(ctx context.Context, id string) (*ServerUser, error)
@@ -272,7 +265,6 @@ type Store interface {
 	Sessions() SessionStore
 	Events() EventStore
 	Slots() SlotStore
-	Users() UserStore
 	Memory() MemoryStore
 	Sync() SyncStore
 	ServerUsers() ServerUserStore

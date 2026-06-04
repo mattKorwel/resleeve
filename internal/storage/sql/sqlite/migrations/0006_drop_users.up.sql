@@ -1,0 +1,24 @@
+-- Resleeve Q1 cleanup: drop the pre-pivot client-side users table.
+--
+-- 0002_users.up.sql created `users` as the client-side account record,
+-- but the round-4/round-5 server-side identity split moved persistence
+-- to `server_users` + `devices` + `pairings` (see migration 0005 and
+-- docs/design/round-4/02-cross-machine-sync.md §"Identity"). The
+-- client no longer reads or writes the `users` table — every reference
+-- in the Go code (auth.Login, auth.Recover, auth.ResetPassword,
+-- userStore, UserStore interface, Store.Users() accessor) was removed
+-- in the same commit as this migration. The table is therefore dead
+-- weight; existing installs may have rows in it, fresh installs would
+-- create-then-orphan it.
+--
+-- We KEEP 0002_users.up.sql on disk: migration history is sacrosanct,
+-- and a hypothetical re-migration on an already-migrated install would
+-- see version 2 already applied in schema_migrations and skip 0002
+-- anyway. Adding this drop as 0006 — rather than deleting 0002 — means
+-- (a) installs that already applied 0002 get the cleanup, and (b)
+-- fresh installs apply 0002 then immediately drop the table, ending
+-- with the same schema as never having had it.
+--
+-- See docs/REVIEW_QUALITY.md Q1.
+
+DROP TABLE IF EXISTS users;

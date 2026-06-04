@@ -1,11 +1,10 @@
 package auth
 
 import (
-	"errors"
 	"testing"
 )
 
-func TestSignupLoginRoundTrip(t *testing.T) {
+func TestSignupProducesMaterial(t *testing.T) {
 	r, err := Signup("matt@example.com", "correct-horse-battery-staple")
 	if err != nil {
 		t.Fatalf("signup: %v", err)
@@ -13,79 +12,25 @@ func TestSignupLoginRoundTrip(t *testing.T) {
 	if r.RecoveryKey == "" {
 		t.Fatal("recovery key not returned")
 	}
-
-	kek, err := Login(r.User, "correct-horse-battery-staple")
-	if err != nil {
-		t.Fatalf("login: %v", err)
+	if r.User == nil {
+		t.Fatal("user not returned")
 	}
-	if kek != r.KEK {
-		t.Errorf("login KEK mismatch")
+	if r.User.Email != "matt@example.com" {
+		t.Errorf("email: got %q, want matt@example.com", r.User.Email)
 	}
-
-	if _, err := Login(r.User, "wrong-password"); !errors.Is(err, ErrInvalidCredentials) {
-		t.Errorf("wrong password should produce ErrInvalidCredentials, got %v", err)
+	// All four wrap-material components must be populated; the CLI
+	// streams these to `resleeve serve` in RegisterReq.
+	if len(r.User.PasswordVerifier.Hash) == 0 || len(r.User.PasswordVerifier.Salt) == 0 {
+		t.Error("password verifier not populated")
 	}
-}
-
-func TestRecoverRoundTrip(t *testing.T) {
-	r, err := Signup("matt@example.com", "correct-horse-battery-staple")
-	if err != nil {
-		t.Fatalf("signup: %v", err)
+	if len(r.User.PasswordKEK.Ciphertext) == 0 || len(r.User.PasswordKEK.Salt) == 0 {
+		t.Error("password KEK wrap not populated")
 	}
-
-	kek, err := Recover(r.User, r.RecoveryKey)
-	if err != nil {
-		t.Fatalf("recover: %v", err)
+	if len(r.User.RecoveryVerifier.Hash) == 0 || len(r.User.RecoveryVerifier.Salt) == 0 {
+		t.Error("recovery verifier not populated")
 	}
-	if kek != r.KEK {
-		t.Errorf("recovery KEK mismatch")
-	}
-
-	// Wrong recovery key (well-formed but doesn't match) → invalid credentials.
-	wrong, _ := NewRecoveryKey()
-	if _, err := Recover(r.User, wrong); !errors.Is(err, ErrInvalidCredentials) {
-		t.Errorf("wrong recovery key should produce ErrInvalidCredentials, got %v", err)
-	}
-}
-
-func TestResetPasswordRotatesRecovery(t *testing.T) {
-	r, err := Signup("matt@example.com", "correct-horse-battery-staple")
-	if err != nil {
-		t.Fatalf("signup: %v", err)
-	}
-
-	kek, err := Recover(r.User, r.RecoveryKey)
-	if err != nil {
-		t.Fatalf("recover: %v", err)
-	}
-
-	newRecovery, err := ResetPassword(r.User, kek, "another-strong-password-13!")
-	if err != nil {
-		t.Fatalf("reset password: %v", err)
-	}
-	if newRecovery == r.RecoveryKey {
-		t.Errorf("recovery key not rotated")
-	}
-
-	// Old password rejected.
-	if _, err := Login(r.User, "correct-horse-battery-staple"); !errors.Is(err, ErrInvalidCredentials) {
-		t.Errorf("old password should be rejected after reset")
-	}
-	// New password works and returns the same KEK.
-	kek2, err := Login(r.User, "another-strong-password-13!")
-	if err != nil {
-		t.Errorf("new password should work after reset: %v", err)
-	}
-	if kek2 != kek {
-		t.Errorf("KEK changed across password reset; should be stable")
-	}
-	// Old recovery key rejected.
-	if _, err := Recover(r.User, r.RecoveryKey); !errors.Is(err, ErrInvalidCredentials) {
-		t.Errorf("old recovery should be rejected after rotation")
-	}
-	// New recovery key works.
-	if _, err := Recover(r.User, newRecovery); err != nil {
-		t.Errorf("new recovery should work: %v", err)
+	if len(r.User.RecoveryKEK.Ciphertext) == 0 || len(r.User.RecoveryKEK.Salt) == 0 {
+		t.Error("recovery KEK wrap not populated")
 	}
 }
 

@@ -273,3 +273,38 @@ func TestStore_NotFound(t *testing.T) {
 		t.Errorf("missing slot: expected ErrNotFound, got %v", err)
 	}
 }
+
+// TestMigrations_DroppedUsersTable is the Q1 regression: the
+// pre-pivot client-side `users` table (created by migration 0002) is
+// dropped by migration 0006 because the round-4/round-5 identity
+// pivot moved persistence to `server_users` + `devices` + `pairings`.
+// A fresh install must end with NO `users` table — only the
+// server-side identity tables — even though 0002 still runs.
+func TestMigrations_DroppedUsersTable(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+
+	row := st.db.QueryRowContext(ctx,
+		`SELECT name FROM sqlite_master WHERE type='table' AND name='users'`)
+	var name string
+	if err := row.Scan(&name); err == nil {
+		t.Errorf("`users` table still present after migrations: %q (should be dropped by 0006)", name)
+	}
+
+	// Sanity-check the server-side identity tables are still there.
+	for _, want := range []string{"server_users", "devices", "pairing_codes"} {
+		row := st.db.QueryRowContext(ctx,
+			`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, want)
+		var got string
+		if err := row.Scan(&got); err != nil {
+			t.Errorf("expected table %q after migrations, got err: %v", want, err)
+		}
+	}
+
+	// And that migration 0006 was actually recorded.
+	var v int
+	if err := st.db.QueryRowContext(ctx,
+		`SELECT version FROM schema_migrations WHERE version = 6`).Scan(&v); err != nil {
+		t.Errorf("migration 0006 not recorded in schema_migrations: %v", err)
+	}
+}

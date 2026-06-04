@@ -4,14 +4,17 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"strings"
 	"time"
 )
 
-// User is a resleeve account. All cryptographic material lives here so
-// it can be persisted as one storage record. See
-// docs/design/round-2/10-auth-subsystem.md.
+// User is the in-memory crypto-material carrier returned from Signup.
+// The client never persists this; the CLI extracts the verifier/wrap
+// fields and sends them to `resleeve serve`, which persists the
+// server-side mirror as a ServerUser row (see
+// docs/design/round-4/02-cross-machine-sync.md §"Identity"). The
+// pre-pivot client-side persistence layer (userStore / migration 0002)
+// was removed in Q1 — see docs/REVIEW_QUALITY.md.
 type User struct {
 	ID        string
 	Email     string
@@ -32,9 +35,6 @@ type SignupResult struct {
 	RecoveryKey RecoveryKey
 	KEK         KEK
 }
-
-// ErrInvalidCredentials is returned when a password or recovery key doesn't match.
-var ErrInvalidCredentials = errors.New("auth: invalid credentials")
 
 // Signup creates a new User from email + master password. Generates a
 // fresh KEK, wraps it twice (password + recovery key), and returns the
@@ -93,70 +93,6 @@ func Signup(email, password string) (*SignupResult, error) {
 		RecoveryKEK:      rw,
 	}
 	return &SignupResult{User: u, RecoveryKey: rk, KEK: kek}, nil
-}
-
-// Login verifies password against the user's PasswordVerifier and, on
-// success, returns the unwrapped KEK.
-func Login(u *User, password string) (KEK, error) {
-	if !u.PasswordVerifier.Verify([]byte(password), u.Params) {
-		return KEK{}, ErrInvalidCredentials
-	}
-	return u.PasswordKEK.Unwrap([]byte(password))
-}
-
-// Recover verifies recovery key and returns the unwrapped KEK. Caller
-// must follow up with ResetPassword to re-key both wraps.
-func Recover(u *User, rk RecoveryKey) (KEK, error) {
-	rb, err := rk.Bytes()
-	if err != nil {
-		return KEK{}, fmt.Errorf("recover: %w", err)
-	}
-	if !u.RecoveryVerifier.Verify(rb, u.Params) {
-		return KEK{}, ErrInvalidCredentials
-	}
-	return u.RecoveryKEK.Unwrap(rb)
-}
-
-// ResetPassword takes a recovered KEK and a new password, re-wraps the
-// KEK, and rotates the recovery key. Returns the new recovery key
-// (to be shown once); mutates u in place with the updated material.
-func ResetPassword(u *User, kek KEK, newPassword string) (RecoveryKey, error) {
-	if err := validatePassword(newPassword); err != nil {
-		return "", err
-	}
-
-	pv, err := NewVerifier([]byte(newPassword), u.Params)
-	if err != nil {
-		return "", err
-	}
-	pw, err := kek.Wrap([]byte(newPassword), u.Params)
-	if err != nil {
-		return "", err
-	}
-
-	newRecovery, err := NewRecoveryKey()
-	if err != nil {
-		return "", err
-	}
-	rb, err := newRecovery.Bytes()
-	if err != nil {
-		return "", err
-	}
-	rv, err := NewVerifier(rb, u.Params)
-	if err != nil {
-		return "", err
-	}
-	rw, err := kek.Wrap(rb, u.Params)
-	if err != nil {
-		return "", err
-	}
-
-	u.PasswordVerifier = pv
-	u.PasswordKEK = pw
-	u.RecoveryVerifier = rv
-	u.RecoveryKEK = rw
-	u.UpdatedAt = time.Now().UTC()
-	return newRecovery, nil
 }
 
 func validateEmail(email string) error {

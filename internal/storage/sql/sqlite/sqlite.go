@@ -26,7 +26,6 @@ type Store struct {
 	sessions    *sessionStore
 	events      *eventStore
 	slots       *slotStore
-	users       *userStore
 	memory      *memoryStore
 	sync        *syncStore
 	serverUsers *serverUserStore
@@ -53,7 +52,6 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	s.sessions = &sessionStore{db: db}
 	s.events = &eventStore{db: db}
 	s.slots = &slotStore{db: db}
-	s.users = &userStore{db: db}
 	s.memory = &memoryStore{db: db}
 	s.sync = &syncStore{db: db}
 	s.serverUsers = &serverUserStore{db: db}
@@ -74,9 +72,6 @@ func (s *Store) Events() rsql.EventStore { return s.events }
 
 // Slots returns the SlotStore view.
 func (s *Store) Slots() rsql.SlotStore { return s.slots }
-
-// Users returns the UserStore view.
-func (s *Store) Users() rsql.UserStore { return s.users }
 
 // Memory returns the MemoryStore view.
 func (s *Store) Memory() rsql.MemoryStore { return s.memory }
