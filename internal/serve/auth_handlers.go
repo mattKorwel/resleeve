@@ -310,11 +310,14 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 // PairPublishReq is POST /v2/auth/pair/publish — the inviter, already
 // authenticated as a device, ships:
+//   - an optional client-allocated code_id (so the verifier salt can
+//     be deterministic over it; empty = server allocates)
 //   - the verifier salt+hash for the random pair code
 //   - the KEK wrapped under a key derived from the same pair code
 //
-// The server allocates a public CodeID + sets the 5-minute TTL.
+// The server sets the 5-minute TTL.
 type PairPublishReq struct {
+	CodeID   string         `json:"code_id,omitempty"`
 	Params   Argon2idParams `json:"params"`
 	Verifier VerifierEnv    `json:"verifier"`
 	Wrapped  WrappedKEKEnv  `json:"wrapped"`
@@ -349,8 +352,12 @@ func (s *Server) handlePairPublish(w http.ResponseWriter, r *http.Request, dev *
 		ttl = 5 * time.Minute
 	}
 	now := time.Now().UTC()
+	codeID := strings.TrimSpace(req.CodeID)
+	if codeID == "" {
+		codeID = newID(8)
+	}
 	pc := &rsql.PairingCode{
-		CodeID:    newID(8),
+		CodeID:    codeID,
 		UserID:    dev.UserID,
 		Params:    paramsFromWire(req.Params),
 		Verifier:  auth.Verifier{Salt: req.Verifier.Salt, Hash: req.Verifier.Hash},
