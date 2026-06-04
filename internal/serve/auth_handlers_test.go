@@ -138,6 +138,84 @@ func TestRegister_LoginRoundTrip(t *testing.T) {
 		PushReq{Batch: []PushRow{{Key: "sessions/y", Blob: []byte("b")}}}, 401)
 }
 
+// TestLoginChallenge_ConstantShapeForUnknownEmail asserts that
+// /v2/auth/login-challenge returns an indistinguishable response for
+// unknown emails (no 404 enumeration oracle). The follow-up login still
+// fails on the synthetic salt — UX identical, no info leak.
+func TestLoginChallenge_ConstantShapeForUnknownEmail(t *testing.T) {
+	_, base, _ := newIdentityServer(t)
+
+	// Register one real account so we can compare known-vs-unknown.
+	signup, err := auth.Signup("real@example.com", "hunter22-good-pass")
+	if err != nil {
+		t.Fatalf("Signup: %v", err)
+	}
+	postStatus(t, base+"/v2/auth/register", "", RegisterReq{
+		Email:  signup.User.Email,
+		Params: Argon2idParams{MemoryKiB: signup.User.Params.MemoryKiB, TimeIters: signup.User.Params.TimeIters, Parallelism: signup.User.Params.Parallelism},
+		Password: PasswordEnv{
+			VerifierSalt: signup.User.PasswordVerifier.Salt, VerifierHash: signup.User.PasswordVerifier.Hash,
+			KEKSalt: signup.User.PasswordKEK.Salt, KEKNonce: signup.User.PasswordKEK.Nonce, KEKCT: signup.User.PasswordKEK.Ciphertext,
+		},
+		Recovery: PasswordEnv{
+			VerifierSalt: signup.User.RecoveryVerifier.Salt, VerifierHash: signup.User.RecoveryVerifier.Hash,
+			KEKSalt: signup.User.RecoveryKEK.Salt, KEKNonce: signup.User.RecoveryKEK.Nonce, KEKCT: signup.User.RecoveryKEK.Ciphertext,
+		},
+		Device: DeviceMetadata{Name: "tester"},
+	}, 201)
+
+	// Known email → 200 with the real salt.
+	var known LoginChallengeResp
+	post(t, base+"/v2/auth/login-challenge", "", LoginChallengeReq{Email: "real@example.com"}, &known, 200)
+
+	// Unknown email → must ALSO be 200 (not 404) and same shape.
+	var unknown LoginChallengeResp
+	post(t, base+"/v2/auth/login-challenge", "", LoginChallengeReq{Email: "ghost@example.com"}, &unknown, 200)
+
+	if len(unknown.VerifierSalt) != len(known.VerifierSalt) {
+		t.Errorf("salt lengths differ: known=%d unknown=%d (leaks existence)", len(known.VerifierSalt), len(unknown.VerifierSalt))
+	}
+	if unknown.Params.MemoryKiB == 0 || unknown.Params.TimeIters == 0 || unknown.Params.Parallelism == 0 {
+		t.Errorf("unknown-email challenge missing Argon2id params: %+v", unknown.Params)
+	}
+	if string(unknown.VerifierSalt) == string(known.VerifierSalt) {
+		t.Errorf("unknown synthetic salt collides with real salt — should be unrelated")
+	}
+
+	// Determinism: same unknown email twice → same synthetic salt.
+	// Otherwise repeated probes would expose the unknown branch via
+	// salt churn (real accounts have stable salts).
+	var unknown2 LoginChallengeResp
+	post(t, base+"/v2/auth/login-challenge", "", LoginChallengeReq{Email: "ghost@example.com"}, &unknown2, 200)
+	if string(unknown.VerifierSalt) != string(unknown2.VerifierSalt) {
+		t.Errorf("synthetic salt for same unknown email not stable: %x vs %x", unknown.VerifierSalt, unknown2.VerifierSalt)
+	}
+
+	// Different unknown emails → different salts (no fixed-decoy tell).
+	var unknown3 LoginChallengeResp
+	post(t, base+"/v2/auth/login-challenge", "", LoginChallengeReq{Email: "nobody@example.com"}, &unknown3, 200)
+	if string(unknown.VerifierSalt) == string(unknown3.VerifierSalt) {
+		t.Errorf("synthetic salt is not per-email: collision across unknown emails")
+	}
+
+	// Email case normalization: real account lookup is lower-cased, so
+	// the mixed-case form of a KNOWN email must hit the real branch
+	// (same salt as `known`), not the synthetic one.
+	var knownMixedCase LoginChallengeResp
+	post(t, base+"/v2/auth/login-challenge", "", LoginChallengeReq{Email: "Real@Example.COM"}, &knownMixedCase, 200)
+	if string(knownMixedCase.VerifierSalt) != string(known.VerifierSalt) {
+		t.Errorf("known email case-mismatch routed to synthetic branch (leaks via case probe)")
+	}
+
+	// The follow-up login on the synthetic challenge must still fail
+	// (verifier mismatch on a non-existent account) — same UX, no leak.
+	bogus := auth.DeriveKey([]byte("anything"), unknown.VerifierSalt, auth.Argon2idParams{
+		MemoryKiB: unknown.Params.MemoryKiB, TimeIters: unknown.Params.TimeIters, Parallelism: unknown.Params.Parallelism,
+	})
+	postStatus(t, base+"/v2/auth/login", "",
+		LoginReq{Email: "ghost@example.com", VerifierHash: bogus, Device: DeviceMetadata{Name: "x"}}, 401)
+}
+
 func TestRegister_InvalidPayload(t *testing.T) {
 	_, base, _ := newIdentityServer(t)
 	postStatus(t, base+"/v2/auth/register", "", RegisterReq{}, 400)

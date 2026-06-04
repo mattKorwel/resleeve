@@ -2,7 +2,9 @@ package serve
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -228,19 +230,44 @@ func (s *Server) handleLoginChallenge(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "decode: "+err.Error())
 		return
 	}
-	u, err := s.serverUsers.GetByEmail(r.Context(), strings.ToLower(strings.TrimSpace(req.Email)))
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	// Info-leak hardening: do NOT 404 on unknown emails — that turns the
+	// challenge endpoint into a registration oracle. Instead, return a
+	// constant-shape challenge with default Argon2id params and a
+	// deterministic-but-secret synthetic salt derived from a per-process
+	// server secret. The follow-up /v2/auth/login still 401s on unknown
+	// emails (verifier mismatch); the client UX is identical, but a
+	// passive observer cannot distinguish a real from a decoy challenge.
+	u, err := s.serverUsers.GetByEmail(r.Context(), email)
 	if err != nil {
-		// Don't disclose whether the email exists: respond with a
-		// stable-shaped (but random-salt) challenge to keep the
-		// timing/footprint indistinguishable. v1 simplification:
-		// return 404; we'll harden later.
-		writeError(w, http.StatusNotFound, "no such account")
+		if !errors.Is(err, rsql.ErrNotFound) {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, LoginChallengeResp{
+			Params:       paramsToWire(auth.DefaultArgon2idParams()),
+			VerifierSalt: s.syntheticChallengeSalt(email),
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, LoginChallengeResp{
 		Params:       paramsToWire(u.Params),
 		VerifierSalt: u.PasswordVerifier.Salt,
 	})
+}
+
+// syntheticChallengeSalt derives a stable-but-secret 16-byte salt for an
+// unknown email. Determinism (same email → same salt within a process
+// lifetime) means a repeat probe doesn't reveal "this email is new"; the
+// HMAC key keeps the mapping unguessable so an attacker can't precompute
+// salts to distinguish. Length matches auth.NewSalt() (128 bits) so the
+// wire shape is identical to a real PasswordVerifier.Salt.
+func (s *Server) syntheticChallengeSalt(email string) []byte {
+	mac := hmac.New(sha256.New, s.loginChallengeKey)
+	_, _ = mac.Write([]byte("login-challenge-salt-v1\x00"))
+	_, _ = mac.Write([]byte(email))
+	sum := mac.Sum(nil)
+	return sum[:16]
 }
 
 // --- login ---

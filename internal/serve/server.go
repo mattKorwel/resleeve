@@ -13,6 +13,7 @@
 package serve
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -55,6 +56,16 @@ type Server struct {
 	devices     rsql.DeviceStore
 	pairings    rsql.PairingStore
 
+	// loginChallengeKey is a per-process random secret used to derive
+	// synthetic Argon2id salts for unknown-email login-challenge requests
+	// (HMAC(key, "login-challenge-salt-v1"||email) → 16-byte salt). This
+	// keeps the response shape indistinguishable from a real account so
+	// /v2/auth/login-challenge cannot be used to enumerate registered
+	// emails. The key never leaves the server and is rotated on restart;
+	// since the synthetic salts are decoys (the subsequent /v2/auth/login
+	// always 401s), rotation has no client-visible effect.
+	loginChallengeKey []byte
+
 	// sseSubscribers is the live SSE fan-out set for kind=memory.
 	// Each subscriber owns a buffered channel; slow subscribers get
 	// their events dropped (the SSE backlog replay covers catch-up).
@@ -72,14 +83,19 @@ func New(cfg Config) (*Server, error) {
 	if cfg.AuthToken == "" && cfg.Devices == nil {
 		return nil, errors.New("serve: no auth configured (set AuthToken or Devices)")
 	}
+	challengeKey := make([]byte, 32)
+	if _, err := rand.Read(challengeKey); err != nil {
+		return nil, fmt.Errorf("serve: gen login-challenge key: %w", err)
+	}
 	s := &Server{
-		mux:            http.NewServeMux(),
-		backend:        cfg.Backend,
-		authToken:      cfg.AuthToken,
-		serverUsers:    cfg.ServerUsers,
-		devices:        cfg.Devices,
-		pairings:       cfg.Pairings,
-		sseSubscribers: map[chan PushRow]struct{}{},
+		mux:               http.NewServeMux(),
+		backend:           cfg.Backend,
+		authToken:         cfg.AuthToken,
+		serverUsers:       cfg.ServerUsers,
+		devices:           cfg.Devices,
+		pairings:          cfg.Pairings,
+		loginChallengeKey: challengeKey,
+		sseSubscribers:    map[chan PushRow]struct{}{},
 	}
 	s.routes()
 	if cfg.ServerUsers != nil && cfg.Devices != nil {
