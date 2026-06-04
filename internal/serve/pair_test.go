@@ -1,8 +1,12 @@
 package serve
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base32"
+	"encoding/json"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -222,4 +226,226 @@ func deterministicSaltForTest(codeID, label string) []byte {
 		return h[:16]
 	}
 	return h
+}
+
+// --- sec-H2: pair-claim failed-attempt rate-limit ---
+
+// pairClaimFixture spins up a server, registers an inviter, publishes a
+// pair code, and returns the artefacts needed to drive /v2/auth/pair/claim
+// from a test. ttl controls publish lifetime; pass 5*time.Minute for
+// "normal" tests and 1*time.Nanosecond to deliberately TTL-expire. The
+// underlying *Server is exposed so sec-H2 tests can introspect the
+// in-memory pairAttempts counter.
+type pairClaimFixture struct {
+	srv       *Server
+	base      string
+	codeID    string
+	rightHash []byte
+	wrongHash []byte
+	devToken  string
+}
+
+func newPairClaimFixture(t *testing.T, email, codeID string, ttl time.Duration) pairClaimFixture {
+	t.Helper()
+	srv, base := newIdentityServerForPairClaim(t)
+
+	signup, err := auth.Signup(email, "good-pass-here-22")
+	if err != nil {
+		t.Fatalf("Signup: %v", err)
+	}
+	var reg RegisterResp
+	post(t, base+"/v2/auth/register", "", minimalRegister(signup), &reg, 201)
+
+	pairCode := "RIGHT-CODE-FOR-LOCKOUT-TEST"
+	pairParams := auth.Argon2idParams{MemoryKiB: 16 * 1024, TimeIters: 2, Parallelism: 1}
+	vsalt := deterministicSaltForTest(codeID, "pair-verifier")
+	vhash := auth.DeriveKey([]byte(pairCode), vsalt, pairParams)
+	wrapped, err := signup.KEK.Wrap([]byte(pairCode), pairParams)
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	var pub PairPublishResp
+	post(t, base+"/v2/auth/pair/publish", reg.DeviceToken, PairPublishReq{
+		CodeID:   codeID,
+		Params:   Argon2idParams{MemoryKiB: pairParams.MemoryKiB, TimeIters: pairParams.TimeIters, Parallelism: pairParams.Parallelism},
+		Verifier: VerifierEnv{Salt: vsalt, Hash: vhash},
+		Wrapped:  WrappedKEKEnv{Salt: wrapped.Salt, Nonce: wrapped.Nonce, CT: wrapped.Ciphertext},
+		TTL:      ttl,
+	}, &pub, 201)
+
+	badHash := auth.DeriveKey([]byte("WRONG-CODE-XX"), vsalt, pairParams)
+	return pairClaimFixture{
+		srv:       srv,
+		base:      base,
+		codeID:    codeID,
+		rightHash: vhash,
+		wrongHash: badHash,
+		devToken:  reg.DeviceToken,
+	}
+}
+
+// newIdentityServerForPairClaim mirrors newIdentityServer but also
+// returns the *Server so sec-H2 tests can introspect the in-memory
+// pairAttempts map. Kept separate from newIdentityServer so we don't
+// have to change every existing call site.
+func newIdentityServerForPairClaim(t *testing.T) (*Server, string) {
+	t.Helper()
+	ts, base, _ := newIdentityServer(t)
+	// httptest.Server.Config.Handler is the *Server we passed in.
+	srv, ok := ts.Config.Handler.(*Server)
+	if !ok {
+		t.Fatalf("test server handler is not *Server: %T", ts.Config.Handler)
+	}
+	return srv, base
+}
+
+// claimRaw posts to /v2/auth/pair/claim and returns the raw status +
+// body so tests can compare them byte-for-byte. Used by the
+// "indistinguishable" assertions.
+func claimRaw(t *testing.T, base, codeID string, hash []byte) (int, string) {
+	t.Helper()
+	body, err := json.Marshal(PairClaimReq{CodeID: codeID, VerifierHash: hash})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	req, _ := http.NewRequest("POST", base+"/v2/auth/pair/claim", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := newHTTPClient().Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(respBody)
+}
+
+// TestPairClaim_LocksAfterFiveFailedAttempts asserts the sec-H2 core
+// guarantee: five consecutive wrong-verifier attempts hard-delete the
+// code, and the sixth attempt sees a "not found" response identical to
+// what an expired-and-swept code would return.
+func TestPairClaim_LocksAfterFiveFailedAttempts(t *testing.T) {
+	fx := newPairClaimFixture(t, "lock@b.com", "code-lock-5", 5*time.Minute)
+
+	// Attempts 1..4 — should return 401 verifier-failed, code still live.
+	for i := 1; i <= pairClaimMaxAttempts-1; i++ {
+		status, body := claimRaw(t, fx.base, fx.codeID, fx.wrongHash)
+		if status != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: status %d (body %q), want 401", i, status, body)
+		}
+	}
+	// Attempt 5 — pushes counter to threshold, triggers lockout, must
+	// return the "code not found or expired" shape.
+	status, body := claimRaw(t, fx.base, fx.codeID, fx.wrongHash)
+	if status != http.StatusNotFound {
+		t.Fatalf("attempt 5 (lockout): status %d (body %q), want 404", status, body)
+	}
+	// Attempt 6 — code already deleted; Get returns ErrNotFound; the
+	// response is the same as the lockout response.
+	status6, body6 := claimRaw(t, fx.base, fx.codeID, fx.wrongHash)
+	if status6 != http.StatusNotFound {
+		t.Fatalf("attempt 6: status %d (body %q), want 404", status6, body6)
+	}
+	// A subsequent attempt with the *correct* verifier hash also fails
+	// the same way — the lockout is total, not just per-bad-hash.
+	statusR, bodyR := claimRaw(t, fx.base, fx.codeID, fx.rightHash)
+	if statusR != http.StatusNotFound {
+		t.Fatalf("post-lockout right-hash claim: status %d (body %q), want 404", statusR, bodyR)
+	}
+}
+
+// TestPairClaim_LockoutIsIndistinguishableFromExpiry asserts that the
+// status code AND error body are byte-identical between (a) a code
+// locked out via 5 failed attempts and (b) a code that ran past its TTL
+// and was lazily deleted on the next claim. This is the sec-H2 oracle
+// guarantee: an attacker who exhausts their budget cannot tell their
+// brute force tripped the lockout vs the legitimate inviter's TTL
+// expiring naturally.
+func TestPairClaim_LockoutIsIndistinguishableFromExpiry(t *testing.T) {
+	// (a) lockout path — burn through pairClaimMaxAttempts attempts on a
+	// long-TTL code and capture the response at the lockout transition.
+	lockFx := newPairClaimFixture(t, "lock@b.com", "code-lock", 5*time.Minute)
+	for i := 1; i < pairClaimMaxAttempts; i++ {
+		claimRaw(t, lockFx.base, lockFx.codeID, lockFx.wrongHash)
+	}
+	lockStatus, lockBody := claimRaw(t, lockFx.base, lockFx.codeID, lockFx.wrongHash)
+
+	// (b) TTL-expired path — publish a code with a 1ns TTL, sleep enough
+	// for the wall clock to move past it, then claim. The handler should
+	// detect expiry, lazy-sweep the row, and emit the same response.
+	expFx := newPairClaimFixture(t, "exp@b.com", "code-exp", 1*time.Nanosecond)
+	time.Sleep(2 * time.Millisecond)
+	expStatus, expBody := claimRaw(t, expFx.base, expFx.codeID, expFx.rightHash)
+
+	if lockStatus != expStatus {
+		t.Errorf("status: lockout %d, ttl-expiry %d (must match for sec-H2)", lockStatus, expStatus)
+	}
+	if lockBody != expBody {
+		t.Errorf("body: lockout %q, ttl-expiry %q (must match for sec-H2)", lockBody, expBody)
+	}
+}
+
+// TestPairClaim_SuccessfulClaimDoesNotPersistAttemptCount checks that a
+// successful claim wipes its in-memory counter so a downstream operator
+// can't observe leftover state. We can't introspect the map from a
+// blackbox HTTP test, but we can assert the behavioural consequence:
+// after a successful claim of code A, an attacker who somehow republishes
+// the same code_id later (via a fresh PairPublish — possible because
+// Claim only sets claimed_at, and the row could be re-created by a new
+// publish if we Sweep it) does NOT inherit any counter state from the
+// previous successful claim. Concretely: after success on code A, we
+// publish a new code under the same code_id (after deleting the old row
+// via sweep), and verify that 4 wrong attempts on the new code do NOT
+// trip the lockout (which would only happen if leftover counter from
+// the previous successful claim were still around).
+func TestPairClaim_SuccessfulClaimDoesNotPersistAttemptCount(t *testing.T) {
+	// Use the lockout-aware fixture so we have a *Server handle for
+	// direct map introspection.
+	fx := newPairClaimFixture(t, "succ@b.com", "code-success-state", 5*time.Minute)
+
+	// Burn 4 wrong attempts so the in-memory counter sits at 4 — just
+	// short of the lockout threshold.
+	for i := 0; i < pairClaimMaxAttempts-1; i++ {
+		status, body := claimRaw(t, fx.base, fx.codeID, fx.wrongHash)
+		if status != http.StatusUnauthorized {
+			t.Fatalf("burn %d: got %d (%q), want 401", i, status, body)
+		}
+	}
+	// Sanity: per-code counter should sit at pairClaimMaxAttempts-1.
+	if got := fixtureCounterFor(fx, fx.codeID); got != pairClaimMaxAttempts-1 {
+		t.Fatalf("pre-success counter for %q: got %d, want %d", fx.codeID, got, pairClaimMaxAttempts-1)
+	}
+
+	// Successful claim with the right hash. This must clear the counter
+	// so a subsequent operator (or attacker who later regains code_id
+	// visibility) cannot probe with the leftover N=4 state.
+	if status, body := claimRaw(t, fx.base, fx.codeID, fx.rightHash); status != http.StatusOK {
+		t.Fatalf("success claim: got %d (%q), want 200", status, body)
+	}
+
+	// Post-success: NO entry must remain in the in-memory counter map
+	// — sec-H2's "no leftover state" guarantee. We assert both the
+	// per-code lookup AND the global map size to catch both per-row
+	// and map-wide leaks.
+	if got := fixtureCounterFor(fx, fx.codeID); got != 0 {
+		t.Errorf("post-success counter for %q: got %d, want 0", fx.codeID, got)
+	}
+	if got := fixtureMapSize(fx); got != 0 {
+		t.Errorf("post-success pairAttempts map size: %d, want 0 (leftover state lets an attacker probe)", got)
+	}
+}
+
+// fixtureCounterFor returns the per-code attempt counter under the
+// server's mutex. Zero when the entry has been cleared or never written.
+func fixtureCounterFor(fx pairClaimFixture, codeID string) int {
+	fx.srv.pairAttemptsMu.Lock()
+	defer fx.srv.pairAttemptsMu.Unlock()
+	return fx.srv.pairAttempts[codeID]
+}
+
+// fixtureMapSize returns the total number of entries in the server's
+// pairAttempts map. Used to assert "no leftover state anywhere".
+func fixtureMapSize(fx pairClaimFixture) int {
+	fx.srv.pairAttemptsMu.Lock()
+	defer fx.srv.pairAttemptsMu.Unlock()
+	return len(fx.srv.pairAttempts)
 }

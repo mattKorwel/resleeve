@@ -71,7 +71,29 @@ type Server struct {
 	// their events dropped (the SSE backlog replay covers catch-up).
 	sseMu          sync.RWMutex
 	sseSubscribers map[chan PushRow]struct{}
+
+	// pairAttemptsMu + pairAttempts is the in-memory failed-claim counter
+	// for /v2/auth/pair/claim (sec-H2). Keyed by code_id. The 60-bit pair
+	// code is brute-forceable within its 5-min TTL if code_id leaks, so
+	// after pairClaimMaxAttempts consecutive verifier failures we hard-
+	// delete the code row and clear the counter — subsequent claims see
+	// the same ErrNotFound as a swept-expired code, making lockout
+	// indistinguishable from TTL expiry on the wire. State is purely
+	// in-memory: lost on restart, but codes are 5-min TTL anyway and the
+	// SweepExpired/Get paths reconcile any drift. Map entries are cleaned
+	// up lazily on successful claim or on the lockout-delete path.
+	pairAttemptsMu sync.Mutex
+	pairAttempts   map[string]int
 }
+
+// pairClaimMaxAttempts is the per-code consecutive failed-verifier
+// threshold before /v2/auth/pair/claim hard-deletes the pairing row
+// (sec-H2). Five is a balance between human-typo tolerance (an accepter
+// fat-fingering the pair code once or twice during the 5-minute TTL
+// shouldn't lock them out) and the brute-force cost we're imposing: at
+// 5 attempts, the expected work to guess a 60-bit code is 2^59 / 5 ≈
+// 2^57 lockout cycles, each requiring a fresh publish from the inviter.
+const pairClaimMaxAttempts = 5
 
 // New builds a Server. At least one auth mode (legacy AuthToken or
 // per-device Devices store) must be configured; without either, New
@@ -96,6 +118,7 @@ func New(cfg Config) (*Server, error) {
 		pairings:          cfg.Pairings,
 		loginChallengeKey: challengeKey,
 		sseSubscribers:    map[chan PushRow]struct{}{},
+		pairAttempts:      map[string]int{},
 	}
 	s.routes()
 	if cfg.ServerUsers != nil && cfg.Devices != nil {

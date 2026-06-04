@@ -257,6 +257,11 @@ type PairingStore interface {
 	// Claim marks the code consumed atomically. Returns ErrNotFound if
 	// the row was already claimed (preventing replays) or expired.
 	Claim(ctx context.Context, codeID string, now time.Time) error
+	// Delete hard-removes a code row. Used by the pair-claim rate-limiter
+	// to lock out a code that exceeded the failed-attempt threshold so
+	// subsequent claims see the same ErrNotFound a swept-expired row
+	// would produce. Idempotent.
+	Delete(ctx context.Context, codeID string) error
 	// SweepExpired deletes any rows past expires_at. Cheap maintenance.
 	SweepExpired(ctx context.Context, now time.Time) error
 }

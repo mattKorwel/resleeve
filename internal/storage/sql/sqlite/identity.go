@@ -231,6 +231,11 @@ func (s *pairingStore) Claim(ctx context.Context, codeID string, now time.Time) 
 	return nil
 }
 
+func (s *pairingStore) Delete(ctx context.Context, codeID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM pairing_codes WHERE code_id = ?`, codeID)
+	return err
+}
+
 func (s *pairingStore) SweepExpired(ctx context.Context, now time.Time) error {
 	_, err := s.db.ExecContext(ctx,
 		`DELETE FROM pairing_codes WHERE expires_at <= ?`,

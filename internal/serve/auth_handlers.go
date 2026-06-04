@@ -456,15 +456,38 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 	}
 	pc, err := s.pairings.Get(r.Context(), req.CodeID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "no such code")
+		// Either the code never existed, was swept on expiry, or was
+		// locked out via pairClaimMaxAttempts. Same wire response for
+		// all three so a brute-forcer cannot distinguish lockout from
+		// normal TTL expiry (sec-H2).
+		writePairClaimGone(w)
 		return
 	}
 	now := time.Now().UTC()
-	if pc.ClaimedAt != nil || pc.ExpiresAt.Before(now) {
+	if pc.ClaimedAt != nil {
+		// Replay after a successful claim — distinct from lockout/TTL
+		// expiry: the legitimate accepter already finished, so 410
+		// "already used" is still the right signal to the operator.
 		writeError(w, http.StatusGone, "code already used or expired")
 		return
 	}
+	if pc.ExpiresAt.Before(now) {
+		// Lazy TTL sweep: delete on detection and clear any counter
+		// state so this path is byte-identical to the lockout path.
+		s.pairClaimLockout(r.Context(), pc.CodeID)
+		writePairClaimGone(w)
+		return
+	}
 	if subtle.ConstantTimeCompare(req.VerifierHash, pc.Verifier.Hash) != 1 {
+		// Increment AFTER the comparison so a single failure costs the
+		// attacker one of their budgeted attempts. At the threshold we
+		// hard-delete the code row + clear in-memory state and emit the
+		// lockout response (same shape as TTL expiry).
+		if s.pairClaimRecordFailure(pc.CodeID) >= pairClaimMaxAttempts {
+			s.pairClaimLockout(r.Context(), pc.CodeID)
+			writePairClaimGone(w)
+			return
+		}
 		writeError(w, http.StatusUnauthorized, "code verification failed")
 		return
 	}
@@ -473,6 +496,11 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusGone, "code already used")
 		return
 	}
+	// Success: drop any accumulated counter so subsequent unrelated
+	// probes (which can't succeed anyway, since ClaimedAt != nil now)
+	// don't carry over state. Belt-and-braces — no information leak
+	// hinges on this, but leaving leftover state in the map is sloppy.
+	s.pairClaimClearAttempts(pc.CodeID)
 	dev, err := s.mintDevice(r.Context(), pc.UserID, req.Device.Name)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "mint device: "+err.Error())
@@ -489,6 +517,47 @@ func (s *Server) handlePairClaim(w http.ResponseWriter, r *http.Request) {
 			CT:    pc.WrappedK.Ciphertext,
 		},
 	})
+}
+
+// writePairClaimGone is the unified "code not available" response used
+// by handlePairClaim for both TTL-swept codes and codes locked out via
+// pairClaimMaxAttempts. Returning identical status + body for both is
+// the indistinguishability guarantee that justifies sec-H2's fix
+// strategy: an attacker probing a leaked code_id cannot tell whether
+// the code expired naturally or whether their brute force tripped the
+// lockout.
+func writePairClaimGone(w http.ResponseWriter) {
+	writeError(w, http.StatusNotFound, "code not found or expired")
+}
+
+// pairClaimRecordFailure increments the per-code failure counter and
+// returns the new count. Caller checks the threshold and triggers the
+// lockout if it's reached.
+func (s *Server) pairClaimRecordFailure(codeID string) int {
+	s.pairAttemptsMu.Lock()
+	defer s.pairAttemptsMu.Unlock()
+	s.pairAttempts[codeID]++
+	return s.pairAttempts[codeID]
+}
+
+// pairClaimClearAttempts drops the in-memory counter for a code. Called
+// on successful claim and on lockout-delete; both transition the code
+// to a terminal state where the counter is no longer needed.
+func (s *Server) pairClaimClearAttempts(codeID string) {
+	s.pairAttemptsMu.Lock()
+	defer s.pairAttemptsMu.Unlock()
+	delete(s.pairAttempts, codeID)
+}
+
+// pairClaimLockout hard-deletes a pair code and clears its in-memory
+// counter. Errors from Delete are swallowed by design — the caller is
+// about to emit a "not found" response, and the next claim will Get
+// ErrNotFound anyway (either because Delete succeeded or because the
+// row was already gone). Idempotent and safe to call on rows that
+// don't exist.
+func (s *Server) pairClaimLockout(ctx context.Context, codeID string) {
+	_ = s.pairings.Delete(ctx, codeID)
+	s.pairClaimClearAttempts(codeID)
 }
 
 // --- middleware: per-device bearer ---
