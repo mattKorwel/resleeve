@@ -222,6 +222,100 @@ func TestRegister_InvalidPayload(t *testing.T) {
 	postStatus(t, base+"/v2/auth/register", "", RegisterReq{Email: "not-an-email"}, 400)
 }
 
+// buildRegisterReq returns a fully-formed RegisterReq with the given
+// Argon2id params overriding auth.Signup's defaults. Lets the sec-H1
+// tests probe each axis of the floor/ceiling without rebuilding all the
+// envelope plumbing inline.
+func buildRegisterReq(t *testing.T, email string, override Argon2idParams) RegisterReq {
+	t.Helper()
+	signup, err := auth.Signup(email, "hunter22-good-pass")
+	if err != nil {
+		t.Fatalf("Signup: %v", err)
+	}
+	return RegisterReq{
+		Email:  signup.User.Email,
+		Params: override,
+		Password: PasswordEnv{
+			VerifierSalt: signup.User.PasswordVerifier.Salt,
+			VerifierHash: signup.User.PasswordVerifier.Hash,
+			KEKSalt:      signup.User.PasswordKEK.Salt,
+			KEKNonce:     signup.User.PasswordKEK.Nonce,
+			KEKCT:        signup.User.PasswordKEK.Ciphertext,
+		},
+		Recovery: PasswordEnv{
+			VerifierSalt: signup.User.RecoveryVerifier.Salt,
+			VerifierHash: signup.User.RecoveryVerifier.Hash,
+			KEKSalt:      signup.User.RecoveryKEK.Salt,
+			KEKNonce:     signup.User.RecoveryKEK.Nonce,
+			KEKCT:        signup.User.RecoveryKEK.Ciphertext,
+		},
+		Device: DeviceMetadata{Name: "tester"},
+	}
+}
+
+// TestRegister_RejectsWeakParams asserts the sec-H1 floor: a malicious
+// client cannot register with sub-floor Argon2id params on any axis
+// (memory, time, parallelism). Each below-floor request must 400 BEFORE
+// the verifier is persisted.
+func TestRegister_RejectsWeakParams(t *testing.T) {
+	_, base, _ := newIdentityServer(t)
+
+	cases := []struct {
+		name   string
+		params Argon2idParams
+	}{
+		{"memory_below_floor", Argon2idParams{MemoryKiB: argon2MinMemoryKiB - 1, TimeIters: argon2MinTimeIters, Parallelism: argon2MinParallelism}},
+		{"memory_tiny", Argon2idParams{MemoryKiB: 8, TimeIters: argon2MinTimeIters, Parallelism: argon2MinParallelism}},
+		{"time_below_floor", Argon2idParams{MemoryKiB: argon2MinMemoryKiB, TimeIters: argon2MinTimeIters - 1, Parallelism: argon2MinParallelism}},
+		{"parallelism_zero", Argon2idParams{MemoryKiB: argon2MinMemoryKiB, TimeIters: argon2MinTimeIters, Parallelism: 0}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			postStatus(t, base+"/v2/auth/register", "", buildRegisterReq(t, tc.name+"@example.com", tc.params), 400)
+		})
+	}
+}
+
+// TestRegister_RejectsDoSParams asserts the sec-H1 ceiling: a malicious
+// client cannot register with absurd Argon2id params that would punish
+// every legitimate login thereafter (the server itself doesn't run
+// Argon2 for register, but the params are stored and consumed by the
+// client on every login).
+func TestRegister_RejectsDoSParams(t *testing.T) {
+	_, base, _ := newIdentityServer(t)
+
+	cases := []struct {
+		name   string
+		params Argon2idParams
+	}{
+		{"memory_above_ceiling", Argon2idParams{MemoryKiB: argon2MaxMemoryKiB + 1, TimeIters: argon2MinTimeIters, Parallelism: argon2MinParallelism}},
+		{"time_above_ceiling", Argon2idParams{MemoryKiB: argon2MinMemoryKiB, TimeIters: argon2MaxTimeIters + 1, Parallelism: argon2MinParallelism}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			postStatus(t, base+"/v2/auth/register", "", buildRegisterReq(t, tc.name+"@example.com", tc.params), 400)
+		})
+	}
+}
+
+// TestRegister_AcceptsRoundTwoTenBaseline asserts the sec-H1 floor is
+// not over-eager: exactly-at-floor params (the round-2/10 baseline) must
+// be accepted. This is the canonical "honest client" config.
+func TestRegister_AcceptsRoundTwoTenBaseline(t *testing.T) {
+	_, base, _ := newIdentityServer(t)
+
+	baseline := Argon2idParams{
+		MemoryKiB:   argon2MinMemoryKiB,
+		TimeIters:   argon2MinTimeIters,
+		Parallelism: argon2MinParallelism,
+	}
+	var resp RegisterResp
+	post(t, base+"/v2/auth/register", "", buildRegisterReq(t, "baseline@example.com", baseline), &resp, 201)
+	if resp.DeviceToken == "" {
+		t.Fatal("baseline register: empty device token")
+	}
+}
+
 func TestSync_LegacyBearerStillWorks(t *testing.T) {
 	// Migration overlap: register a user, but the existing legacy bearer
 	// must keep authenticating /v2/sync/* calls until operators rotate

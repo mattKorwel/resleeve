@@ -18,6 +18,31 @@ import (
 	rsql "github.com/mattkorwel/resleeve/internal/storage/sql"
 )
 
+// --- Argon2id params policy (sec-H1) ---
+//
+// The client picks its own Argon2id cost knobs and ships them in
+// RegisterReq.Params. We trust the wire shape but NOT the cost: a
+// malicious client could pick (memory_kib=8, time_iters=1) to produce a
+// verifier hash that's offline-crackable in seconds if the DB ever leaks.
+// Per G's security review (H1), we therefore enforce a server-side floor
+// BEFORE persisting the user row. We also enforce a CEILING so that a
+// malicious caller can't single-shot DoS the server by demanding 64 GiB
+// of memory or 1e6 iterations during register (the server itself doesn't
+// run Argon2 here, but accepting absurd params poisons the stored row
+// and impacts the legitimate client on every subsequent login).
+//
+// Floor matches round-2/10's baseline (OWASP-leaning interactive auth).
+// Ceiling is generous — anything above it is presumptive abuse.
+const (
+	argon2MinMemoryKiB   uint32 = 64 * 1024 // 64 MiB — OWASP interactive floor
+	argon2MaxMemoryKiB   uint32 = 4 * 1024 * 1024 // 4 GiB — DoS ceiling
+	argon2MinTimeIters   uint32 = 2
+	argon2MaxTimeIters   uint32 = 32
+	argon2MinParallelism uint8  = 1
+	argon2RequiredSaltLen   = 16 // 128 bits — matches auth.NewSalt()
+	argon2RequiredOutputLen = 32 // 256 bits — matches auth.keyLen (AES-256-GCM)
+)
+
 // Auth-handler routes (added in punch-list #3). Wire format mirrors the
 // docs/design/round-4/02-cross-machine-sync.md §"Identity" flow:
 //
@@ -557,14 +582,53 @@ func validateRegister(req *RegisterReq) error {
 	if strings.TrimSpace(req.Email) == "" || !strings.Contains(req.Email, "@") {
 		return errors.New("invalid email")
 	}
-	if req.Params.MemoryKiB == 0 || req.Params.TimeIters == 0 || req.Params.Parallelism == 0 {
-		return errors.New("missing argon2 params")
+	if err := validateArgon2Params(req.Params); err != nil {
+		return err
 	}
-	if len(req.Password.VerifierHash) == 0 || len(req.Password.KEKCT) == 0 {
+	if len(req.Password.VerifierSalt) != argon2RequiredSaltLen {
+		return fmt.Errorf("password verifier salt must be %d bytes, got %d", argon2RequiredSaltLen, len(req.Password.VerifierSalt))
+	}
+	if len(req.Recovery.VerifierSalt) != argon2RequiredSaltLen {
+		return fmt.Errorf("recovery verifier salt must be %d bytes, got %d", argon2RequiredSaltLen, len(req.Recovery.VerifierSalt))
+	}
+	if len(req.Password.VerifierHash) != argon2RequiredOutputLen {
+		return fmt.Errorf("password verifier hash must be %d bytes, got %d", argon2RequiredOutputLen, len(req.Password.VerifierHash))
+	}
+	if len(req.Recovery.VerifierHash) != argon2RequiredOutputLen {
+		return fmt.Errorf("recovery verifier hash must be %d bytes, got %d", argon2RequiredOutputLen, len(req.Recovery.VerifierHash))
+	}
+	if len(req.Password.KEKCT) == 0 {
 		return errors.New("missing password envelope")
 	}
-	if len(req.Recovery.VerifierHash) == 0 || len(req.Recovery.KEKCT) == 0 {
+	if len(req.Recovery.KEKCT) == 0 {
 		return errors.New("missing recovery envelope")
+	}
+	return nil
+}
+
+// validateArgon2Params enforces the server-side floor + ceiling on the
+// client-supplied Argon2id cost knobs (sec-H1). The floor blocks a
+// malicious client from registering with verifier-cracking-cheap params;
+// the ceiling blocks a single-shot DoS via absurd params that would
+// punish every legitimate login thereafter.
+func validateArgon2Params(p Argon2idParams) error {
+	if p.MemoryKiB == 0 || p.TimeIters == 0 || p.Parallelism == 0 {
+		return errors.New("missing argon2 params")
+	}
+	if p.MemoryKiB < argon2MinMemoryKiB {
+		return fmt.Errorf("argon2 memory_kib %d below floor %d", p.MemoryKiB, argon2MinMemoryKiB)
+	}
+	if p.MemoryKiB > argon2MaxMemoryKiB {
+		return fmt.Errorf("argon2 memory_kib %d above ceiling %d", p.MemoryKiB, argon2MaxMemoryKiB)
+	}
+	if p.TimeIters < argon2MinTimeIters {
+		return fmt.Errorf("argon2 time_iters %d below floor %d", p.TimeIters, argon2MinTimeIters)
+	}
+	if p.TimeIters > argon2MaxTimeIters {
+		return fmt.Errorf("argon2 time_iters %d above ceiling %d", p.TimeIters, argon2MaxTimeIters)
+	}
+	if p.Parallelism < argon2MinParallelism {
+		return fmt.Errorf("argon2 parallelism %d below floor %d", p.Parallelism, argon2MinParallelism)
 	}
 	return nil
 }
