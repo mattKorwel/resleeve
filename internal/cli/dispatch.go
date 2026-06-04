@@ -59,6 +59,8 @@ func Main(args []string) int {
 		return runServe(ctx, rest)
 	case "sync":
 		return runSync(ctx, rest)
+	case "mcp":
+		return runMCP(ctx, rest)
 	case "help", "--help", "-h":
 		printUsage(os.Stdout)
 		return 0
@@ -89,6 +91,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  resume           re-sleeve a captured session into a fresh CLI instance")
 	fmt.Fprintln(w, "  serve            run the v2 sync HTTP server (v2 slice 1 stub)")
 	fmt.Fprintln(w, "  sync             manual push/pull escape hatch (requires upstream)")
+	fmt.Fprintln(w, "  mcp              run the MCP server (stdio JSON-RPC) for in-agent memory curation")
 	fmt.Fprintln(w, "  help             show this help")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Other commands ship in later stages — see docs/design/round-4/")
