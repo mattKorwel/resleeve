@@ -198,13 +198,18 @@ func runLogin(ctx context.Context, args []string) int {
 		return 1
 	}
 
-	// 4) Persist the device token in the keychain.
+	// 4) Persist the device token in the keychain. Before writing, run
+	//    the one-shot file → OS keychain migration for this
+	//    (upstream, email) pair so users upgrading from the pre-follow-
+	//    up-A file backend don't lose existing device tokens.
 	kc, err := defaultKeychain()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "login: keychain:", err)
 		return 1
 	}
-	if err := kc.Put(*upstream, strings.ToLower(strings.TrimSpace(email)), resp.DeviceToken); err != nil {
+	normEmail := strings.ToLower(strings.TrimSpace(email))
+	maybeMigrateFromFile(kc, *upstream, normEmail)
+	if err := kc.Put(*upstream, normEmail, resp.DeviceToken); err != nil {
 		fmt.Fprintln(os.Stderr, "login: keychain put:", err)
 		return 1
 	}
