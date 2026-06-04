@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -54,14 +55,57 @@ func TestTryOnDemandPull_NetworkErrorWarnsAndContinues(t *testing.T) {
 func TestTryOnDemandPull_NoUpstreamIsSilent(t *testing.T) {
 	t.Parallel()
 	// Mirrors the wire-format error returned by agent.Client.doJSON
-	// when the daemon responds 409 (see internal/agent/sync_handlers.go).
+	// when the daemon responds 409 (see internal/agent/sync_handlers.go):
+	// a wrapped agent.ErrNoUpstream sentinel.
 	p := &fakePuller{fn: func(_ context.Context) (*agent.SyncPullResp, error) {
-		return nil, errors.New("daemon 409 Conflict: no upstream configured — set --upstream on `resleeve up`")
+		return nil, fmt.Errorf("daemon 409 Conflict: no upstream configured — set --upstream on `resleeve up`: %w", agent.ErrNoUpstream)
 	}}
 	var buf bytes.Buffer
 	tryOnDemandPull(context.Background(), p, time.Second, &buf)
 	if buf.Len() != 0 {
 		t.Fatalf("expected silent fallback for standalone deployment, got %q", buf.String())
+	}
+}
+
+// TestTryOnDemandPull_TypedSentinelDetected guards the typed-sentinel
+// contract directly: any error chain that wraps agent.ErrNoUpstream
+// must be treated as "standalone, silently skip", independent of the
+// surrounding string formatting. Replaces the pre-followup-F
+// strings.Contains coupling.
+func TestTryOnDemandPull_TypedSentinelDetected(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"bare sentinel", agent.ErrNoUpstream},
+		{"wrapped with arbitrary prefix", fmt.Errorf("anything at all: %w", agent.ErrNoUpstream)},
+		{"double-wrapped", fmt.Errorf("outer: %w", fmt.Errorf("middle: %w", agent.ErrNoUpstream))},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p := &fakePuller{fn: func(_ context.Context) (*agent.SyncPullResp, error) {
+				return nil, tc.err
+			}}
+			var buf bytes.Buffer
+			tryOnDemandPull(context.Background(), p, time.Second, &buf)
+			if buf.Len() != 0 {
+				t.Fatalf("expected silent fallback when err wraps ErrNoUpstream, got %q", buf.String())
+			}
+			if !isNoUpstreamConfigured(tc.err) {
+				t.Fatalf("isNoUpstreamConfigured returned false for %v", tc.err)
+			}
+		})
+	}
+
+	// Negative control: a stringly-similar error that does NOT wrap
+	// the sentinel must NOT be classified as standalone-mode (this is
+	// the exact regression the typed sentinel prevents).
+	stringyTwin := errors.New("daemon 409 Conflict: no upstream configured — set --upstream on `resleeve up`")
+	if isNoUpstreamConfigured(stringyTwin) {
+		t.Fatalf("expected stringy-twin error to NOT match typed sentinel")
 	}
 }
 

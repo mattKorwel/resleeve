@@ -2,9 +2,9 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
 	"github.com/mattkorwel/resleeve/internal/agent"
@@ -59,13 +59,10 @@ func tryOnDemandPull(ctx context.Context, c syncPuller, timeout time.Duration, w
 }
 
 // isNoUpstreamConfigured returns true if err is the daemon's 409
-// response for "no upstream configured". The agent client surfaces the
-// HTTP status + body as a formatted string ("daemon 409 Conflict: ...");
-// we match on the body fragment because it's stable across handlers
-// (see internal/agent/sync_handlers.go).
+// response for "no upstream configured". The agent client wraps that
+// case in the typed agent.ErrNoUpstream sentinel (see
+// internal/agent/errors.go) so we match on the type rather than the
+// body string.
 func isNoUpstreamConfigured(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), "no upstream configured")
+	return errors.Is(err, agent.ErrNoUpstream)
 }

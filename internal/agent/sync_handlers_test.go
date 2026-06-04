@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -190,6 +191,47 @@ func TestSyncHandler_PullNowNoUpstreamReturns409(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Errorf("no-upstream status: got %d, want 409", resp.StatusCode)
+	}
+}
+
+// TestClient_SyncPullNowWrapsErrNoUpstream locks the wire contract from
+// the client side: when the daemon answers 409 + "no upstream
+// configured", Client.SyncPullNow must return an error that
+// errors.Is-matches agent.ErrNoUpstream so on-demand-pull's
+// standalone-mode detection (internal/cli/on_demand_pull.go) can use
+// the typed sentinel instead of substring matching. See round-5
+// follow-up F.
+func TestClient_SyncPullNowWrapsErrNoUpstream(t *testing.T) {
+	d := newTestDaemonNoSync(t)
+	srv := httptest.NewServer(muxForDaemon(d))
+	t.Cleanup(srv.Close)
+
+	c := NewClient(srv.URL, d.secret)
+	_, err := c.SyncPullNow(context.Background())
+	if err == nil {
+		t.Fatal("expected error from SyncPullNow against no-upstream daemon, got nil")
+	}
+	if !errors.Is(err, ErrNoUpstream) {
+		t.Fatalf("expected errors.Is(err, ErrNoUpstream); got %v", err)
+	}
+}
+
+// TestClient_SyncPushNowWrapsErrNoUpstream mirrors the pull-side
+// contract for push: both push-now and pull-now should yield the typed
+// sentinel on 409 so future callers (e.g. the manual `resleeve sync
+// push` escape hatch) can branch cleanly.
+func TestClient_SyncPushNowWrapsErrNoUpstream(t *testing.T) {
+	d := newTestDaemonNoSync(t)
+	srv := httptest.NewServer(muxForDaemon(d))
+	t.Cleanup(srv.Close)
+
+	c := NewClient(srv.URL, d.secret)
+	_, err := c.SyncPushNow(context.Background())
+	if err == nil {
+		t.Fatal("expected error from SyncPushNow against no-upstream daemon, got nil")
+	}
+	if !errors.Is(err, ErrNoUpstream) {
+		t.Fatalf("expected errors.Is(err, ErrNoUpstream); got %v", err)
 	}
 }
 

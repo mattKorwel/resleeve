@@ -190,7 +190,14 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, body io.Re
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("daemon %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		bodyStr := strings.TrimSpace(string(b))
+		if resp.StatusCode == http.StatusConflict && strings.Contains(bodyStr, "no upstream configured") {
+			// Wrap the typed sentinel so callers can use errors.Is
+			// instead of string-matching the body fragment.
+			// See internal/agent/errors.go for context.
+			return fmt.Errorf("daemon %s: %s: %w", resp.Status, bodyStr, ErrNoUpstream)
+		}
+		return fmt.Errorf("daemon %s: %s", resp.Status, bodyStr)
 	}
 	if into == nil {
 		return nil
