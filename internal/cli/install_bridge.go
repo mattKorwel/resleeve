@@ -14,6 +14,7 @@ import (
 // the harness's settings file. Idempotent.
 func runInstallBridge(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("install-bridge", flag.ContinueOnError)
+	memoryOnly := fs.Bool("memory-only", false, "install only the SessionStart hook (memory injection only — no session/tool/event capture)")
 	fs.SetOutput(os.Stderr)
 	adapterName := fs.String("adapter", "claude", "adapter name")
 	dryRun := fs.Bool("dry-run", false, "print resulting settings; don't write")
@@ -27,7 +28,7 @@ func runInstallBridge(ctx context.Context, args []string) int {
 		return 1
 	}
 
-	if err := a.InstallBridge(ctx, adapter.InstallOpts{DryRun: *dryRun}); err != nil {
+	if err := a.InstallBridge(ctx, adapter.InstallOpts{DryRun: *dryRun, MemoryOnly: *memoryOnly}); err != nil {
 		fmt.Fprintln(os.Stderr, "install-bridge:", err)
 		return 1
 	}

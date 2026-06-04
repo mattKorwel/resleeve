@@ -73,9 +73,40 @@ func (a *Adapter) InstallBridge(ctx context.Context, opts adapter.InstallOpts) e
 		settings["hooks"] = hooks
 	}
 
-	handler := makeResleeveHandler(binPath)
+	handler := makeResleeveHandler(binPath, opts.MemoryOnly)
 
-	for _, eventName := range hookEventsToInstall {
+	// Memory-only mode installs ONLY SessionStart — capture for tool calls
+	// / user prompts / session end is skipped entirely (no hooks fire for
+	// those, so no events reach the daemon). SessionStart is still wired
+	// so the additionalContext injection on session start keeps working;
+	// the `--memory-only` flag baked into the command string tells the
+	// hook command to skip its AppendEvents call too.
+	eventsToInstall := hookEventsToInstall
+	if opts.MemoryOnly {
+		eventsToInstall = []string{"SessionStart"}
+	}
+
+	// In memory-only mode we ALSO need to strip any prior resleeve hooks
+	// from the events we're NOT re-installing — otherwise a switch from
+	// full → memory-only mode would leave stale PostToolUse/Stop/etc.
+	// _resleeve hooks behind, still POSTing events to the daemon.
+	if opts.MemoryOnly {
+		for _, eventName := range hookEventsToInstall {
+			if eventName == "SessionStart" {
+				continue
+			}
+			if existing, ok := hooks[eventName].([]any); ok {
+				stripped := stripResleeveFromEvent(existing)
+				if len(stripped) == 0 {
+					delete(hooks, eventName)
+				} else {
+					hooks[eventName] = stripped
+				}
+			}
+		}
+	}
+
+	for _, eventName := range eventsToInstall {
 		existing, _ := hooks[eventName].([]any)
 		// Strip prior resleeve entries (flat or wrapped) before
 		// appending our own wrapped group. This is what makes
@@ -134,11 +165,17 @@ func (a *Adapter) UninstallBridge(ctx context.Context) error {
 
 // makeResleeveHandler builds the inner command object resleeve installs.
 // Same shape under both flat and wrapped formats — only the surrounding
-// container changes.
-func makeResleeveHandler(binPath string) map[string]any {
+// container changes. When memoryOnly is true the command picks up the
+// `--memory-only` flag so the hook skips persisting events to the daemon
+// (only the SessionStart additionalContext injection runs).
+func makeResleeveHandler(binPath string, memoryOnly bool) map[string]any {
+	cmd := fmt.Sprintf("%s hook --adapter %s", binPath, Name)
+	if memoryOnly {
+		cmd += " --memory-only"
+	}
 	return map[string]any{
 		"type":      "command",
-		"command":   fmt.Sprintf("%s hook --adapter %s", binPath, Name),
+		"command":   cmd,
 		"_resleeve": true,
 	}
 }

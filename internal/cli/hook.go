@@ -24,6 +24,7 @@ func runHook(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("hook", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	adapterName := fs.String("adapter", "claude", "adapter name")
+	memoryOnly := fs.Bool("memory-only", false, "skip persisting events to the daemon; SessionStart still emits the additionalContext envelope so memory injection keeps working")
 	if err := fs.Parse(args); err != nil {
 		return 0
 	}
@@ -55,7 +56,9 @@ func runHook(ctx context.Context, args []string) int {
 	}
 
 	client := agent.NewClient(endpoint, secret)
-	_ = client.AppendEvents(ctx, sessionID, events)
+	if !*memoryOnly {
+		_ = client.AppendEvents(ctx, sessionID, events)
+	}
 
 	// SessionStart side-channel: fetch the rolled-up memory for this
 	// scope and emit the matcher-wrapped hookSpecificOutput envelope
@@ -63,6 +66,9 @@ func runHook(ctx context.Context, args []string) int {
 	// the conversation. Silent no-op when no scope, no daemon-side
 	// memory, or any error along the way (a hook failure must not
 	// crash the harness).
+	//
+	// This runs in both modes — memory-only just skips the AppendEvents
+	// above, but injection (the whole point of memory-only mode) stays.
 	if events[0].Kind == event.KindSessionStart {
 		injectContext(ctx, client, events[0].Slot.Scope)
 	}

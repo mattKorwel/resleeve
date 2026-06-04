@@ -48,6 +48,14 @@ type InstallOpts struct {
 	ResleeveBinPath string // absolute path to the resleeve binary (preferred over $PATH lookup)
 	Endpoint        string // optional override; daemon endpoint URL
 	DryRun          bool   // compute changes, do not write
+
+	// MemoryOnly installs ONLY the SessionStart hook (for additionalContext
+	// injection) and adds `--memory-only` to the hook command so the hook
+	// skips persisting the SessionStart event to the daemon's events table.
+	// PostToolUse / Stop / UserPromptSubmit hooks are not installed at all,
+	// so capture is effectively off — memory CRUD via MCP + CLI keeps working
+	// (it goes through the scope/plan/learning routes, not events).
+	MemoryOnly bool
 }
 
 // Source describes where a FromNative input came from.

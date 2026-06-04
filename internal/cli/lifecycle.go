@@ -27,6 +27,7 @@ func runUp(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("up", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	noBridge := fs.Bool("no-bridge", false, "skip bridge plugin install")
+	memoryOnly := fs.Bool("memory-only", false, "install only the SessionStart hook (memory injection only — no session/tool/event capture)")
 	upstream := fs.String("upstream", "", "v2 sync upstream URL (default: $RESLEEVE_UPSTREAM)")
 	upstreamToken := fs.String("upstream-token", "", "v2 sync bearer token (default: $RESLEEVE_UPSTREAM_TOKEN)")
 	if err := fs.Parse(args); err != nil {
@@ -72,11 +73,15 @@ func runUp(ctx context.Context, args []string) int {
 			fmt.Fprintln(os.Stderr, "up:", err)
 			return 1
 		}
-		if err := a.InstallBridge(ctx, adapter.InstallOpts{}); err != nil {
+		if err := a.InstallBridge(ctx, adapter.InstallOpts{MemoryOnly: *memoryOnly}); err != nil {
 			fmt.Fprintln(os.Stderr, "up: install bridge:", err)
 			return 1
 		}
-		fmt.Println("[2/2] installed bridge (claude)")
+		if *memoryOnly {
+			fmt.Println("[2/2] installed bridge (claude, memory-only)")
+		} else {
+			fmt.Println("[2/2] installed bridge (claude)")
+		}
 	} else {
 		fmt.Println("[2/2] skipped bridge install (--no-bridge)")
 	}
