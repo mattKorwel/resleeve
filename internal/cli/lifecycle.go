@@ -171,11 +171,17 @@ func runPurge(ctx context.Context, args []string) int {
 // configuration hooks fire but emit nothing — looks half-installed
 // from the user's perspective. Loud exit code so scripted callers
 // (CI, smoke tests, "resleeve doctor && resleeve up") notice.
+//
+// With --migrate-key, runs the interactive helper that detects the
+// round-4 placeholder ~/.resleeve/seal.key and (after explicit
+// confirmation) deletes it. Server-side blob re-encryption is a
+// separate verb — see `resleeve migrate-key`.
 func runDoctor(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	backfillCounts := fs.Bool("backfill-counts", false, "recompute sessions.event_count for every session (one-shot maintenance pass)")
 	backfillCwd := fs.Bool("backfill-cwd", false, "repair sessions.cwd for pre-existing reconcile-only sessions (#6)")
+	migrateKey := fs.Bool("migrate-key", false, "interactively detect + offer to remove the legacy ~/.resleeve/seal.key")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -190,6 +196,9 @@ func runDoctor(ctx context.Context, args []string) int {
 	}
 	if *backfillCwd {
 		return runDoctorBackfillCwd(ctx)
+	}
+	if *migrateKey {
+		return runDoctorMigrateKey(ctx)
 	}
 
 	fmt.Println("resleeve doctor")
@@ -243,6 +252,18 @@ func runDoctor(ctx context.Context, args []string) int {
 		}
 	} else {
 		fmt.Println("  daemon           ✗ not running")
+	}
+
+	// Legacy placeholder seal.key. Round-5 retired the auto-load model;
+	// surfacing the file's presence here lets users notice they're still
+	// on the transitional shim. Doctor doesn't error — the file is
+	// merely informational at this point — but does point at the
+	// migration verb. See `resleeve migrate-key` and the
+	// `doctor --migrate-key` cleanup helper.
+	if path := defaultSealKeyPath(); path != "" {
+		if st, err := os.Stat(path); err == nil && st.Mode().IsRegular() {
+			fmt.Printf("  legacy seal.key  ⚠  %s exists — run `resleeve migrate-key` then `resleeve doctor --migrate-key`\n", path)
+		}
 	}
 
 	// Bridge

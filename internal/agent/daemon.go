@@ -42,15 +42,12 @@ type Config struct {
 	UpstreamToken string // bearer token presented to upstream (empty allowed if Upstream is empty)
 
 	// Sealer, when non-nil and Upstream is set, encrypts outbox blobs
-	// before push and decrypts pulled blobs before ingest. Slice 2.5
-	// uses a daemon-local random key; round 5+ swaps in a KEK derived
-	// from the user's master password.
+	// before push and decrypts pulled blobs before ingest. Round 5
+	// retired the daemon-local seal.key placeholder; the sealer now
+	// arrives at runtime via /v1/seal/unlock after `resleeve login`
+	// derives the KEK from the master password. A non-nil Sealer here
+	// is the legacy --seal-key=PATH back-compat path only.
 	Sealer auth.Sealer
-
-	// SealKeyPath is where the CLI persists the placeholder seal key.
-	// Informational only on Config — the CLI resolves it and builds
-	// Sealer before calling New.
-	SealKeyPath string
 }
 
 // New opens the storage backend and prepares the daemon. Call Serve to
