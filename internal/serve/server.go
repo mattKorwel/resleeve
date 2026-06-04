@@ -13,6 +13,7 @@
 package serve
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -45,6 +46,14 @@ type Config struct {
 	ServerUsers rsql.ServerUserStore
 	Devices     rsql.DeviceStore
 	Pairings    rsql.PairingStore
+	// ServeMeta persists process-level secrets across restart (sec-M1).
+	// When nil, the server falls back to a per-process random
+	// login-challenge HMAC key (the legacy AuthToken-only mode). When
+	// set, the key is generated on first boot and persisted, so the
+	// synthetic salt returned for unknown-email login-challenge probes
+	// is stable across `resleeve serve` reboots — removing the "did the
+	// server restart?" oracle a passive observer could otherwise mount.
+	ServeMeta rsql.ServeMetaStore
 }
 
 // Server is the HTTP handler exposed at /v2/sync/* and /v2/auth/*.
@@ -56,14 +65,18 @@ type Server struct {
 	devices     rsql.DeviceStore
 	pairings    rsql.PairingStore
 
-	// loginChallengeKey is a per-process random secret used to derive
+	// loginChallengeKey is a persisted random secret used to derive
 	// synthetic Argon2id salts for unknown-email login-challenge requests
 	// (HMAC(key, "login-challenge-salt-v1"||email) → 16-byte salt). This
 	// keeps the response shape indistinguishable from a real account so
 	// /v2/auth/login-challenge cannot be used to enumerate registered
-	// emails. The key never leaves the server and is rotated on restart;
-	// since the synthetic salts are decoys (the subsequent /v2/auth/login
-	// always 401s), rotation has no client-visible effect.
+	// emails. sec-M1: the key is stored in serve_meta (when ServeMeta is
+	// configured) and never rotated, so two probes of the same unknown
+	// email across a restart return the same decoy salt — closing the
+	// "did the server restart?" oracle that a per-process key gave a
+	// passive observer. When ServeMeta is nil (legacy AuthToken-only
+	// mode), the key is per-process random; that mode is on the way out
+	// and pre-dates the identity stack the oracle would target.
 	loginChallengeKey []byte
 
 	// sseSubscribers is the live SSE fan-out set for kind=memory.
@@ -71,6 +84,17 @@ type Server struct {
 	// their events dropped (the SSE backlog replay covers catch-up).
 	sseMu          sync.RWMutex
 	sseSubscribers map[chan PushRow]struct{}
+
+	// loginTimingDecoy is a per-process random 32-byte value compared
+	// against the client's verifier_hash on the unknown-email branch of
+	// /v2/auth/login (sec-M6). Without it, the unknown-email path skips
+	// the subtle.ConstantTimeCompare the known-email path runs, giving a
+	// careful attacker a timing-distinguisher between "no such email" and
+	// "wrong password" — small (the compare is sub-microsecond next to a
+	// DB round trip) but cleanly distinct as an early-return shape. The
+	// decoy never matches a real verifier (random), so the dummy compare
+	// always returns 0 and the handler still 401s.
+	loginTimingDecoy []byte
 
 	// pairAttemptsMu + pairAttempts is the in-memory failed-claim counter
 	// for /v2/auth/pair/claim (sec-H2). Keyed by code_id. The 60-bit pair
@@ -105,9 +129,23 @@ func New(cfg Config) (*Server, error) {
 	if cfg.AuthToken == "" && cfg.Devices == nil {
 		return nil, errors.New("serve: no auth configured (set AuthToken or Devices)")
 	}
-	challengeKey := make([]byte, 32)
-	if _, err := rand.Read(challengeKey); err != nil {
-		return nil, fmt.Errorf("serve: gen login-challenge key: %w", err)
+	// sec-M1: persist the login-challenge HMAC key so the synthetic salt
+	// for unknown-email probes is stable across `resleeve serve` restarts.
+	// First-boot generates 32 random bytes; subsequent boots re-read the
+	// same value from serve_meta. When ServeMeta is unconfigured (legacy
+	// AuthToken-only mode without an identity store), we fall back to a
+	// per-process key — pre-identity deployments don't run the synthetic-
+	// salt code path on registered users so the oracle doesn't bite there.
+	challengeKey, err := loadOrCreateLoginChallengeKey(cfg.ServeMeta)
+	if err != nil {
+		return nil, fmt.Errorf("serve: load login-challenge key: %w", err)
+	}
+	// sec-M6 decoy: per-process random, never persisted — its only job
+	// is to give the unknown-email login branch the same compare cost
+	// as the known-email branch.
+	timingDecoy := make([]byte, 32)
+	if _, err := rand.Read(timingDecoy); err != nil {
+		return nil, fmt.Errorf("serve: gen login-timing decoy: %w", err)
 	}
 	s := &Server{
 		mux:               http.NewServeMux(),
@@ -117,6 +155,7 @@ func New(cfg Config) (*Server, error) {
 		devices:           cfg.Devices,
 		pairings:          cfg.Pairings,
 		loginChallengeKey: challengeKey,
+		loginTimingDecoy:  timingDecoy,
 		sseSubscribers:    map[chan PushRow]struct{}{},
 		pairAttempts:      map[string]int{},
 	}
@@ -195,6 +234,15 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	}
 	committed := make([]string, 0, len(req.Batch))
 	for _, row := range req.Batch {
+		// sec-M2: gate the key prefix so a misbehaving or compromised
+		// client can't write blobs under arbitrary prefixes (disk fill /
+		// blob smuggling). The three allowed prefixes mirror the wire
+		// kinds validated by validateKind on the pull/SSE side; keep them
+		// in sync if a new kind ships.
+		if !isAllowedPushKey(row.Key) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("rejected key %q: must start with sessions/, events/, or memory/", row.Key))
+			return
+		}
 		if err := s.backend.Put(r.Context(), row.Key, row.Blob); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("put %q: %v", row.Key, err))
 			return
@@ -360,6 +408,18 @@ func writeSSEEvent(w http.ResponseWriter, row PushRow) error {
 
 // --- helpers ---
 
+// isAllowedPushKey gates POST /v2/sync/push to the three documented key
+// prefixes (sec-M2). The backend's ValidateKey only rejects empty /
+// leading-slash / dot-segment keys; without this prefix check, a
+// compromised client token could write blobs under arbitrary prefixes
+// the server stores forever (self-DoS via disk fill / blob smuggling).
+// Kept aligned with validateKind on the pull/SSE side.
+func isAllowedPushKey(key string) bool {
+	return strings.HasPrefix(key, "sessions/") ||
+		strings.HasPrefix(key, "events/") ||
+		strings.HasPrefix(key, "memory/")
+}
+
 func validateKind(kind string) error {
 	switch kind {
 	case "sessions", "events", "memory":
@@ -396,4 +456,23 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 // shape and the full code vocabulary.
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeErrorCoded(w, status, defaultCodeForStatus(status), msg)
+}
+
+// loadOrCreateLoginChallengeKey returns the persisted HMAC key from
+// serve_meta, generating it on first boot. When meta is nil (legacy
+// AuthToken-only mode), returns a fresh per-process key — that mode
+// has no identity stack so the cross-restart oracle (sec-M1) does not
+// apply to any real registered email there.
+func loadOrCreateLoginChallengeKey(meta rsql.ServeMetaStore) ([]byte, error) {
+	gen := func() ([]byte, error) {
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			return nil, err
+		}
+		return b, nil
+	}
+	if meta == nil {
+		return gen()
+	}
+	return meta.GetOrCreateBytes(context.Background(), "login_challenge_key", gen)
 }

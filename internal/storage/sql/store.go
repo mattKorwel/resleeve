@@ -192,6 +192,13 @@ type ServerUser struct {
 // the bearer secret the device presents on every /v2/sync/* call; it is
 // per-device so a single device compromise can be revoked without
 // affecting the others.
+//
+// ExpiresAt is the server-side TTL added in sec-M5: when non-nil, the
+// bearer is rejected after this time even if the row hasn't been
+// explicitly deleted. Used by `resleeve pair invite` to mint a 60-second
+// ephemeral device for the login that fetches the wrapped KEK, so a
+// failed best-effort revoke doesn't leave a year-long bearer alive.
+// NULL = no expiry (regular paired devices).
 type Device struct {
 	ID          string
 	UserID      string
@@ -199,6 +206,7 @@ type Device struct {
 	DeviceToken string
 	CreatedAt   time.Time
 	LastSeenAt  time.Time
+	ExpiresAt   *time.Time
 }
 
 // PairingCode is a short-lived (≤5 min) one-time code used to bridge a
@@ -240,6 +248,26 @@ type DeviceStore interface {
 	Delete(ctx context.Context, deviceID string) error
 }
 
+// ServeMetaStore persists `resleeve serve` process-level secrets that
+// need to outlive a restart but don't belong on any one user row. v1
+// holds exactly one key: the HMAC secret used to derive synthetic salts
+// for unknown-email /v2/auth/login-challenge responses (sec-M1). Storing
+// it here means the salt for a probed-unknown email stays stable across
+// reboots, removing the cross-restart "did the server reboot?" oracle.
+//
+// Intentionally narrow API — this is NOT a general kv store, it's a
+// per-process-secret bucket. Add new methods only when the secret
+// genuinely belongs at the serve-process scope, not at the user/device
+// scope.
+type ServeMetaStore interface {
+	// GetOrCreateBytes returns the value for key, generating it via
+	// genFn and persisting on first call. Subsequent calls return the
+	// persisted value. The generator runs at most once per key in the
+	// table's lifetime; concurrent first-callers may both generate but
+	// only one Insert wins — losers re-read.
+	GetOrCreateBytes(ctx context.Context, key string, genFn func() ([]byte, error)) ([]byte, error)
+}
+
 // PairingStore persists short-lived pair codes.
 type PairingStore interface {
 	// Create publishes a fresh code. CodeID is the public identifier the
@@ -270,5 +298,6 @@ type Store interface {
 	ServerUsers() ServerUserStore
 	Devices() DeviceStore
 	Pairings() PairingStore
+	ServeMeta() ServeMetaStore
 	Close() error
 }

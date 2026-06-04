@@ -103,7 +103,7 @@ func runMigrateKey(ctx context.Context, args []string) int {
 		return 1
 	}
 
-	newKEK, deviceToken, err := loginAndUnwrapKEK(ctx, *upstream, email, pw, hostnameOrDefault())
+	newKEK, deviceToken, err := loginAndUnwrapKEK(ctx, *upstream, email, pw, hostnameOrDefault(), 0)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "migrate-key:", err)
 		return 1

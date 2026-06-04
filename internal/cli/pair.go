@@ -99,7 +99,12 @@ func runPairInvite(ctx context.Context, args []string) int {
 	// never use for sync; revoke it on the way out (success OR error)
 	// so it doesn't linger as a usable bearer credential. Best-effort —
 	// a network failure on the revoke shouldn't mask a successful publish.
-	kek, ephemeralTok, err := loginAndUnwrapKEK(ctx, *upstream, email, pw, "pair-invite-ephemeral")
+	//
+	// sec-M5 belt-and-braces: ALSO request a server-side 60-second TTL
+	// on the ephemeral device so a failed revoke (transient network, ^C
+	// after publish) doesn't leave a year-long bearer alive. The server
+	// enforces independently of the client revoke (clamped to ≤10 min).
+	kek, ephemeralTok, err := loginAndUnwrapKEK(ctx, *upstream, email, pw, "pair-invite-ephemeral", 60*time.Second)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "pair invite:", err)
 		return 1
@@ -317,6 +322,11 @@ func runPairAccept(ctx context.Context, args []string) int {
 	fmt.Println("Initial sync will start automatically.")
 	return 0
 }
+
+// unwrapKEKViaLogin / unwrapKEKViaLoginWithTTL: removed during merge.
+// Both duplicated `loginAndUnwrapKEK` (cli/auth_shared.go). The shared
+// helper now takes a `ttl time.Duration` argument that callers pass
+// directly (sec-M5 + Q5 dedup integration).
 
 // newPublicID returns a hex public id used for the pair code's CodeID.
 // 8 random bytes = 16 hex chars. Matches the server's newID(8) shape.

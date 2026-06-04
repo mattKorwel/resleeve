@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/mattkorwel/resleeve/internal/auth"
 	"github.com/mattkorwel/resleeve/internal/serve"
@@ -14,18 +15,16 @@ import (
 //
 // Callers:
 //   - `resleeve migrate-key`: needs the KEK to re-encrypt sealed blobs.
+//     Passes ttl=0 (long-lived device).
 //   - `resleeve pair invite`: needs the KEK to re-wrap under the pair code.
+//     Passes ttl=60s — the issued token is revoked client-side moments
+//     later; the server-side TTL is the safety net (sec-M5) for the case
+//     where the revoke fails (network, ^C). Server clamps to ≤10 min.
 //
 // deviceName is the cosmetic label sent on /v2/auth/login. migrate-key
 // passes the host name (so the row in `devices` is identifiable);
-// pair-invite passes "pair-invite-ephemeral" because the issued token
-// is revoked moments later. Error wrap prefixes are intentionally
-// neutral so callers can prepend their own verb name.
-//
-// Prior life: this body was duplicated as `loginAndUnwrapKEK` in
-// migrate_key.go and `unwrapKEKViaLogin` in pair.go — same crypto, same
-// wire shape, two copies that drifted on error wording. Q5 dedupe.
-func loginAndUnwrapKEK(ctx context.Context, upstream, email, password, deviceName string) (auth.KEK, string, error) {
+// pair-invite passes "pair-invite-ephemeral".
+func loginAndUnwrapKEK(ctx context.Context, upstream, email, password, deviceName string, ttl time.Duration) (auth.KEK, string, error) {
 	var chal serve.LoginChallengeResp
 	if err := postJSON(ctx, upstream+"/v2/auth/login-challenge", "",
 		serve.LoginChallengeReq{Email: email}, &chal); err != nil {
@@ -40,9 +39,10 @@ func loginAndUnwrapKEK(ctx context.Context, upstream, email, password, deviceNam
 	var resp serve.LoginResp
 	if err := postJSON(ctx, upstream+"/v2/auth/login", "",
 		serve.LoginReq{
-			Email:        email,
-			VerifierHash: verifier,
-			Device:       serve.DeviceMetadata{Name: deviceName},
+			Email:           email,
+			VerifierHash:    verifier,
+			Device:          serve.DeviceMetadata{Name: deviceName},
+			ExpiresAtHintNS: ttl.Nanoseconds(),
 		}, &resp); err != nil {
 		return auth.KEK{}, "", fmt.Errorf("login: %w", err)
 	}

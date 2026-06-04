@@ -97,7 +97,7 @@ func TestPairInvite_RevokesEphemeralToken(t *testing.T) {
 	// --- Drive the login leg the way runPairInvite does.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	kek, tok, err := loginAndUnwrapKEK(ctx, ts.URL, email, password, "pair-invite-ephemeral")
+	kek, tok, err := loginAndUnwrapKEK(ctx, ts.URL, email, password, "pair-invite-ephemeral", 0)
 	if err != nil {
 		t.Fatalf("loginAndUnwrapKEK: %v", err)
 	}

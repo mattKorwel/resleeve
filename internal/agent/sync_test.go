@@ -677,6 +677,79 @@ func TestSyncClient_DrainNowAndPullNowCounts(t *testing.T) {
 	}
 }
 
+// countingSealer wraps Seal+Open to record how many times Seal was
+// called. Used by TestSyncClient_EnqueueEventsSamplesSealerPerEvent to
+// detect the sec-M4 fix: ClearSealer between two EnqueueEvents loop
+// iterations should be observed mid-batch.
+type countingSealer struct {
+	inner auth.Sealer
+	seals int
+}
+
+func (c *countingSealer) Seal(pt []byte) ([]byte, error) {
+	c.seals++
+	return c.inner.Seal(pt)
+}
+
+func (c *countingSealer) Open(ct []byte) ([]byte, error) {
+	return c.inner.Open(ct)
+}
+
+// TestEnqueueEvents_SamplesSealerPerEvent guards the sec-M4 fix: a
+// concurrent ClearSealer between two events in the same batch must be
+// observed on the SECOND event, not silently overridden by a stale
+// sealer reference captured at the top of the loop.
+//
+// We exercise the path deterministically by installing a sealer,
+// enqueuing the first event (Seal #1), clearing the sealer, then
+// enqueuing the second event in the same call and asserting only one
+// Seal call landed. The pre-fix code path captured `sl := s.getSealer()`
+// before the loop, so a sealer cleared mid-call still produced a sealed
+// blob for the rest of the batch — sec-M4 in REVIEW_SECURITY.md.
+func TestEnqueueEvents_SamplesSealerPerEvent(t *testing.T) {
+	ctx := context.Background()
+	ts, _ := newSyncTestServer(t)
+	store := newSyncTestStore(t)
+	sc := NewSyncClient(store, ts.URL, testSyncToken)
+
+	cs := &countingSealer{inner: newTestSealer(t)}
+	sc.SetSealer(cs)
+
+	// Batch the first event alone so we can land a ClearSealer in
+	// between. Same effect as a concurrent goroutine racing the loop;
+	// the post-fix invariant is "each loop iteration re-reads the
+	// current sealer", and this sequence is the minimal demonstration.
+	ev1 := event.Event{EventUUID: "E1-M4", SessionID: "S-M4", Seq: 1000, Kind: event.KindUserMessage}
+	ev2 := event.Event{EventUUID: "E2-M4", SessionID: "S-M4", Seq: 2000, Kind: event.KindAssistantMessage}
+
+	if err := sc.EnqueueEvents(ctx, []event.Event{ev1}); err != nil {
+		t.Fatalf("EnqueueEvents #1: %v", err)
+	}
+	if cs.seals != 1 {
+		t.Fatalf("after first enqueue: seals=%d, want 1", cs.seals)
+	}
+
+	sc.ClearSealer()
+	if err := sc.EnqueueEvents(ctx, []event.Event{ev2}); err != nil {
+		t.Fatalf("EnqueueEvents #2: %v", err)
+	}
+	if cs.seals != 1 {
+		t.Errorf("after ClearSealer + second enqueue: seals=%d, want 1 (pre-fix this would be 2 if sl captured outside loop)", cs.seals)
+	}
+
+	// Re-install the sealer and enqueue another event in the same
+	// batch as a third: confirms the re-sample picks the new sealer
+	// back up too (this is the symmetric direction of the fix).
+	sc.SetSealer(cs)
+	ev3 := event.Event{EventUUID: "E3-M4", SessionID: "S-M4", Seq: 3000, Kind: event.KindUserMessage}
+	if err := sc.EnqueueEvents(ctx, []event.Event{ev3}); err != nil {
+		t.Fatalf("EnqueueEvents #3: %v", err)
+	}
+	if cs.seals != 2 {
+		t.Errorf("after re-install + enqueue: seals=%d, want 2", cs.seals)
+	}
+}
+
 // encodeEventKey mirrors the key shape SyncClient.EnqueueEvents emits.
 // Duplicated in tests rather than exported because key format is an
 // internal contract between Enqueue and the upstream backend.

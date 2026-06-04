@@ -116,11 +116,30 @@ type RegisterResp struct {
 // password-derived verifier hash in one round trip, because the client
 // needs the WrappedKEK to decrypt local content anyway and we'd be
 // returning it on success regardless.
+//
+// ExpiresAtHintNS is the optional client-requested device-token TTL in
+// nanoseconds (sec-M5). Non-zero values request a server-side expiry on
+// the minted device row so the bearer is rejected after that delta even
+// if the client never calls /v2/auth/logout. Used by `resleeve pair
+// invite` to mint a short-lived "pair-invite-ephemeral" token (60s).
+// The server clamps to [0, deviceExpiresAtHintMax]; zero (the default
+// for ordinary `resleeve login`) means no expiry — matches the v1
+// behavior on regular paired devices.
 type LoginReq struct {
-	Email        string `json:"email"`
-	VerifierHash []byte `json:"verifier_hash"`
-	Device       DeviceMetadata `json:"device"`
+	Email           string         `json:"email"`
+	VerifierHash    []byte         `json:"verifier_hash"`
+	Device          DeviceMetadata `json:"device"`
+	ExpiresAtHintNS int64          `json:"expires_at_hint_ns,omitempty"`
 }
+
+// deviceExpiresAtHintMax caps the client-requested TTL on
+// /v2/auth/login (sec-M5). 10 minutes is overshoot for the documented
+// pair-invite use case (60s) but leaves headroom for slow operators
+// without permitting an effectively-unbounded TTL via a malicious or
+// buggy client. Hints above the cap are clamped, not rejected, so a
+// future call-site requesting a slightly larger value still gets a
+// finite expiry rather than an unbounded bearer.
+const deviceExpiresAtHintMax = 10 * time.Minute
 
 // LoginResp contains everything the client needs to unwrap its KEK
 // locally: the params, the verifier salt (echoed so the client can
@@ -282,6 +301,36 @@ func (s *Server) handleLoginChallenge(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// runLoginTimingDecoy performs a dummy subtle.ConstantTimeCompare on
+// the unknown-email branch of /v2/auth/login (sec-M6) so the timing
+// shape of "no such email" matches "wrong password". The decoy is a
+// per-process random 32-byte value; the compare deterministically
+// returns 0 (the inputs are independent random). The return value is
+// intentionally consumed via the side effect alone — we don't care
+// what it is, we just want the compare to happen so the caller can't
+// time-distinguish the early-return path from the verifier-check path.
+//
+// Truncated to len(hash) up to the decoy length so the constant-time
+// compare runs over the same byte count as the real path would. If the
+// client ships an absurdly long hash, we cap at the decoy length —
+// the cost gap between "decoy-len compare" and "32-byte real compare"
+// is far below DB-jitter and the gross "no compare at all" tell is
+// what matters here.
+func (s *Server) runLoginTimingDecoy(verifierHash []byte) {
+	n := len(verifierHash)
+	if n > len(s.loginTimingDecoy) {
+		n = len(s.loginTimingDecoy)
+	}
+	if n == 0 {
+		// Run anyway over the decoy alone so an empty hash still hits
+		// the constant-time path; client-side empty-hash is a malformed
+		// request shape, not a real timing channel, but be defensive.
+		_ = subtle.ConstantTimeCompare(s.loginTimingDecoy, s.loginTimingDecoy)
+		return
+	}
+	_ = subtle.ConstantTimeCompare(verifierHash[:n], s.loginTimingDecoy[:n])
+}
+
 // syntheticChallengeSalt derives a stable-but-secret 16-byte salt for an
 // unknown email. Determinism (same email → same salt within a process
 // lifetime) means a repeat probe doesn't reveal "this email is new"; the
@@ -310,6 +359,17 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	u, err := s.serverUsers.GetByEmail(r.Context(), strings.ToLower(strings.TrimSpace(req.Email)))
 	if err != nil {
+		// sec-M6: on the unknown-email branch, run a dummy
+		// ConstantTimeCompare against a per-process random decoy before
+		// returning 401 so the timing shape matches the known-email
+		// wrong-password branch (which always runs the compare against
+		// PasswordVerifier.Hash). The decoy is random + non-secret, so
+		// the compare deterministically returns 0; this is purely about
+		// closing the early-return distinguisher between "no such email"
+		// and "wrong password". DB-round-trip time still differs in
+		// principle, but the compare-vs-no-compare gap is the easy tell
+		// we're plugging.
+		s.runLoginTimingDecoy(req.VerifierHash)
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
@@ -322,7 +382,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
-	dev, err := s.mintDevice(r.Context(), u.ID, req.Device.Name)
+	// sec-M5: honor the client's ExpiresAtHintNS for short-lived
+	// devices (pair-invite ephemeral). Clamped to deviceExpiresAtHintMax;
+	// zero (default) preserves the pre-M5 no-expiry behavior for ordinary
+	// `resleeve login`.
+	ttl := time.Duration(req.ExpiresAtHintNS)
+	if ttl < 0 {
+		ttl = 0
+	}
+	if ttl > deviceExpiresAtHintMax {
+		ttl = deviceExpiresAtHintMax
+	}
+	dev, err := s.mintDeviceWithTTL(r.Context(), u.ID, req.Device.Name, ttl)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "mint device: "+err.Error())
 		return
@@ -608,6 +679,17 @@ func (s *Server) deviceFromBearer(r *http.Request) (*rsql.Device, bool) {
 	// 1) Per-device lookup (post-migration path).
 	if s.devices != nil {
 		if dev, err := s.devices.GetByToken(r.Context(), token); err == nil {
+			// sec-M5: enforce the server-side TTL. Expired tokens are
+			// treated as if the row didn't exist so the wire response
+			// (401 from the caller) is indistinguishable from a never-
+			// existed bearer. We also opportunistically delete the
+			// expired row — best-effort, ignore errors. The bearer was
+			// minted with a short TTL precisely so a missed best-effort
+			// revoke on the client side doesn't leave it usable.
+			if dev.ExpiresAt != nil && !time.Now().UTC().Before(*dev.ExpiresAt) {
+				_ = s.devices.Delete(r.Context(), dev.ID)
+				return nil, false
+			}
 			_ = s.devices.TouchLastSeen(r.Context(), dev.ID)
 			return dev, true
 		}
@@ -642,6 +724,16 @@ func (s *Server) requireUserDevice(w http.ResponseWriter, r *http.Request, dev *
 // --- helpers ---
 
 func (s *Server) mintDevice(ctx context.Context, userID, name string) (*rsql.Device, error) {
+	return s.mintDeviceWithTTL(ctx, userID, name, 0)
+}
+
+// mintDeviceWithTTL is mintDevice with a server-side expiry on the
+// device row (sec-M5). When ttl > 0, the device's ExpiresAt is set to
+// now+ttl, and deviceFromBearer rejects the token after that time.
+// ttl <= 0 means no expiry (matches mintDevice's behavior for ordinary
+// register/login). Used by handleLogin when the client requests a
+// short-lived ephemeral device (e.g. `resleeve pair invite`).
+func (s *Server) mintDeviceWithTTL(ctx context.Context, userID, name string, ttl time.Duration) (*rsql.Device, error) {
 	tok, err := newDeviceToken()
 	if err != nil {
 		return nil, err
@@ -654,6 +746,10 @@ func (s *Server) mintDevice(ctx context.Context, userID, name string) (*rsql.Dev
 		DeviceToken: tok,
 		CreatedAt:   now,
 		LastSeenAt:  now,
+	}
+	if ttl > 0 {
+		exp := now.Add(ttl)
+		dev.ExpiresAt = &exp
 	}
 	if err := s.devices.Create(ctx, dev); err != nil {
 		return nil, err

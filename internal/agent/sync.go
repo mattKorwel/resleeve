@@ -191,15 +191,25 @@ func (s *SyncClient) EnqueueSession(ctx context.Context, ses *rsql.Session) erro
 // One outbox row per event; idempotent via the (kind, key) constraint.
 // Key format: "events/<sid>/<padded-seq>-<event_uuid>" so lexicographic
 // ordering matches (seq, uuid) ordering — see round-2/04-event-schema.md.
+//
+// sec-M4: the sealer is re-sampled INSIDE the loop on every event, not
+// once at the top, so a concurrent ClearSealer (e.g. `resleeve logout`
+// racing with an in-flight IngestBatch) is observed mid-batch. With the
+// previous top-of-loop sample, events later in the same batch were
+// sealed under the just-cleared KEK; the row would then park in the
+// outbox unable to drain until the user logged back in with the same
+// password. Re-sampling makes the user's lock intent take effect at
+// per-event granularity. enqueue-still-happens semantics (events get
+// queued even when no sealer is installed, to avoid losing capture) are
+// preserved in both branches — see seal_handlers.go.
 func (s *SyncClient) EnqueueEvents(ctx context.Context, events []event.Event) error {
 	now := time.Now().UTC()
-	sl := s.getSealer()
 	for _, e := range events {
 		blob, err := json.Marshal(e)
 		if err != nil {
 			return fmt.Errorf("sync: marshal event %s: %w", e.EventUUID, err)
 		}
-		if sl != nil {
+		if sl := s.getSealer(); sl != nil {
 			blob, err = sl.Seal(blob)
 			if err != nil {
 				return fmt.Errorf("sync: seal event %s: %w", e.EventUUID, err)

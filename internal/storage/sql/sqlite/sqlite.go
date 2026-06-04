@@ -31,6 +31,7 @@ type Store struct {
 	serverUsers *serverUserStore
 	devices     *deviceStore
 	pairings    *pairingStore
+	serveMeta   *serveMetaStore
 }
 
 // Open opens (and auto-migrates) a SQLite database at the given DSN.
@@ -57,6 +58,7 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	s.serverUsers = &serverUserStore{db: db}
 	s.devices = &deviceStore{db: db}
 	s.pairings = &pairingStore{db: db}
+	s.serveMeta = &serveMetaStore{db: db}
 	if err := s.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -87,6 +89,11 @@ func (s *Store) Devices() rsql.DeviceStore { return s.devices }
 // Pairings returns the short-lived pairing-code store. Only `resleeve
 // serve` reads from this.
 func (s *Store) Pairings() rsql.PairingStore { return s.pairings }
+
+// ServeMeta returns the server-side process-secret store. Holds the
+// persisted login-challenge HMAC key (sec-M1) so the synthetic salt for
+// unknown-email probes is stable across `resleeve serve` restarts.
+func (s *Store) ServeMeta() rsql.ServeMetaStore { return s.serveMeta }
 
 // Close releases the underlying database handle.
 func (s *Store) Close() error { return s.db.Close() }

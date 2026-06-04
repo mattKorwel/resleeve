@@ -103,26 +103,31 @@ func (s *serverUserStore) scan(row *sql.Row) (*rsql.ServerUser, error) {
 type deviceStore struct{ db *sql.DB }
 
 func (s *deviceStore) Create(ctx context.Context, d *rsql.Device) error {
+	var expires sql.NullString
+	if d.ExpiresAt != nil {
+		expires = sql.NullString{Valid: true, String: d.ExpiresAt.UTC().Format(time.RFC3339Nano)}
+	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO devices
-		(id, user_id, name, device_token, created_at, last_seen_at)
-		VALUES (?, ?, ?, ?, ?, ?)`,
+		(id, user_id, name, device_token, created_at, last_seen_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		d.ID, d.UserID, d.Name, d.DeviceToken,
 		d.CreatedAt.UTC().Format(time.RFC3339Nano),
 		d.LastSeenAt.UTC().Format(time.RFC3339Nano),
+		expires,
 	)
 	return err
 }
 
 func (s *deviceStore) GetByToken(ctx context.Context, token string) (*rsql.Device, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, user_id, name, device_token, created_at, last_seen_at
+		`SELECT id, user_id, name, device_token, created_at, last_seen_at, expires_at
 		   FROM devices WHERE device_token = ?`, token)
 	return s.scanDevice(row)
 }
 
 func (s *deviceStore) ListByUser(ctx context.Context, userID string) ([]*rsql.Device, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, user_id, name, device_token, created_at, last_seen_at
+		`SELECT id, user_id, name, device_token, created_at, last_seen_at, expires_at
 		   FROM devices WHERE user_id = ? ORDER BY created_at ASC`, userID)
 	if err != nil {
 		return nil, err
@@ -132,7 +137,8 @@ func (s *deviceStore) ListByUser(ctx context.Context, userID string) ([]*rsql.De
 	for rows.Next() {
 		var d rsql.Device
 		var created, lastSeen string
-		if err := rows.Scan(&d.ID, &d.UserID, &d.Name, &d.DeviceToken, &created, &lastSeen); err != nil {
+		var expires sql.NullString
+		if err := rows.Scan(&d.ID, &d.UserID, &d.Name, &d.DeviceToken, &created, &lastSeen, &expires); err != nil {
 			return nil, err
 		}
 		if t, err := time.Parse(time.RFC3339Nano, created); err == nil {
@@ -140,6 +146,11 @@ func (s *deviceStore) ListByUser(ctx context.Context, userID string) ([]*rsql.De
 		}
 		if t, err := time.Parse(time.RFC3339Nano, lastSeen); err == nil {
 			d.LastSeenAt = t
+		}
+		if expires.Valid {
+			if t, err := time.Parse(time.RFC3339Nano, expires.String); err == nil {
+				d.ExpiresAt = &t
+			}
 		}
 		out = append(out, &d)
 	}
@@ -161,7 +172,8 @@ func (s *deviceStore) Delete(ctx context.Context, deviceID string) error {
 func (s *deviceStore) scanDevice(row *sql.Row) (*rsql.Device, error) {
 	var d rsql.Device
 	var created, lastSeen string
-	if err := row.Scan(&d.ID, &d.UserID, &d.Name, &d.DeviceToken, &created, &lastSeen); err != nil {
+	var expires sql.NullString
+	if err := row.Scan(&d.ID, &d.UserID, &d.Name, &d.DeviceToken, &created, &lastSeen, &expires); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, rsql.ErrNotFound
 		}
@@ -173,7 +185,46 @@ func (s *deviceStore) scanDevice(row *sql.Row) (*rsql.Device, error) {
 	if t, err := time.Parse(time.RFC3339Nano, lastSeen); err == nil {
 		d.LastSeenAt = t
 	}
+	if expires.Valid {
+		if t, err := time.Parse(time.RFC3339Nano, expires.String); err == nil {
+			d.ExpiresAt = &t
+		}
+	}
 	return &d, nil
+}
+
+// serveMetaStore implements rsql.ServeMetaStore against the `serve_meta`
+// table (migration 0006). One row per persistent process secret. v1
+// holds exactly one key: "login_challenge_key" (sec-M1). See the migration
+// header for why the key needs to outlive a restart.
+type serveMetaStore struct{ db *sql.DB }
+
+func (s *serveMetaStore) GetOrCreateBytes(ctx context.Context, key string, genFn func() ([]byte, error)) ([]byte, error) {
+	// Fast path: row already exists.
+	var val []byte
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM serve_meta WHERE key = ?`, key).Scan(&val)
+	if err == nil {
+		return val, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	// First-time generate + insert. INSERT OR IGNORE makes the lost-race
+	// case a no-op so two concurrent first-callers both succeed; the
+	// SELECT after re-reads whichever value won.
+	gen, err := genFn()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO serve_meta (key, value) VALUES (?, ?)`,
+		key, gen); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT value FROM serve_meta WHERE key = ?`, key).Scan(&val); err != nil {
+		return nil, err
+	}
+	return val, nil
 }
 
 // pairingStore implements rsql.PairingStore against the `pairing_codes` table.
@@ -270,4 +321,5 @@ var (
 	_ rsql.ServerUserStore = (*serverUserStore)(nil)
 	_ rsql.DeviceStore     = (*deviceStore)(nil)
 	_ rsql.PairingStore    = (*pairingStore)(nil)
+	_ rsql.ServeMetaStore  = (*serveMetaStore)(nil)
 )
