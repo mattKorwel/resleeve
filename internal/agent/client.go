@@ -105,6 +105,17 @@ func (c *Client) ListEvents(ctx context.Context, sessionID string, sinceSeq int6
 	return resp.Events, nil
 }
 
+// DoctorSyncStatus fetches the daemon's sync runtime snapshot for
+// `resleeve doctor`. See SyncStatusSnapshot for field semantics.
+func (c *Client) DoctorSyncStatus(ctx context.Context) (*SyncStatusSnapshot, error) {
+	endpoint := c.BaseURL + "/v1/doctor/sync-status"
+	var snap SyncStatusSnapshot
+	if err := c.doJSON(ctx, http.MethodGet, endpoint, nil, &snap); err != nil {
+		return nil, err
+	}
+	return &snap, nil
+}
+
 // Search runs a cross-session content search.
 func (c *Client) Search(ctx context.Context, query string, limit int) ([]rsql.EventSearchHit, error) {
 	q := url.Values{}

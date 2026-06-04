@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mattkorwel/resleeve/internal/auth"
@@ -57,6 +58,12 @@ type SyncClient struct {
 	// daemons with no --upstream). See round-4/02-cross-machine-sync.md
 	// §"Zero-knowledge layer".
 	sealer auth.Sealer
+
+	// stats tracks runtime liveness for `resleeve doctor`. Mutated from
+	// the drain/pull/sse loops via record* helpers (defined at the
+	// bottom of this file) and read out via Snapshot() for the
+	// /v1/doctor/sync-status endpoint. See round-4/03 §"resleeve doctor".
+	stats syncStats
 }
 
 // NewSyncClient builds a client. upstream is the base URL of a
@@ -284,6 +291,7 @@ func (s *SyncClient) drainOnce(ctx context.Context) error {
 			ackSeqs = append(ackSeqs, seq)
 		}
 	}
+	s.stats.recordDrain(time.Now().UTC())
 	return s.store.Sync().AckOutbox(ctx, ackSeqs)
 }
 
@@ -401,6 +409,7 @@ func (s *SyncClient) pullKind(ctx context.Context, kind string) (int, error) {
 			break
 		}
 	}
+	s.stats.recordPull(kind, time.Now().UTC())
 	return ingested, nil
 }
 
@@ -618,6 +627,8 @@ func (s *SyncClient) runSSE(ctx context.Context) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("sse status %d", resp.StatusCode)
 	}
+	s.stats.recordSSEConnected(time.Now().UTC())
+	defer s.stats.recordSSEDisconnected()
 
 	// SSE event framing per spec: lines separated by '\n'; an empty
 	// line dispatches the buffered event. We only emit single-line
@@ -647,6 +658,7 @@ func (s *SyncClient) runSSE(ctx context.Context) error {
 				log.Printf("sync sse: ingest %s: %v", row.Key, err)
 				continue
 			}
+			s.stats.recordSSEEvent(time.Now().UTC())
 			if err := s.store.Sync().SetCursor(ctx, "memory", row.Key); err != nil {
 				log.Printf("sync sse: set cursor: %v", err)
 			}
@@ -664,4 +676,118 @@ func (s *SyncClient) runSSE(ctx context.Context) error {
 		return fmt.Errorf("sse read: %w", err)
 	}
 	return nil
+}
+
+// --- runtime stats (read by /v1/doctor/sync-status) ---
+//
+// syncStats holds the runtime liveness fields surfaced by `resleeve
+// doctor`. All accessors are mutex-protected so the doctor endpoint can
+// snapshot a consistent view while the drain/pull/sse loops are
+// concurrently recording new timestamps. Time fields are stored in
+// UTC; zero value = "never happened".
+//
+// Why a sub-struct rather than per-field atomics on SyncClient: the
+// snapshot wants a single point-in-time view across all fields, which
+// a single mutex gives us for free. The mutations are infrequent (once
+// per drain interval, once per pull interval, once per SSE event), so
+// lock contention is not a concern. See round-4/03 §"resleeve doctor".
+type syncStats struct {
+	mu              sync.Mutex
+	drainLast       time.Time
+	pullLastPerKind map[string]time.Time
+	sseConnected    bool
+	sseConnectedAt  time.Time
+	sseLastEventAt  time.Time
+}
+
+func (s *syncStats) recordDrain(t time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.drainLast = t
+}
+
+func (s *syncStats) recordPull(kind string, t time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pullLastPerKind == nil {
+		s.pullLastPerKind = make(map[string]time.Time)
+	}
+	s.pullLastPerKind[kind] = t
+}
+
+func (s *syncStats) recordSSEConnected(t time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sseConnected = true
+	s.sseConnectedAt = t
+}
+
+func (s *syncStats) recordSSEDisconnected() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sseConnected = false
+	// Keep sseConnectedAt and sseLastEventAt for post-mortem visibility.
+}
+
+func (s *syncStats) recordSSEEvent(t time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sseLastEventAt = t
+}
+
+// SyncStatusSnapshot is the point-in-time view returned by
+// /v1/doctor/sync-status. JSON-friendly; zero-time fields serialize
+// as RFC3339 "0001-01-01T00:00:00Z" which the CLI side treats as
+// "never". OutboxDepth and UpstreamReachable are filled by the
+// daemon's handler (not the SyncClient) because they require a
+// store query and a network probe respectively.
+type SyncStatusSnapshot struct {
+	DrainLast        time.Time            `json:"drain_last"`
+	PullLastPerKind  map[string]time.Time `json:"pull_last_per_kind"`
+	SSEConnected     bool                 `json:"sse_connected"`
+	SSEConnectedAt   time.Time            `json:"sse_connected_at"`
+	SSEUptimeSec     int64                `json:"sse_uptime_sec"`
+	SSELastEventAt   time.Time            `json:"sse_last_event_at"`
+	OutboxDepth      int                  `json:"outbox_depth"`
+	UpstreamConfig   string               `json:"upstream"`
+	UpstreamOK       bool                 `json:"upstream_ok"`
+	UpstreamRTTms    int64                `json:"upstream_rtt_ms"`
+	UpstreamError    string               `json:"upstream_error,omitempty"`
+}
+
+// Snapshot returns a copy of the stats (without OutboxDepth, upstream
+// fields, or upstream config — those are filled by the daemon handler).
+// Safe to call concurrently with the drain/pull/sse loops.
+func (s *SyncClient) Snapshot() SyncStatusSnapshot {
+	s.stats.mu.Lock()
+	defer s.stats.mu.Unlock()
+	out := SyncStatusSnapshot{
+		DrainLast:      s.stats.drainLast,
+		SSEConnected:   s.stats.sseConnected,
+		SSEConnectedAt: s.stats.sseConnectedAt,
+		SSELastEventAt: s.stats.sseLastEventAt,
+	}
+	if s.stats.sseConnected && !s.stats.sseConnectedAt.IsZero() {
+		out.SSEUptimeSec = int64(time.Since(s.stats.sseConnectedAt).Seconds())
+	}
+	if len(s.stats.pullLastPerKind) > 0 {
+		out.PullLastPerKind = make(map[string]time.Time, len(s.stats.pullLastPerKind))
+		for k, v := range s.stats.pullLastPerKind {
+			out.PullLastPerKind[k] = v
+		}
+	}
+	return out
+}
+
+// UpstreamURL returns the configured upstream base URL (already
+// trimmed of trailing slashes). Empty when no --upstream was passed.
+// Used by the doctor handler to ping /v2/sync/health.
+func (s *SyncClient) UpstreamURL() string {
+	return s.upstream
+}
+
+// UpstreamToken returns the bearer secret sent to upstream. Used by
+// the doctor handler to authenticate the /v2/sync/health probe.
+func (s *SyncClient) UpstreamToken() string {
+	return s.token
 }

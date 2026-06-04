@@ -164,6 +164,12 @@ func runPurge(ctx context.Context, args []string) int {
 }
 
 // runDoctor reports daemon + bridge + CLI status.
+//
+// The exit code is non-zero when doctor detects the F13 silent-no-op
+// state: bridge installed (✓) but daemon not running (✗). In that
+// configuration hooks fire but emit nothing — looks half-installed
+// from the user's perspective. Loud exit code so scripted callers
+// (CI, smoke tests, "resleeve doctor && resleeve up") notice.
 func runDoctor(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -200,7 +206,9 @@ func runDoctor(ctx context.Context, args []string) int {
 	}
 
 	// Daemon
-	if alive, pid := daemonAlive(); alive {
+	daemonRunning, _ := daemonAlive()
+	if daemonRunning {
+		_, pid := daemonAlive()
 		fmt.Printf("  daemon           ✓ running (pid %d)\n", pid)
 		if url, _, _ := agent.LoadEndpoint(); url != "" {
 			fmt.Printf("  endpoint         %s\n", url)
@@ -218,10 +226,12 @@ func runDoctor(ctx context.Context, args []string) int {
 	}
 
 	// Bridge
+	bridgeInstalled := false
 	settingsPath, _ := claudeSettingsPath()
 	if settingsPath != "" {
 		if data, err := os.ReadFile(settingsPath); err == nil {
 			if strings.Contains(string(data), `"_resleeve": true`) {
+				bridgeInstalled = true
 				fmt.Printf("  bridge (claude)  ✓ installed in %s\n", settingsPath)
 			} else {
 				fmt.Printf("  bridge (claude)  ✗ not installed in %s\n", settingsPath)
@@ -229,6 +239,12 @@ func runDoctor(ctx context.Context, args []string) int {
 		} else {
 			fmt.Printf("  bridge (claude)  ? settings.json missing\n")
 		}
+	}
+
+	// Sync cards (upstream / slow / fast) — additive helpers; only
+	// useful when the daemon is up since the snapshot lives in-process.
+	if daemonRunning {
+		printSyncCards(ctx)
 	}
 
 	// CLI binary
@@ -242,7 +258,166 @@ func runDoctor(ctx context.Context, args []string) int {
 	if self, err := os.Executable(); err == nil {
 		fmt.Printf("  resleeve binary  %s\n", self)
 	}
-	return 0
+
+	// Hook-env card: LOUDLY warn when bridge is installed but daemon
+	// is not running — the F13 silent-injection-failure state. Returns
+	// non-zero exit code so scripted callers notice.
+	return printHookEnvCard(bridgeInstalled, daemonRunning)
+}
+
+// printSyncCards renders the upstream / sync(slow) / sync(fast-sse)
+// cards. Pulls the snapshot from the daemon's /v1/doctor/sync-status
+// endpoint. If the daemon is not reachable or the endpoint is
+// unavailable (older daemon), prints nothing — the daemon ✗ line
+// above already covered that case.
+func printSyncCards(ctx context.Context) {
+	c, err := clientFromEndpoint()
+	if err != nil {
+		return
+	}
+	snap, err := c.DoctorSyncStatus(ctx)
+	if err != nil {
+		fmt.Printf("  sync             ✗ couldn't fetch status: %v\n", err)
+		return
+	}
+	printUpstreamCard(snap)
+	printSyncSlowCard(snap)
+	printSyncFastCard(snap)
+}
+
+// printUpstreamCard renders the upstream reachability line. When no
+// upstream is configured we emit a single "standalone" line so users
+// know sync just isn't a thing for this daemon.
+func printUpstreamCard(snap *agent.SyncStatusSnapshot) {
+	if snap.UpstreamConfig == "" {
+		fmt.Println("  upstream         (standalone — no upstream configured)")
+		return
+	}
+	if snap.UpstreamOK {
+		fmt.Printf("  upstream         %s (✓ reachable, %dms RTT)\n", snap.UpstreamConfig, snap.UpstreamRTTms)
+	} else {
+		errStr := snap.UpstreamError
+		if errStr == "" {
+			errStr = "unreachable"
+		}
+		fmt.Printf("  upstream         %s (✗ %s)\n", snap.UpstreamConfig, errStr)
+	}
+}
+
+// printSyncSlowCard renders the slow-tier card: last drain, last pull,
+// outbox depth. Outbox depth > 0 with a stale drain timestamp is a
+// hint that pushes are failing — though we don't try to diagnose
+// why here.
+func printSyncSlowCard(snap *agent.SyncStatusSnapshot) {
+	drain := agoOrNever(snap.DrainLast)
+	// "events" is the highest-volume kind and is the most useful single
+	// signal for "is pull doing anything"; show its last-pull time as
+	// the headline. (sessions and memory get rolled up into the same
+	// loop so they all advance together in practice.)
+	var lastPull time.Time
+	for _, t := range snap.PullLastPerKind {
+		if t.After(lastPull) {
+			lastPull = t
+		}
+	}
+	fmt.Printf("  sync (slow)      last drain %s • last pull %s • outbox depth %d\n",
+		drain, agoOrNever(lastPull), snap.OutboxDepth)
+}
+
+// printSyncFastCard renders the fast-tier (SSE) card. Three states:
+// connected (with uptime + last event), disconnected (showing last
+// known event), and never-connected (likely no upstream).
+func printSyncFastCard(snap *agent.SyncStatusSnapshot) {
+	if snap.UpstreamConfig == "" {
+		// No upstream → fast tier doesn't apply. Skip the card to
+		// keep the output uncluttered.
+		return
+	}
+	if snap.SSEConnected {
+		uptime := time.Duration(snap.SSEUptimeSec) * time.Second
+		fmt.Printf("  sync (fast/sse)  ✓ connected (%s uptime) • last event %s\n",
+			compactDuration(uptime), agoOrNever(snap.SSELastEventAt))
+		return
+	}
+	if snap.SSEConnectedAt.IsZero() {
+		fmt.Println("  sync (fast/sse)  ✗ never connected")
+		return
+	}
+	fmt.Printf("  sync (fast/sse)  ✗ disconnected • last event %s\n", agoOrNever(snap.SSELastEventAt))
+}
+
+// printHookEnvCard renders the hook-env card and returns the exit
+// code for runDoctor. The F13 dogfood finding: a daemon-down +
+// bridge-installed config is the silent-no-op state — the hook
+// fires, gets connection-refused, and CC sees no additionalContext.
+// Looks half-installed. We yell with red+bold ANSI escapes (only on
+// a TTY) and exit non-zero so scripts catch it.
+func printHookEnvCard(bridgeInstalled, daemonRunning bool) int {
+	switch {
+	case bridgeInstalled && !daemonRunning:
+		// The dangerous combo. Loud.
+		msg := "bridge ✓ — but daemon ✗ ! HOOKS ARE NO-OPS — run `resleeve up`"
+		if isStdoutTTY() {
+			// Bright red, bold.
+			fmt.Printf("  hook env         \x1b[1;31m%s\x1b[0m\n", msg)
+		} else {
+			fmt.Printf("  hook env         %s\n", msg)
+		}
+		return 1
+	case bridgeInstalled && daemonRunning:
+		fmt.Println("  hook env         ✓ bridge + daemon both up")
+		return 0
+	case !bridgeInstalled && daemonRunning:
+		fmt.Println("  hook env         bridge ✗ — daemon up but hooks not wired (run `resleeve up`)")
+		return 0
+	default:
+		// Neither bridge nor daemon. This is the post-`resleeve down`
+		// state — annoying to flag loudly, so just note it.
+		fmt.Println("  hook env         ✗ neither bridge nor daemon — run `resleeve up`")
+		return 0
+	}
+}
+
+// agoOrNever formats a timestamp as "Ns ago" / "Nm ago" / "Nh ago" or
+// "never" if the time is the zero value. Sub-second resolution is
+// rolled up to "just now".
+func agoOrNever(t time.Time) string {
+	if t.IsZero() {
+		return "never"
+	}
+	d := time.Since(t)
+	if d < 0 {
+		return "just now"
+	}
+	return compactDuration(d) + " ago"
+}
+
+// compactDuration renders a duration as "Ns" / "Nm" / "Nh" rounded down.
+// Sub-second collapses to "0s" (then surfaced as "just now" by callers).
+func compactDuration(d time.Duration) string {
+	if d < time.Second {
+		return "0s"
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	return fmt.Sprintf("%dh", int(d.Hours()))
+}
+
+// isStdoutTTY reports whether stdout looks like an interactive
+// terminal. Used to decide whether to emit ANSI color escapes in
+// the loud hook-env warning. Conservative: anything we can't stat
+// or any non-character-device is treated as non-TTY (so piped /
+// redirected output stays clean).
+func isStdoutTTY() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
 // runDoctorBackfillCounts recomputes sessions.event_count for every row
