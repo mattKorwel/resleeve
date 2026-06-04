@@ -19,6 +19,11 @@ import (
 // Daemon is the local resleeve agent process. It owns the SQLite
 // store, an HTTP listener on loopback, and the endpoint file used by
 // bridge plugins to discover it.
+//
+// The Sealer is intentionally runtime-mutable via SetSealer/ClearSealer
+// (called by the /v1/seal/unlock and /v1/seal/lock handlers). This is
+// what lets `resleeve login` install a freshly-derived KEK into a
+// running daemon without a restart.
 type Daemon struct {
 	cfg      Config
 	store    *sqlite.Store
@@ -69,6 +74,7 @@ func New(ctx context.Context, cfg Config) (*Daemon, error) {
 	d.registerMemoryRoutes(mux)
 	d.registerSyncRoutes(mux)
 	d.registerDoctorRoutes(mux)
+	d.registerSealRoutes(mux)
 	d.server = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,

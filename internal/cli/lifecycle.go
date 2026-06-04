@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -210,7 +211,7 @@ func runDoctor(ctx context.Context, args []string) int {
 	if daemonRunning {
 		_, pid := daemonAlive()
 		fmt.Printf("  daemon           ✓ running (pid %d)\n", pid)
-		if url, _, _ := agent.LoadEndpoint(); url != "" {
+		if url, secret, _ := agent.LoadEndpoint(); url != "" {
 			fmt.Printf("  endpoint         %s\n", url)
 			// Try /v1/health.
 			resp, err := http.Get(url + "/v1/health")
@@ -219,6 +220,25 @@ func runDoctor(ctx context.Context, args []string) int {
 				fmt.Println("  /v1/health       ✓ 200 OK")
 			} else {
 				fmt.Printf("  /v1/health       ✗ %v\n", err)
+			}
+			// Sealer status: tells the operator whether `resleeve login`
+			// has installed a KEK yet. Sync push/pull is parked while
+			// sealed=false on a daemon with --no-seal-key.
+			if sealReq, _ := http.NewRequest("GET", url+"/v1/seal/status", nil); sealReq != nil {
+				sealReq.Header.Set("Authorization", "Bearer "+secret)
+				if resp, err := http.DefaultClient.Do(sealReq); err == nil {
+					defer resp.Body.Close()
+					var status struct {
+						Sealed    bool `json:"sealed"`
+						SyncReady bool `json:"sync_ready"`
+					}
+					_ = json.NewDecoder(resp.Body).Decode(&status)
+					if status.Sealed {
+						fmt.Println("  sealer           ✓ unlocked")
+					} else {
+						fmt.Println("  sealer           ✗ locked (run `resleeve login`)")
+					}
+				}
 			}
 		}
 	} else {

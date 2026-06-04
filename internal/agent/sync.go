@@ -57,7 +57,24 @@ type SyncClient struct {
 	// push/pull boundary. nil = plaintext mode (used by tests and by
 	// daemons with no --upstream). See round-4/02-cross-machine-sync.md
 	// §"Zero-knowledge layer".
-	sealer auth.Sealer
+	//
+	// Post-#3: also nil when the daemon is up but the user hasn't run
+	// `resleeve login` yet. The drain/pull/sse loops park while it's
+	// nil; Enqueue is a no-op (capture stays local until login).
+	// SetSealer installs one at runtime; ClearSealer locks it back to
+	// nil. sealerMu guards reads + writes; the loops re-check on every
+	// tick so a freshly installed sealer is picked up within parkInterval.
+	sealerMu sync.RWMutex
+	sealer   auth.Sealer
+
+	// parkInterval is how often a parked loop wakes up to check whether
+	// a sealer has been installed. Kept short for snappy login UX.
+	parkInterval time.Duration
+
+	// parkLogMu guards parkLogAt — used to throttle "waiting for login"
+	// log lines to once per minute per loop.
+	parkLogMu sync.Mutex
+	parkLogAt map[string]time.Time
 
 	// stats tracks runtime liveness for `resleeve doctor`. Mutated from
 	// the drain/pull/sse loops via record* helpers (defined at the
@@ -78,9 +95,36 @@ func NewSyncClient(store rsql.Store, upstream, token string) *SyncClient {
 		sseHTTPc:      &http.Client{}, // no timeout: SSE is long-lived; context controls lifetime
 		drainInterval: 1 * time.Second,
 		pullInterval:  30 * time.Second,
+		parkInterval:  5 * time.Second,
 		batchSize:     100,
 		done:          make(chan struct{}, 3),
 	}
+}
+
+// SetSealer installs (or replaces) the sealer used at the push/pull
+// boundary. Called by the daemon's /v1/seal/unlock handler after
+// `resleeve login` derives the KEK locally. Idempotent + concurrent-safe.
+func (s *SyncClient) SetSealer(sl auth.Sealer) {
+	s.sealerMu.Lock()
+	s.sealer = sl
+	s.sealerMu.Unlock()
+}
+
+// ClearSealer drops the installed sealer. Called by /v1/seal/lock on
+// `resleeve logout`; the drain/pull/sse loops then park until the
+// next SetSealer.
+func (s *SyncClient) ClearSealer() {
+	s.sealerMu.Lock()
+	s.sealer = nil
+	s.sealerMu.Unlock()
+}
+
+// getSealer is the read-side snapshot of the current sealer. Returns
+// nil when none is installed (post-startup, pre-login state).
+func (s *SyncClient) getSealer() auth.Sealer {
+	s.sealerMu.RLock()
+	defer s.sealerMu.RUnlock()
+	return s.sealer
 }
 
 // NewSyncClientWithSealer is NewSyncClient plus a Sealer that wraps
@@ -89,7 +133,7 @@ func NewSyncClient(store rsql.Store, upstream, token string) *SyncClient {
 // ciphertext — the zero-knowledge property of round-4/02.
 func NewSyncClientWithSealer(store rsql.Store, upstream, token string, sealer auth.Sealer) *SyncClient {
 	c := NewSyncClient(store, upstream, token)
-	c.sealer = sealer
+	c.SetSealer(sealer)
 	return c
 }
 
@@ -122,13 +166,19 @@ func (s *SyncClient) Stop() {
 // EnqueueSession is called by IngestBatch after the local Sessions.Create
 // commits. Idempotent on session ID (the outbox unique constraint on
 // (kind, key) absorbs duplicate enqueues).
+//
+// Sealer semantics: a non-nil sealer wraps the blob before storage; nil
+// sealer stores plaintext (slice-2-pre-2.5 mode and test mode). The
+// drain loop is what blocks when no sealer is installed — at enqueue
+// time we ALWAYS write to the outbox so capture doesn't lose events
+// across a logout/login or daemon restart.
 func (s *SyncClient) EnqueueSession(ctx context.Context, ses *rsql.Session) error {
 	blob, err := json.Marshal(ses)
 	if err != nil {
 		return fmt.Errorf("sync: marshal session: %w", err)
 	}
-	if s.sealer != nil {
-		blob, err = s.sealer.Seal(blob)
+	if sl := s.getSealer(); sl != nil {
+		blob, err = sl.Seal(blob)
 		if err != nil {
 			return fmt.Errorf("sync: seal session: %w", err)
 		}
@@ -143,13 +193,14 @@ func (s *SyncClient) EnqueueSession(ctx context.Context, ses *rsql.Session) erro
 // ordering matches (seq, uuid) ordering — see round-2/04-event-schema.md.
 func (s *SyncClient) EnqueueEvents(ctx context.Context, events []event.Event) error {
 	now := time.Now().UTC()
+	sl := s.getSealer()
 	for _, e := range events {
 		blob, err := json.Marshal(e)
 		if err != nil {
 			return fmt.Errorf("sync: marshal event %s: %w", e.EventUUID, err)
 		}
-		if s.sealer != nil {
-			blob, err = s.sealer.Seal(blob)
+		if sl != nil {
+			blob, err = sl.Seal(blob)
 			if err != nil {
 				return fmt.Errorf("sync: seal event %s: %w", e.EventUUID, err)
 			}
@@ -227,20 +278,49 @@ func (s *SyncClient) drainLoop(ctx context.Context) {
 	t := time.NewTicker(s.drainInterval)
 	defer t.Stop()
 	// Run an immediate drain on start so events captured before sync
-	// was up don't wait a full interval.
-	if err := s.drainOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		log.Printf("sync drain (initial): %v", err)
+	// was up don't wait a full interval. Park-on-nil-sealer applies to
+	// the initial drain too; we log the wait once and let the timer
+	// pick up the work when a sealer is installed.
+	if !s.parked("drain") {
+		if err := s.drainOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("sync drain (initial): %v", err)
+		}
 	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			if s.parked("drain") {
+				continue
+			}
 			if err := s.drainOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("sync drain: %v", err)
 			}
 		}
 	}
+}
+
+// parked returns true (and logs once-per-minute) when no sealer is
+// installed. The loops use this as a soft pause: ticker fires on the
+// normal cadence, but the work is skipped until SetSealer arrives.
+// We don't lengthen the drain interval — outbox depth stays accurate
+// for `doctor`, and the no-op cost is negligible.
+func (s *SyncClient) parked(loop string) bool {
+	if s.getSealer() != nil {
+		return false
+	}
+	// Throttle the log so we don't spam every drainInterval tick.
+	s.parkLogMu.Lock()
+	defer s.parkLogMu.Unlock()
+	if time.Since(s.parkLogAt[loop]) > time.Minute {
+		log.Printf("sync %s: parked (waiting for resleeve login)", loop)
+		if s.parkLogAt == nil {
+			s.parkLogAt = map[string]time.Time{}
+		}
+		s.parkLogAt[loop] = time.Now()
+	}
+	return true
 }
 
 func (s *SyncClient) drainOnce(ctx context.Context) error {
@@ -316,8 +396,10 @@ func (s *SyncClient) pullLoop(ctx context.Context) {
 	defer func() { s.done <- struct{}{} }()
 	// Immediate pull on startup so a freshly-paired device starts
 	// catching up without waiting an interval.
-	if err := s.pullAllKinds(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		log.Printf("sync pull (initial): %v", err)
+	if !s.parked("pull") {
+		if err := s.pullAllKinds(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("sync pull (initial): %v", err)
+		}
 	}
 	t := time.NewTicker(s.pullInterval)
 	defer t.Stop()
@@ -326,6 +408,9 @@ func (s *SyncClient) pullLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			if s.parked("pull") {
+				continue
+			}
 			if err := s.pullAllKinds(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("sync pull: %v", err)
 			}
@@ -414,8 +499,8 @@ func (s *SyncClient) pullKind(ctx context.Context, kind string) (int, error) {
 }
 
 func (s *SyncClient) ingestPulled(ctx context.Context, kind string, blob []byte) error {
-	if s.sealer != nil {
-		opened, err := s.sealer.Open(blob)
+	if sl := s.getSealer(); sl != nil {
+		opened, err := sl.Open(blob)
 		if err != nil {
 			return fmt.Errorf("open envelope: %w", err)
 		}
@@ -465,8 +550,8 @@ func (s *SyncClient) ingestPulled(ctx context.Context, kind string, blob []byte)
 // All operations are idempotent against the local memory store, so
 // replaying the same row (e.g. SSE backlog + live) is safe.
 func (s *SyncClient) ingestMemoryRow(ctx context.Context, key string, blob []byte) error {
-	if s.sealer != nil {
-		opened, err := s.sealer.Open(blob)
+	if sl := s.getSealer(); sl != nil {
+		opened, err := sl.Open(blob)
 		if err != nil {
 			return fmt.Errorf("sync: open memory blob %q: %w", key, err)
 		}
@@ -518,8 +603,8 @@ func (s *SyncClient) EnqueueScope(ctx context.Context, scope *memory.Scope) erro
 	if err != nil {
 		return fmt.Errorf("sync: marshal scope: %w", err)
 	}
-	if s.sealer != nil {
-		blob, err = s.sealer.Seal(blob)
+	if sl := s.getSealer(); sl != nil {
+		blob, err = sl.Seal(blob)
 		if err != nil {
 			return fmt.Errorf("sync: seal scope: %w", err)
 		}
@@ -538,8 +623,8 @@ func (s *SyncClient) EnqueuePlan(ctx context.Context, plan *memory.Plan) error {
 	if err != nil {
 		return fmt.Errorf("sync: marshal plan: %w", err)
 	}
-	if s.sealer != nil {
-		blob, err = s.sealer.Seal(blob)
+	if sl := s.getSealer(); sl != nil {
+		blob, err = sl.Seal(blob)
 		if err != nil {
 			return fmt.Errorf("sync: seal plan: %w", err)
 		}
@@ -558,8 +643,8 @@ func (s *SyncClient) EnqueueLearning(ctx context.Context, l *memory.Learning) er
 	if err != nil {
 		return fmt.Errorf("sync: marshal learning: %w", err)
 	}
-	if s.sealer != nil {
-		blob, err = s.sealer.Seal(blob)
+	if sl := s.getSealer(); sl != nil {
+		blob, err = sl.Seal(blob)
 		if err != nil {
 			return fmt.Errorf("sync: seal learning: %w", err)
 		}
@@ -583,6 +668,18 @@ func (s *SyncClient) sseLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
+		}
+		// Park: SSE is a long-lived connection that decrypts each frame,
+		// so without a sealer there's nothing useful to do. Sleep for
+		// parkInterval and re-check; SetSealer will let the next pass
+		// through.
+		if s.parked("sse") {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(s.parkInterval):
+				continue
+			}
 		}
 		err := s.runSSE(ctx)
 		if err != nil && !errors.Is(err, context.Canceled) {
