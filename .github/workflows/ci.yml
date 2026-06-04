@@ -31,10 +31,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26'
-      - uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@v7
         with:
-          # Pin explicitly: the action's "latest" tag resolves to a
-          # stale v1.64.8 (built with Go 1.24) which refuses to lint
-          # projects targeting Go 1.25+. v2.12.x is built with a
-          # newer Go and uses defaults when no .golangci.yml is present.
+          # golangci-lint-action@v7 is required to run lint v2.x.
+          # The lint binary needs to be built with a Go version >= the
+          # project's `go` directive (currently 1.25.0).
           version: v2.12.2
