@@ -45,6 +45,13 @@ import (
 // that here — operators of legacy deployments are expected to be on a
 // post-2.5 daemon.
 func runMigrateKey(ctx context.Context, args []string) int {
+	// Refuse to run while the daemon is up: a live daemon under the OLD
+	// sealer could push mid-migration, producing mixed-key blobs on
+	// upstream. Operator must `resleeve down` first. (round-5 follow-up D)
+	if alive, pid := daemonAlive(); alive {
+		fmt.Fprintf(os.Stderr, "migrate-key: daemon is running (pid %d) — run `resleeve down` first\n", pid)
+		return 1
+	}
 	fs := flag.NewFlagSet("migrate-key", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	upstream := fs.String("upstream", "", "v2 sync upstream URL (default: $RESLEEVE_UPSTREAM)")
@@ -300,6 +307,13 @@ func loginAndUnwrapKEK(ctx context.Context, upstream, email, pw string) (auth.KE
 // user explicitly confirms). The actual upstream re-encryption is a
 // separate verb (runMigrateKey) — this is just the local cleanup.
 func runDoctorMigrateKey(_ context.Context) int {
+	// Refuse while the daemon is up: it has the old key cached in-memory
+	// and may still be sealing captures under it; deleting seal.key out
+	// from under a live daemon is a footgun. (round-5 follow-up D)
+	if alive, pid := daemonAlive(); alive {
+		fmt.Fprintf(os.Stderr, "doctor --migrate-key: daemon is running (pid %d) — run `resleeve down` first\n", pid)
+		return 1
+	}
 	path := defaultSealKeyPath()
 	st, err := os.Stat(path)
 	if err != nil {
