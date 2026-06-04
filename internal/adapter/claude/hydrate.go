@@ -12,18 +12,35 @@ import (
 
 // Hydrate materializes the target CLI's local state for a session so
 // that exec'ing the returned NativeResumeCmd picks up the session
-// natively. For claude, this means writing a JSONL into
-// ~/.claude/projects/<cwd-encoded>/<sessionID>.jsonl.
+// natively.
 //
-// Only replay mode is implemented in this commit; prime mode follows
-// in a later commit (see round-4/01-conversation-transport.md).
+// Replay mode (auto default for claude→claude): writes a JSONL into
+// ~/.claude/projects/<cwd-encoded>/<sessionID>.jsonl. Bit-equivalent
+// to the original up to the resume point when vendor.native_payload
+// is preserved.
+//
+// Prime mode (opt-in via --mode prime, or forced when source/target
+// CLIs differ): writes a synthesized markdown opening prompt to
+// ~/.resleeve/hydrate/<new-uuid>.md and mints a fresh session id.
+// See docs/design/round-4/01-conversation-transport.md.
 func (a *Adapter) Hydrate(ctx context.Context, session adapter.SessionView, opts adapter.HydrateOpts) (adapter.HydrateResult, error) {
 	mode := opts.Mode
 	if mode == adapter.RenderModeAuto {
 		mode = adapter.RenderModeReplay
 	}
+	if session.EventStream == nil {
+		return adapter.HydrateResult{}, fmt.Errorf("claude.Hydrate: session view has no EventStream")
+	}
+	events, err := session.EventStream()
+	if err != nil {
+		return adapter.HydrateResult{}, fmt.Errorf("claude.Hydrate: load events: %w", err)
+	}
+
+	if mode == adapter.RenderModePrime {
+		return a.hydratePrime(ctx, session, events)
+	}
 	if mode != adapter.RenderModeReplay {
-		return adapter.HydrateResult{}, fmt.Errorf("%w: claude.Hydrate %s mode", adapter.ErrNotImplemented, mode)
+		return adapter.HydrateResult{}, fmt.Errorf("claude.Hydrate: unknown mode %q", mode)
 	}
 
 	cwd := opts.Cwd
@@ -32,14 +49,6 @@ func (a *Adapter) Hydrate(ctx context.Context, session adapter.SessionView, opts
 	}
 	if cwd == "" {
 		return adapter.HydrateResult{}, fmt.Errorf("claude.Hydrate: session has no cwd and none provided in opts; can't derive project dir")
-	}
-
-	if session.EventStream == nil {
-		return adapter.HydrateResult{}, fmt.Errorf("claude.Hydrate: session view has no EventStream")
-	}
-	events, err := session.EventStream()
-	if err != nil {
-		return adapter.HydrateResult{}, fmt.Errorf("claude.Hydrate: load events: %w", err)
 	}
 
 	body, err := a.ToNative(ctx, events, mode)

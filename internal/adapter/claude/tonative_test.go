@@ -92,10 +92,35 @@ func TestToNative_AutoDefaultsToReplay(t *testing.T) {
 	}
 }
 
-func TestToNative_PrimeNotImplemented(t *testing.T) {
+func TestToNative_PrimeEmitsMarkdown(t *testing.T) {
 	a := New()
-	_, err := a.ToNative(context.Background(), nil, adapter.RenderModePrime)
-	if err == nil {
-		t.Fatal("expected ErrNotImplemented for prime mode")
+	// One user message — enough to verify prime mode now produces
+	// markdown rather than ErrNotImplemented.
+	events := []event.Event{
+		{
+			EventUUID: "E1",
+			SessionID: "S1",
+			Seq:       100,
+			Kind:      event.KindUserMessage,
+			Content:   json.RawMessage(`{"text":"refactor the auth code"}`),
+			Vendor:    event.Vendor{Name: Name},
+		},
+	}
+	body, err := a.ToNative(context.Background(), events, adapter.RenderModePrime)
+	if err != nil {
+		t.Fatalf("ToNative prime: %v", err)
+	}
+	s := string(body)
+	for _, want := range []string{
+		"# Resumed session: S1",
+		"## Context",
+		"## Plan",
+		"## Recent activity",
+		"## Next",
+		"user: refactor the auth code",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("prime output missing %q\n---\n%s", want, s)
+		}
 	}
 }

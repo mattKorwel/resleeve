@@ -3,7 +3,6 @@ package claude
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,17 +118,49 @@ func TestHydrate_CwdOptOverridesSession(t *testing.T) {
 	}
 }
 
-func TestHydrate_PrimeNotImplemented(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+func TestHydrate_PrimeWritesScratchFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 	a := New()
 	session := adapter.SessionView{
-		SessionID:   "S1",
-		Cwd:         "/x",
-		EventStream: func() ([]event.Event, error) { return nil, nil },
+		SessionID: "S1",
+		CLI:       Name,
+		Cwd:       "/x",
+		EventStream: func() ([]event.Event, error) {
+			return []event.Event{
+				{
+					EventUUID: "E1",
+					SessionID: "S1",
+					Seq:       1,
+					Kind:      event.KindUserMessage,
+					Content:   json.RawMessage(`{"text":"hi"}`),
+				},
+			}, nil
+		},
 	}
-	_, err := a.Hydrate(context.Background(), session, adapter.HydrateOpts{Mode: adapter.RenderModePrime})
-	if !errors.Is(err, adapter.ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented for prime mode, got: %v", err)
+	result, err := a.Hydrate(context.Background(), session, adapter.HydrateOpts{Mode: adapter.RenderModePrime})
+	if err != nil {
+		t.Fatalf("Hydrate prime: %v", err)
+	}
+	if result.Mode != adapter.RenderModePrime {
+		t.Errorf("Mode: got %q, want %q", result.Mode, adapter.RenderModePrime)
+	}
+	if result.SessionID == "S1" || result.SessionID == "" {
+		t.Errorf("expected freshly minted SessionID, got %q", result.SessionID)
+	}
+	wantDir := filepath.Join(home, ".resleeve", "hydrate")
+	if !strings.HasPrefix(result.Path, wantDir+string(filepath.Separator)) {
+		t.Errorf("Path %q not under %q", result.Path, wantDir)
+	}
+	if !strings.HasSuffix(result.Path, ".md") {
+		t.Errorf("Path %q should end in .md", result.Path)
+	}
+	body, err := os.ReadFile(result.Path)
+	if err != nil {
+		t.Fatalf("read written file: %v", err)
+	}
+	if !strings.Contains(string(body), "# Resumed session:") {
+		t.Errorf("scratch file missing prime header: %q", string(body))
 	}
 }
 
@@ -163,13 +194,30 @@ func TestNativeResumeCmd_ReplayReturnsClaudeResume(t *testing.T) {
 	}
 }
 
-func TestNativeResumeCmd_PrimeNotImplemented(t *testing.T) {
+func TestNativeResumeCmd_PrimeReturnsShellRedirect(t *testing.T) {
+	a := New()
+	cmd, args, err := a.NativeResumeCmd(context.Background(),
+		adapter.SessionView{SessionID: "S1"},
+		adapter.HydrateResult{Mode: adapter.RenderModePrime, Path: "/tmp/x.md"},
+	)
+	if err != nil {
+		t.Fatalf("NativeResumeCmd prime: %v", err)
+	}
+	if cmd != "sh" {
+		t.Errorf("cmd: got %q, want %q", cmd, "sh")
+	}
+	if len(args) != 2 || args[0] != "-c" || !strings.Contains(args[1], `claude < "/tmp/x.md"`) {
+		t.Errorf("args wrong: got %#v", args)
+	}
+}
+
+func TestNativeResumeCmd_PrimeRejectsMissingPath(t *testing.T) {
 	a := New()
 	_, _, err := a.NativeResumeCmd(context.Background(),
 		adapter.SessionView{SessionID: "S1"},
 		adapter.HydrateResult{Mode: adapter.RenderModePrime},
 	)
-	if !errors.Is(err, adapter.ErrNotImplemented) {
-		t.Errorf("expected ErrNotImplemented for prime, got: %v", err)
+	if err == nil {
+		t.Fatal("expected error for missing Path")
 	}
 }

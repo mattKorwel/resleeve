@@ -10,6 +10,7 @@ import (
 
 	"github.com/mattkorwel/resleeve/internal/adapter"
 	"github.com/mattkorwel/resleeve/internal/adapter/claude"
+	"github.com/mattkorwel/resleeve/internal/adapter/opencode"
 	"github.com/mattkorwel/resleeve/internal/event"
 )
 
@@ -113,6 +114,15 @@ func runResume(ctx context.Context, args []string) int {
 	switch cliName {
 	case claude.Name:
 		a = claude.New()
+	case opencode.Name:
+		a = opencode.New()
+		// opencode can only re-sleeve via prime mode (it can't ingest
+		// claude's JSONL). If the caller didn't ask for an explicit
+		// mode, force prime so Auto doesn't fall through into a
+		// replay attempt the adapter would reject anyway.
+		if mode == adapter.RenderModeAuto {
+			mode = adapter.RenderModePrime
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "resume: no adapter registered for cli %q\n", cliName)
 		return 1

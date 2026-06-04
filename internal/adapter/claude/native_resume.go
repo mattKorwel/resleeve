@@ -8,16 +8,30 @@ import (
 )
 
 // NativeResumeCmd returns the shell command + args that resumes the
-// hydrated session natively. For replay mode, this is `claude --resume
-// <sid>` — CC's own resume machinery takes over from the JSONL Hydrate
-// just wrote. Prime mode lands in a follow-up commit (will return a
-// `--prompt-file` style command for the target CLI).
+// hydrated session natively.
+//
+// Replay mode: `claude --resume <sid>` — CC's own resume machinery
+// takes over from the JSONL Hydrate just wrote.
+//
+// Prime mode (claude→claude with --mode prime): the synthesized
+// prompt lives at result.Path. Claude Code's CLI doesn't currently
+// accept a prompt file directly; we shell-redirect the file as stdin
+// via `sh -c 'claude < "<path>"'`. This is a stopgap until CC
+// exposes a `--prompt-file` flag — the seam is here so we can swap
+// the args without changing callers.
 func (a *Adapter) NativeResumeCmd(ctx context.Context, session adapter.SessionView, result adapter.HydrateResult) (string, []string, error) {
 	switch result.Mode {
 	case adapter.RenderModeReplay:
 		return "claude", []string{"--resume", session.SessionID}, nil
 	case adapter.RenderModePrime:
-		return "", nil, fmt.Errorf("%w: claude.NativeResumeCmd prime mode", adapter.ErrNotImplemented)
+		if result.Path == "" {
+			return "", nil, fmt.Errorf("claude.NativeResumeCmd: prime result missing Path")
+		}
+		// Use sh -c so we can stdin-redirect the prompt file. The
+		// inner command quotes the path with %q so spaces in the
+		// hydrate dir (rare but possible) survive the round-trip.
+		inner := fmt.Sprintf("claude < %q", result.Path)
+		return "sh", []string{"-c", inner}, nil
 	default:
 		return "", nil, fmt.Errorf("claude.NativeResumeCmd: hydrate result has unknown mode %q", result.Mode)
 	}
