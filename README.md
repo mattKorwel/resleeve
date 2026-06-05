@@ -2,7 +2,7 @@
 
 **Memory and identity that survive when the body doesn't.**
 
-In Richard K. Morgan's *Altered Carbon*, your consciousness lives in a cortical "stack" and downloads into any compatible "sleeve." Bodies are interchangeable; the stack is what's you.
+The metaphor: your consciousness lives in a cortical "stack" and downloads into any compatible "sleeve." Bodies are interchangeable; the stack is what's you.
 
 `resleeve` does the same for AI coding agents. Your **stack** — transcripts, plans, scope-keyed memory, learnings — is portable. Keep it on this laptop, host it on a server you control, or stand up `resleeve serve` for a team. Your **sleeves** — `claude`, `opencode`, whatever ships next — connect to wherever the stack lives. End-to-end encrypted: even your own server stores ciphertext only. Pick up where you left off, on any machine, in any CLI vendor.
 
