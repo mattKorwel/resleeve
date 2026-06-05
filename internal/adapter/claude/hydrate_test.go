@@ -5,16 +5,18 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/mattkorwel/resleeve/internal/adapter"
 	"github.com/mattkorwel/resleeve/internal/event"
+	"github.com/mattkorwel/resleeve/internal/testutil"
 )
 
 func TestHydrate_ReplayWritesJSONLToProjectDir(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testutil.SetHomeDir(t, home)
 
 	a := New()
 	cwd := "/private/tmp/x/proj"
@@ -57,7 +59,7 @@ func TestHydrate_ReplayWritesJSONLToProjectDir(t *testing.T) {
 
 func TestHydrate_ReplayOverwritesExisting(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testutil.SetHomeDir(t, home)
 
 	// Pre-create the target with junk to verify atomic overwrite.
 	dir := filepath.Join(home, ".claude", "projects", "-tmp")
@@ -87,7 +89,7 @@ func TestHydrate_ReplayOverwritesExisting(t *testing.T) {
 }
 
 func TestHydrate_ErrorWhenNoCwdAvailable(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testutil.SetHomeDir(t, t.TempDir())
 	a := New()
 	session := adapter.SessionView{
 		SessionID:   "S1",
@@ -101,7 +103,7 @@ func TestHydrate_ErrorWhenNoCwdAvailable(t *testing.T) {
 
 func TestHydrate_CwdOptOverridesSession(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testutil.SetHomeDir(t, home)
 	a := New()
 	session := adapter.SessionView{
 		SessionID:   "S1",
@@ -120,7 +122,7 @@ func TestHydrate_CwdOptOverridesSession(t *testing.T) {
 
 func TestHydrate_PrimeWritesScratchFile(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testutil.SetHomeDir(t, home)
 	a := New()
 	session := adapter.SessionView{
 		SessionID: "S1",
@@ -172,7 +174,7 @@ func TestHydrate_PrimeWritesScratchFile(t *testing.T) {
 // regression looks like an unchanged signature with a missing copy.
 func TestHydrate_PrimeForwardsPlanContent(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testutil.SetHomeDir(t, home)
 	a := New()
 	session := adapter.SessionView{
 		SessionID: "S1",
@@ -217,10 +219,13 @@ func TestHydrate_PrimeForwardsPlanContent(t *testing.T) {
 
 func TestEncodeCwdForProjectDir(t *testing.T) {
 	cases := map[string]string{
-		"/Users/x/proj":       "-Users-x-proj",
-		"/tmp":                "-tmp",
-		"/a/b/c":              "-a-b-c",
-		"/Users/x/dev-stuff":  "-Users-x-dev-stuff", // existing hyphens preserved
+		"/Users/x/proj":      "-Users-x-proj",
+		"/tmp":               "-tmp",
+		"/a/b/c":             "-a-b-c",
+		"/Users/x/dev-stuff": "-Users-x-dev-stuff", // existing hyphens preserved
+		"/home/u/my.app_v2":  "-home-u-my-app-v2",  // dots + underscores -> dashes
+		"/has space/dir":     "-has-space-dir",     // spaces -> dashes
+		`C:\Users\x\proj`:    "C--Users-x-proj",    // Windows: drive colon + backslashes
 	}
 	for in, want := range cases {
 		if got := encodeCwdForProjectDir(in); got != want {
@@ -254,10 +259,16 @@ func TestNativeResumeCmd_PrimeReturnsShellRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NativeResumeCmd prime: %v", err)
 	}
-	if cmd != "sh" {
-		t.Errorf("cmd: got %q, want %q", cmd, "sh")
+	// The shell differs per platform (sh -c on unix, cmd /c on Windows) but
+	// both stdin-redirect the prompt file via the same `<` syntax.
+	wantCmd, wantFlag := "sh", "-c"
+	if runtime.GOOS == "windows" {
+		wantCmd, wantFlag = "cmd", "/c"
 	}
-	if len(args) != 2 || args[0] != "-c" || !strings.Contains(args[1], `claude < "/tmp/x.md"`) {
+	if cmd != wantCmd {
+		t.Errorf("cmd: got %q, want %q", cmd, wantCmd)
+	}
+	if len(args) != 2 || args[0] != wantFlag || !strings.Contains(args[1], `claude < "/tmp/x.md"`) {
 		t.Errorf("args wrong: got %#v", args)
 	}
 }

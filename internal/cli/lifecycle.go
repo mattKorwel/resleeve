@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/mattkorwel/resleeve/internal/adapter"
@@ -99,7 +98,7 @@ func runDown(ctx context.Context, args []string) int {
 	}
 
 	if alive, pid := daemonAlive(); alive {
-		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		if err := terminateDaemon(pid); err != nil {
 			fmt.Fprintln(os.Stderr, "down: kill daemon:", err)
 			return 1
 		}
@@ -646,7 +645,7 @@ func spawnDaemon(dataDir, upstream, upstreamToken string) error {
 	cmd := exec.Command(self, cmdArgs...)
 	cmd.Stdout = logF
 	cmd.Stderr = logF
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.SysProcAttr = daemonSysProcAttr()
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start daemon: %w", err)
 	}
@@ -686,15 +685,7 @@ func daemonAlive() (bool, int) {
 	if err != nil || pid <= 0 {
 		return false, 0
 	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false, pid
-	}
-	// Signal 0: just probe whether the process exists / we can signal it.
-	if err := proc.Signal(syscall.Signal(0)); err != nil {
-		return false, pid
-	}
-	return true, pid
+	return processAlive(pid), pid
 }
 
 func claudeSettingsPath() (string, error) {

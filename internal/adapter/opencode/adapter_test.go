@@ -6,12 +6,14 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/mattkorwel/resleeve/internal/adapter"
 	"github.com/mattkorwel/resleeve/internal/event"
+	"github.com/mattkorwel/resleeve/internal/testutil"
 )
 
 func TestOpencode_DetectReturnsInstalledFalseWhenMissing(t *testing.T) {
@@ -30,7 +32,13 @@ func TestOpencode_DetectReturnsInstalledFalseWhenMissing(t *testing.T) {
 
 func TestOpencode_DetectReturnsInstalledTrueWhenPresent(t *testing.T) {
 	bin := t.TempDir()
-	target := filepath.Join(bin, "opencode")
+	// On Windows exec.LookPath only resolves names carrying a PATHEXT
+	// extension (.exe/.bat/...), so the fake binary needs ".exe".
+	name := "opencode"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	target := filepath.Join(bin, name)
 	if err := os.WriteFile(target, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +90,7 @@ func TestOpencode_ToNativeAutoPicksPrime(t *testing.T) {
 
 func TestOpencode_HydratePrimeWritesScratchFile(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testutil.SetHomeDir(t, home)
 
 	a := New()
 	session := adapter.SessionView{
@@ -126,7 +134,7 @@ func TestOpencode_HydratePrimeWritesScratchFile(t *testing.T) {
 }
 
 func TestOpencode_HydrateReplayRejected(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testutil.SetHomeDir(t, t.TempDir())
 	a := New()
 	session := adapter.SessionView{
 		SessionID:   "S1",

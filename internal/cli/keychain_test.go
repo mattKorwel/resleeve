@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -109,13 +110,17 @@ func TestFileKeychain_RoundTrip(t *testing.T) {
 	if err := f.Put(host, account, token); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	// File mode must be 0600.
-	info, err := os.Stat(f.path(host, account))
-	if err != nil {
-		t.Fatalf("stat: %v", err)
-	}
-	if mode := info.Mode().Perm(); mode != 0o600 {
-		t.Fatalf("file mode: want 0600, got %v", mode)
+	// File mode must be 0600 — but Unix permission bits are not enforced
+	// on Windows (os.WriteFile's perm is largely ignored; Stat reports
+	// 0666), so only assert this where the filesystem honors it.
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(f.path(host, account))
+		if err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		if mode := info.Mode().Perm(); mode != 0o600 {
+			t.Fatalf("file mode: want 0600, got %v", mode)
+		}
 	}
 	got, _ = f.Get(host, account)
 	if got != token {
