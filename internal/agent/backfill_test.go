@@ -10,6 +10,7 @@ import (
 
 	rsql "github.com/mattkorwel/resleeve/internal/storage/sql"
 	"github.com/mattkorwel/resleeve/internal/storage/sql/sqlite"
+	"github.com/mattkorwel/resleeve/internal/testutil"
 )
 
 // TestBackfillSessionCwd_RepairsLegacyRows verifies the full happy
@@ -21,7 +22,7 @@ func TestBackfillSessionCwd_RepairsLegacyRows(t *testing.T) {
 
 	// Sandbox HOME so we can stage a fake ~/.claude/projects tree.
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testutil.SetHomeDir(t, home)
 	// Clear RESLEEVE_SCOPE: deriveScope short-circuits on it and would
 	// make the scope-assertion below depend on the runner's env.
 	t.Setenv("RESLEEVE_SCOPE", "")

@@ -1,6 +1,6 @@
 # Round 8 — Windows port
 
-> **Status**: planning. Tracks under sub-scope `resleeve/windows-port` in the memory store. Not yet executed.
+> **Status**: executed. Tracks under sub-scope `resleeve/windows-port` in the memory store. See "Delta from brief" at the bottom for where the implementation corrected this doc.
 
 ## Goal
 
@@ -96,3 +96,57 @@ The brief above is enough for whoever picks this up. Two reasonable approaches:
 2. **Cross-compile from Mac/Linux + remote validation.** `GOOS=windows go build ./...` will tell you the compile errors quickly; the split can be drafted from any host. Push to a branch and let CI run on `windows-latest` as the smoke.
 
 Either way, this doc is the contract. Match it; deviate only with reason.
+
+## Delta from brief (recorded at execution)
+
+Reading the code + cross-compiling (`GOOS=windows`) + inspecting Claude Code's own bundle turned up
+gaps and one mis-diagnosis in the brief above. What actually shipped:
+
+- **Only two compile blockers**, both in `internal/cli/lifecycle.go` (`syscall.Kill`,
+  `SysProcAttr.Setsid`) — confirmed by `GOOS=windows go build ./...`.
+- **`syscall.Exec` is NOT a compile blocker.** It is declared on Windows (returns `EWINDOWS` at
+  runtime), so `internal/cli/resume.go` cross-compiles clean. It's a *functional* fix: extracted to
+  `execResume` (`resume_unix.go` exec-replaces; `resume_windows.go` runs the child then `os.Exit`s
+  with its code).
+- **`daemonAlive` liveness was unlisted.** `proc.Signal(syscall.Signal(0))` compiles on Windows but
+  errors at runtime → `daemonAlive` always false → up/down/doctor wrong. Extracted to `processAlive`
+  (Windows uses `OpenProcess` + `GetExitCodeProcess`, alive iff exit code == `STILL_ACTIVE`/259).
+- **`syscall.STILL_ACTIVE` does not exist** in stdlib `syscall` or `golang.org/x/sys/windows` —
+  defined locally as `const stillActive = 259`.
+- **`native_resume.go` `sh -c` was unlisted** — no `sh` on bare Windows. Prime-mode command is now
+  built per platform (`primeResumeCmd`): `sh -c` on unix, `cmd /c` on Windows (both `<`-redirect the
+  prompt file; Windows quoting avoids Go `%q` backslash-escaping).
+- **`encodeCwdForProjectDir` was wrong on every platform.** CC's actual encoder (from its bundle) is
+  `s.replace(/[^a-zA-Z0-9]/g, "-")`; the old Go replaced only `/`, so replay silently wrote to the
+  wrong dir for any cwd containing `.`/`_`/space. Fixed in place with the same `[^a-zA-Z0-9] -> "-"`
+  rule (platform-agnostic — no build tag; backslash and drive-colon fall out for free).
+- **No existing `_test.go` used POSIX syscalls** — none used `syscall`/signals/`StartProcess`, so none
+  needed a build-tag guard for that reason. New tagged tests were added for the unix/Windows process
+  primitives; the encode + prime-cmd tests are platform-aware in one untagged file.
+
+## Delta from brief — round 2 (actually running `go test` on a Windows box)
+
+Cross-compiling only proves the binary *builds*. Running the full suite on real Windows surfaced a
+batch of **pre-existing, latent Windows breakage** that had been invisible while `windows-latest` was
+out of the matrix. None were regressions; all are now fixed so the suite is green and CI can stay
+green. Lesson: validate the matrix flip by running the tests on the OS, not just cross-compiling.
+
+- **`os.UserHomeDir()` reads `%USERPROFILE%`, not `$HOME`, on Windows.** ~13 tests sandboxed the home
+  dir with `t.Setenv("HOME", tmp)` only, so on Windows they silently hit the real home and failed.
+  Added `internal/testutil.SetHomeDir(t, dir)` (sets both vars) and routed every call site through it.
+- **`exec.LookPath` requires a PATHEXT extension on Windows.** The opencode detect test wrote a fake
+  binary named `opencode` (no `.exe`) → never found. Test now appends `.exe` on Windows.
+- **Unix permission bits aren't enforced on Windows.** The file-keychain test asserted mode `0600`
+  (Windows reports `0666`); that assertion is now skipped on Windows only.
+- **`:` (and `<>"\|?*`) are illegal in Windows filenames — a real code bug, not just a test issue.**
+  `encodeScopePath` maps scope `/`→`:`, and `internal/sync/local` wrote those keys straight to disk,
+  so any memory blob with a child scope segment failed to write on Windows (`os.Rename` →
+  "The parameter is incorrect"). The local backend now percent-encodes reserved bytes per path
+  segment (`encodeKey`/`decodeKey`, round-tripped in `List`), applied uniformly on all platforms so
+  the on-disk layout is identical everywhere. (The primary `serve`/SQLite sync path keys by string
+  and was unaffected.)
+
+Validated on a real Windows 11 box: `go build`/`go vet`/`go test ./...` all green; `go vet ./...`
+green cross-compiled for `linux` and `darwin`; and a sandboxed `resleeve up` → `doctor` (daemon ✓
+running + bridge ✓) → `down` smoke passed — exercising the detached spawn, `processAlive`, and
+`terminateDaemon` paths for real.

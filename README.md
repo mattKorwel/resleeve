@@ -56,7 +56,7 @@ Building from source? `go install github.com/mattkorwel/resleeve/cmd/resleeve@la
 
 The Claude Code adapter is the reference implementation. The opencode adapter compiles + implements `Hydrate` for prime mode; capture and replay are stubs pending vendor stability. Codex / Gemini / others are interface-ready (the `Adapter` contract is in `internal/adapter/adapter.go`) but unimplemented.
 
-Platform support: macOS and Linux are CI-tested every PR. Windows support is in flight under the [`resleeve/windows-port`](docs/use-cases/) scope — currently blocks at compile time on `syscall.Kill` / `Setsid`; build-tag split coming.
+Platform support: macOS, Linux, and Windows are CI-tested every PR. The platform-specific daemon process control (terminate, liveness, detached spawn) and native resume hand-off live in `//go:build`-tagged siblings; see the [round-8 Windows port notes](docs/design/round-8/windows-port.md).
 
 ## Docs
 

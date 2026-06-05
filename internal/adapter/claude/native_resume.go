@@ -16,9 +16,9 @@ import (
 // Prime mode (claude→claude with --mode prime): the synthesized
 // prompt lives at result.Path. Claude Code's CLI doesn't currently
 // accept a prompt file directly; we shell-redirect the file as stdin
-// via `sh -c 'claude < "<path>"'`. This is a stopgap until CC
-// exposes a `--prompt-file` flag — the seam is here so we can swap
-// the args without changing callers.
+// (via the platform shell — see primeResumeCmd). This is a stopgap
+// until CC exposes a `--prompt-file` flag — the seam is here so we can
+// swap the args without changing callers.
 func (a *Adapter) NativeResumeCmd(ctx context.Context, session adapter.SessionView, result adapter.HydrateResult) (string, []string, error) {
 	switch result.Mode {
 	case adapter.RenderModeReplay:
@@ -27,11 +27,8 @@ func (a *Adapter) NativeResumeCmd(ctx context.Context, session adapter.SessionVi
 		if result.Path == "" {
 			return "", nil, fmt.Errorf("claude.NativeResumeCmd: prime result missing Path")
 		}
-		// Use sh -c so we can stdin-redirect the prompt file. The
-		// inner command quotes the path with %q so spaces in the
-		// hydrate dir (rare but possible) survive the round-trip.
-		inner := fmt.Sprintf("claude < %q", result.Path)
-		return "sh", []string{"-c", inner}, nil
+		cmd, args := primeResumeCmd(result.Path)
+		return cmd, args, nil
 	default:
 		return "", nil, fmt.Errorf("claude.NativeResumeCmd: hydrate result has unknown mode %q", result.Mode)
 	}

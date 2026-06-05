@@ -100,7 +100,10 @@ func (b *Backend) List(ctx context.Context, prefix string, sinceCursor string, l
 	if prefix == "" {
 		startDir = b.root
 	} else {
-		startDir = filepath.Join(b.root, prefix)
+		// Encode the prefix the same way path() encodes keys so the walk
+		// roots at the real on-disk directory. Trailing '/' is dropped so
+		// the final segment isn't treated as an empty one.
+		startDir = filepath.Join(b.root, filepath.FromSlash(encodeKey(strings.TrimSuffix(prefix, "/"))))
 	}
 
 	var keys []string
@@ -122,7 +125,7 @@ func (b *Backend) List(ctx context.Context, prefix string, sinceCursor string, l
 		if err != nil {
 			return err
 		}
-		key := strings.TrimSuffix(filepath.ToSlash(rel), ext)
+		key := decodeKey(strings.TrimSuffix(filepath.ToSlash(rel), ext))
 		if key > sinceCursor {
 			keys = append(keys, key)
 		}
@@ -159,5 +162,102 @@ func (b *Backend) Delete(ctx context.Context, key string) error {
 func (b *Backend) Root() string { return b.root }
 
 func (b *Backend) path(key string) string {
-	return filepath.Join(b.root, filepath.FromSlash(key)+ext)
+	return filepath.Join(b.root, filepath.FromSlash(encodeKey(key))+ext)
+}
+
+// Keys are arbitrary '/'-separated strings (ValidateKey permits any
+// segment content, and encodeScopePath maps scope '/' to ':'), but some
+// characters that are valid in a key segment are illegal in a filename on
+// Windows (notably ':', plus '<>"\|?*' and control bytes). encodeKey
+// percent-encodes those characters — and '%' itself — within each
+// segment so a key maps to a filename valid on every supported OS. '/'
+// separators are preserved (they map to subdirectories). The transform is
+// applied uniformly on all platforms so the on-disk layout is identical
+// everywhere, and decodeKey reverses it exactly for List.
+func encodeKey(key string) string {
+	segs := strings.Split(key, "/")
+	for i, s := range segs {
+		segs[i] = encodeSegment(s)
+	}
+	return strings.Join(segs, "/")
+}
+
+// decodeKey reverses encodeKey, reconstructing the original key from a
+// '/'-joined sequence of encoded segments.
+func decodeKey(key string) string {
+	segs := strings.Split(key, "/")
+	for i, s := range segs {
+		segs[i] = decodeSegment(s)
+	}
+	return strings.Join(segs, "/")
+}
+
+// reservedInSegment reports whether c must be percent-encoded to be a
+// portable filename byte: the Windows-reserved set plus ASCII control
+// bytes. '/' is never passed here (segments are split on it).
+func reservedInSegment(c byte) bool {
+	switch c {
+	case '<', '>', ':', '"', '\\', '|', '?', '*':
+		return true
+	}
+	return c < 0x20
+}
+
+const upperHex = "0123456789ABCDEF"
+
+func encodeSegment(seg string) string {
+	needs := false
+	for i := 0; i < len(seg); i++ {
+		if seg[i] == '%' || reservedInSegment(seg[i]) {
+			needs = true
+			break
+		}
+	}
+	if !needs {
+		return seg
+	}
+	var b strings.Builder
+	b.Grow(len(seg) + 8)
+	for i := 0; i < len(seg); i++ {
+		c := seg[i]
+		if c == '%' || reservedInSegment(c) {
+			b.WriteByte('%')
+			b.WriteByte(upperHex[c>>4])
+			b.WriteByte(upperHex[c&0x0f])
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+func decodeSegment(seg string) string {
+	if !strings.Contains(seg, "%") {
+		return seg
+	}
+	var b strings.Builder
+	b.Grow(len(seg))
+	for i := 0; i < len(seg); i++ {
+		if seg[i] == '%' && i+2 < len(seg) {
+			if hi, lo := unhex(seg[i+1]), unhex(seg[i+2]); hi >= 0 && lo >= 0 {
+				b.WriteByte(byte(hi<<4 | lo))
+				i += 2
+				continue
+			}
+		}
+		b.WriteByte(seg[i])
+	}
+	return b.String()
+}
+
+func unhex(c byte) int {
+	switch {
+	case '0' <= c && c <= '9':
+		return int(c - '0')
+	case 'A' <= c && c <= 'F':
+		return int(c-'A') + 10
+	case 'a' <= c && c <= 'f':
+		return int(c-'a') + 10
+	}
+	return -1
 }
