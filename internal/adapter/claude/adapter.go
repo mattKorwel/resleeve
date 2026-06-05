@@ -6,10 +6,15 @@ import (
 	"strings"
 
 	"github.com/mattkorwel/resleeve/internal/adapter"
+	"github.com/mattkorwel/resleeve/internal/adapter/registry"
 )
 
 // Name is the adapter identifier registered with the daemon.
 const Name = "claude"
+
+func init() {
+	registry.Register(Name, func() adapter.Adapter { return New() })
+}
 
 // Adapter implements adapter.Adapter for Claude Code.
 type Adapter struct{}

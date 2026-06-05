@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/mattkorwel/resleeve/internal/adapter/claude"
 	"github.com/mattkorwel/resleeve/internal/agent"
 	"github.com/mattkorwel/resleeve/internal/auth"
 )
@@ -67,22 +66,16 @@ func runAgent(ctx context.Context, args []string) int {
 		fmt.Fprintln(os.Stderr, "resleeve agent: legacy --seal-key loaded; consider `resleeve migrate-key` to switch to the master-password KEK")
 	}
 
-	// Register adapter-specific startup reconcilers here — the daemon
-	// stays CLI-neutral (Q12). For now only claude has a reconcile
-	// sweep; opencode's stub doesn't ship one yet.
-	reconcilers := []agent.Reconciler{
-		func(ctx context.Context, d *agent.Daemon) error {
-			return claude.New().ReconcileOnce(ctx, d)
-		},
-	}
-
+	// Adapter reconcile sweeps are registered per-adapter via init()
+	// (see cli/adapters.go + cli/adapter_<name>.go). The daemon stays
+	// CLI-neutral (Q12); it just runs whatever was registered.
 	d, err := agent.New(ctx, agent.Config{
 		DSN:           *dsn,
 		Addr:          *addr,
 		Upstream:      *upstream,
 		UpstreamToken: *upstreamToken,
 		Sealer:        sealer,
-		Reconcilers:   reconcilers,
+		Reconcilers:   startupReconcilers,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "resleeve agent:", err)
