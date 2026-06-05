@@ -11,10 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # windows-latest temporarily disabled — internal/cli/lifecycle.go
-        # uses syscall.Kill + SysProcAttr.Setsid unconditionally. Re-enabled
-        # when the resleeve/windows-port scope lands the build-tag split.
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -37,3 +34,21 @@ jobs:
           # The lint binary needs to be built with a Go version >= the
           # project's `go` directive (currently 1.25.0).
           version: v2.12.2
+
+  # Aggregate gate — the single status check wired into branch protection.
+  # It depends on every other job, so the test matrix (OS list, job names)
+  # can change freely without ever touching GitHub's required-checks config.
+  # `if: always()` makes it run even when an upstream job fails, and the
+  # result check below fails the gate if any dependency didn't succeed.
+  tests:
+    if: always()
+    needs: [test, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all upstream jobs to pass
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ] || [ "${{ needs.lint.result }}" != "success" ]; then
+            echo "gate failed — test=${{ needs.test.result }} lint=${{ needs.lint.result }}"
+            exit 1
+          fi
+          echo "gate passed — test and lint both succeeded"

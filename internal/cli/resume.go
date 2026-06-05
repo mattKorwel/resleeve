@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"syscall"
 
 	"github.com/mattkorwel/resleeve/internal/adapter"
 	"github.com/mattkorwel/resleeve/internal/adapter/claude"
@@ -36,7 +35,7 @@ type resumeOpts struct {
 //   - parseResumeArgs   — flag parsing
 //   - resolveSession    — daemon client + GetSession (with on-demand pull)
 //   - hydrateForCLI     — adapter selection + Hydrate (incl. prime PlanContent fetch)
-//   - execOrPrint       — print-only formatting vs syscall.Exec hand-off
+//   - execOrPrint       — print-only formatting vs execResume hand-off
 func runResume(ctx context.Context, args []string) int {
 	opts, code := parseResumeArgs(args)
 	if code != 0 {
@@ -239,10 +238,11 @@ func fetchPrimePlan(ctx context.Context, c *agent.Client, ses *rsql.Session, mod
 	return ctxBody
 }
 
-// execOrPrint either prints the native resume command (--print) or
-// syscall.Exec's into it so the target CLI inherits this process's tty,
-// signals, and env cleanly. After a successful Exec, nothing in this
-// process runs again.
+// execOrPrint either prints the native resume command (--print) or hands
+// off to it via execResume so the target CLI inherits this process's tty,
+// signals, and env cleanly. On a successful hand-off, nothing in this
+// process runs again (unix exec-replaces; Windows runs the child then
+// os.Exit's with its code).
 func execOrPrint(ctx context.Context, a adapter.Adapter, view adapter.SessionView, result *adapter.HydrateResult, opts resumeOpts) int {
 	cmd, cmdArgs, err := a.NativeResumeCmd(ctx, view, *result)
 	if err != nil {
@@ -262,7 +262,7 @@ func execOrPrint(ctx context.Context, a adapter.Adapter, view adapter.SessionVie
 		fmt.Fprintf(os.Stderr, "       (re-run with --print to get the command and execute it yourself)\n")
 		return 1
 	}
-	if err := syscall.Exec(cmdPath, append([]string{cmd}, cmdArgs...), os.Environ()); err != nil {
+	if err := execResume(cmdPath, append([]string{cmd}, cmdArgs...), os.Environ()); err != nil {
 		fmt.Fprintln(os.Stderr, "resume: exec:", err)
 		return 1
 	}

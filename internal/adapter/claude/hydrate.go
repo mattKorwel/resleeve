@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
+	"regexp"
 
 	"github.com/mattkorwel/resleeve/internal/adapter"
 )
@@ -96,9 +96,18 @@ func (a *Adapter) Hydrate(ctx context.Context, session adapter.SessionView, opts
 	}, nil
 }
 
+// nonAlnumRE matches any rune that is not an ASCII letter or digit.
+var nonAlnumRE = regexp.MustCompile(`[^a-zA-Z0-9]`)
+
 // encodeCwdForProjectDir converts a filesystem path to Claude Code's
-// project-dir naming convention by replacing each '/' with '-'.
-// e.g. "/Users/x/proj" -> "-Users-x-proj".
+// project-dir naming convention: every non-alphanumeric rune (including
+// '/', '\\', ':', '.', '_', and spaces) becomes '-'. This mirrors CC's own
+// encoder (`s.replace(/[^a-zA-Z0-9]/g, "-")`), so resleeve writes replay
+// JSONL to the exact directory CC reads from on every platform.
+//
+//	"/Users/x/proj"      -> "-Users-x-proj"
+//	"/home/u/my.app_v2"  -> "-home-u-my-app-v2"
+//	`C:\Users\x\proj`     -> "C--Users-x-proj"
 func encodeCwdForProjectDir(cwd string) string {
-	return strings.ReplaceAll(cwd, "/", "-")
+	return nonAlnumRE.ReplaceAllString(cwd, "-")
 }

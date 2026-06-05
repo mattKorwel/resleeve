@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/mattkorwel/resleeve/internal/adapter"
+	"github.com/mattkorwel/resleeve/internal/testutil"
 )
 
 // withTempHome runs fn with HOME pointing at a fresh tmpdir containing
@@ -26,9 +27,7 @@ func withTempHome(t *testing.T, seed string) string {
 			t.Fatalf("seed settings.json: %v", err)
 		}
 	}
-	oldHome := os.Getenv("HOME")
-	t.Setenv("HOME", dir)
-	t.Cleanup(func() { _ = os.Setenv("HOME", oldHome) })
+	testutil.SetHomeDir(t, dir)
 	return dir
 }
 
