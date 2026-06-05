@@ -169,7 +169,12 @@ func (a *Adapter) UninstallBridge(ctx context.Context) error {
 // `--memory-only` flag so the hook skips persisting events to the daemon
 // (only the SessionStart additionalContext injection runs).
 func makeResleeveHandler(binPath string, memoryOnly bool) map[string]any {
-	cmd := fmt.Sprintf("%s hook --adapter %s", binPath, Name)
+	// Claude Code executes hook commands through bash even on Windows,
+	// where backslashes are escape characters that silently corrupt the
+	// binary path (C:\Users\…\resleeve.exe -> C:Users…resleeve.exe ->
+	// "command not found"). Emit forward slashes: bash leaves them intact
+	// and the Windows executable accepts them just fine. No-op on unix.
+	cmd := fmt.Sprintf("%s hook --adapter %s", filepath.ToSlash(binPath), Name)
 	if memoryOnly {
 		cmd += " --memory-only"
 	}

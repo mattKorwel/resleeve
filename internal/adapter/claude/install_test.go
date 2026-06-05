@@ -44,6 +44,22 @@ func readSettingsForTest(t *testing.T, home string) map[string]any {
 	return m
 }
 
+// TestMakeResleeveHandler_CommandUsesForwardSlashes guards the Windows
+// hook-path fix: Claude Code runs hook commands through bash even on
+// Windows, where backslashes are escape characters that corrupt the binary
+// path. The emitted command must use forward slashes (valid for bash and
+// the Windows exe alike).
+func TestMakeResleeveHandler_CommandUsesForwardSlashes(t *testing.T) {
+	binPath := filepath.Join("C:", "Users", "x", "go", "bin", "resleeve.exe")
+	cmd, _ := makeResleeveHandler(binPath, false)["command"].(string)
+	if strings.Contains(cmd, "\\") {
+		t.Errorf("hook command must not contain backslashes (bash-executed): %q", cmd)
+	}
+	if !strings.Contains(cmd, "resleeve.exe hook --adapter claude") {
+		t.Errorf("unexpected hook command: %q", cmd)
+	}
+}
+
 // countResleeveHandlers walks the settings.json hooks tree counting
 // _resleeve-tagged entries, looking inside both flat command entries
 // and matcher-wrapped groups.
