@@ -7,7 +7,7 @@ In [`05-decisions.md`](../round-1/05-decisions.md) we deferred the memory layer 
 - **ori stays as Matt's private playground** (messy, not for public, but running in his work fleet today).
 - **resleeve is the fresh public face** of the same idea.
 
-Given that, shipping resleeve as "session capture only" undersells the project — the *stack* (Altered Carbon sense) needs both transcripts *and* the working brain (plans, learnings, scope). The "lift design from ori, implement fresh" call is the right one; we just need to do it in v1 rather than after.
+Given that, shipping resleeve as "session capture only" undersells the project — the *stack* (in the consciousness-transfer sense) needs both transcripts *and* the working brain (plans, learnings, scope). The "lift design from ori, implement fresh" call is the right one; we just need to do it in v1 rather than after.
 
 This doc specifies what the memory module looks like in resleeve v1.
 

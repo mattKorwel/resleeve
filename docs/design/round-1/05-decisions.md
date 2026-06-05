@@ -4,7 +4,7 @@ Locked-in decisions governing resleeve's design. Updated as the design matures.
 
 ## Name: `resleeve`
 
-The Altered Carbon verb — moving a "stack" of consciousness into a different "sleeve." Maps onto re-hydrating an AI session into a different sleeve (compute environment).
+A sci-fi verb — moving a "stack" of consciousness into a different "sleeve." Maps onto re-hydrating an AI session into a different sleeve (compute environment).
 
 Cleared availability checks: `npm`, `pip`, `brew`, `github.com/mattkorwel/resleeve` all free. SEO clean.
 
