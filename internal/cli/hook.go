@@ -12,6 +12,7 @@ import (
 
 	"github.com/mattkorwel/resleeve/internal/adapter"
 	"github.com/mattkorwel/resleeve/internal/adapter/claude"
+	"github.com/mattkorwel/resleeve/internal/adapter/registry"
 	"github.com/mattkorwel/resleeve/internal/agent"
 	"github.com/mattkorwel/resleeve/internal/event"
 )
@@ -142,15 +143,19 @@ func writeLastInjected(scope, body string) {
 	_ = os.WriteFile(path, []byte(header+body), 0o600)
 }
 
-// pickAdapter returns an adapter.Adapter for the given name. v1 only
-// supports claude; v3 will register opencode / codex / gemini.
+// pickAdapter returns an adapter.Adapter for the given name, resolved
+// through internal/adapter/registry (adapters self-register from their
+// init(); see internal/cli/adapters.go). An empty name defaults to
+// claude, preserving the hook flag's historical default.
 func pickAdapter(name string) (adapter.Adapter, error) {
-	switch name {
-	case claude.Name, "":
-		return claude.New(), nil
-	default:
+	if name == "" {
+		name = claude.Name
+	}
+	a, ok := registry.New(name)
+	if !ok {
 		return nil, &unknownAdapterError{name: name}
 	}
+	return a, nil
 }
 
 type unknownAdapterError struct{ name string }

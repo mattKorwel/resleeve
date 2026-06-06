@@ -9,7 +9,7 @@ import (
 
 	"github.com/mattkorwel/resleeve/internal/adapter"
 	"github.com/mattkorwel/resleeve/internal/adapter/claude"
-	"github.com/mattkorwel/resleeve/internal/adapter/opencode"
+	"github.com/mattkorwel/resleeve/internal/adapter/registry"
 	"github.com/mattkorwel/resleeve/internal/agent"
 	"github.com/mattkorwel/resleeve/internal/event"
 	rsql "github.com/mattkorwel/resleeve/internal/storage/sql"
@@ -169,23 +169,17 @@ func hydrateForCLI(ctx context.Context, c *agent.Client, ses *rsql.Session, opts
 	}
 
 	mode := opts.mode
-	var a adapter.Adapter
-	switch cliName {
-	case claude.Name:
-		a = claude.New()
-	case opencode.Name:
-		a = opencode.New()
-		// opencode can only re-sleeve via prime mode (it can't ingest
-		// claude's JSONL). If the caller didn't ask for an explicit
-		// mode, force prime so Auto doesn't fall through into a
-		// replay attempt the adapter would reject anyway.
-		if mode == adapter.RenderModeAuto {
-			mode = adapter.RenderModePrime
-		}
-	default:
+	a, ok := registry.New(cliName)
+	if !ok {
 		fmt.Fprintf(os.Stderr, "resume: no adapter registered for cli %q\n", cliName)
 		return nil, adapter.SessionView{}, nil, 1
 	}
+	// Mode resolution lives in the adapter's Hydrate: an adapter that
+	// can't replay (e.g. opencode→ a non-opencode source) resolves Auto
+	// to prime itself. The CLI no longer hard-codes per-adapter mode
+	// rules here; it only forwards opts.mode and the prime PlanContent
+	// (fetched below for any non-replay mode so the adapter has it if it
+	// ends up priming).
 
 	view := adapter.SessionView{
 		SessionID:   ses.ID,
@@ -217,13 +211,16 @@ func hydrateForCLI(ctx context.Context, c *agent.Client, ses *rsql.Session, opts
 // fetchPrimePlan renders a "## Plan" section from the session's scope's
 // rolled-up memory context (item #8 on the polish punch list) by hitting
 // the same daemon endpoint the SessionStart hook uses (GET /v1/context).
-// Replay mode skips this entirely (the section is prime-only). Empty /
-// "unknown" scopes are skipped: BuildContext would have nothing useful
-// to return and "unknown" is a sentinel the slot writer uses when the
-// source CLI never sent a scope. Failures are non-fatal — prime can
+// Only explicit replay mode skips this — Auto is included because an
+// adapter may resolve Auto to prime (e.g. opencode), and PlanContent is
+// ignored by replay renderers anyway (see HydrateOpts.PlanContent), so
+// fetching it for Auto is harmless when the adapter ends up replaying.
+// Empty / "unknown" scopes are skipped: BuildContext would have nothing
+// useful to return and "unknown" is a sentinel the slot writer uses when
+// the source CLI never sent a scope. Failures are non-fatal — prime can
 // still render with an empty plan.
 func fetchPrimePlan(ctx context.Context, c *agent.Client, ses *rsql.Session, mode adapter.RenderMode) string {
-	if mode != adapter.RenderModePrime {
+	if mode == adapter.RenderModeReplay {
 		return ""
 	}
 	scope := ses.Slot.Scope
