@@ -106,15 +106,35 @@ func NewSyncClient(store rsql.Store, upstream, token string) *SyncClient {
 // `resleeve login` derives the KEK locally. Idempotent + concurrent-safe.
 func (s *SyncClient) SetSealer(sl auth.Sealer) {
 	s.sealerMu.Lock()
+	// sec-H4: if we're replacing an existing sealer (re-unlock with a
+	// different KEK, or a key rotation), scrub the old one's key material
+	// rather than leaking it to GC. No-op when there was no prior sealer
+	// or it isn't Wipeable (e.g. test fakes).
+	if old, ok := s.sealer.(auth.Wipeable); ok && s.sealer != sl {
+		old.Wipe()
+	}
 	s.sealer = sl
 	s.sealerMu.Unlock()
 }
 
 // ClearSealer drops the installed sealer. Called by /v1/seal/lock on
-// `resleeve logout`; the drain/pull/sse loops then park until the
-// next SetSealer.
+// `resleeve logout` (and any future idle/auto-lock path); the
+// drain/pull/sse loops then park until the next SetSealer.
+//
+// sec-H4: before nil-ing the reference, we best-effort zero the sealer's
+// key material via the Wipeable interface. Without this the AES key
+// bytes linger in the heap until GC reuses the page, so a logout would
+// not actually revoke the KEK from a memory-reading attacker. Pure-Go
+// can't scrub the expanded AES schedule or swapped-out pages — see
+// auth.AESGCMSealer.Wipe for the caveats — but this shortens the window.
+// We wipe the OLD sealer while still holding sealerMu so no concurrent
+// getSealer() can hand the soon-to-be-wiped sealer to a loop that then
+// races the scrub.
 func (s *SyncClient) ClearSealer() {
 	s.sealerMu.Lock()
+	if w, ok := s.sealer.(auth.Wipeable); ok {
+		w.Wipe()
+	}
 	s.sealer = nil
 	s.sealerMu.Unlock()
 }

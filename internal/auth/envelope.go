@@ -23,6 +23,21 @@ type Sealer interface {
 	Open(ciphertext []byte) ([]byte, error)
 }
 
+// Wipeable is an optional interface a Sealer may implement to support
+// best-effort zeroization of its key material (sec-H4). Callers that
+// hold a Sealer they want to revoke (e.g. the daemon on `resleeve
+// logout` / idle-lock) should type-assert to Wipeable and call Wipe
+// before dropping the reference, so the raw key bytes don't linger in
+// the heap until the GC happens to reuse the page.
+//
+// Wipe MUST be idempotent and safe to call concurrently with a nil
+// receiver path (the caller guards the reference under its own mutex).
+// After Wipe, Seal/Open behavior is undefined — the contract is "wiped
+// sealers are discarded immediately."
+type Wipeable interface {
+	Wipe()
+}
+
 // AESGCMSealer is a Sealer backed by AES-256-GCM with a random 12-byte
 // nonce per Seal call. Wire format:
 //
@@ -30,37 +45,77 @@ type Sealer interface {
 //
 // The AEAD tag (16 bytes, appended to ciphertext by gcm.Seal) detects
 // any tampering of the version/nonce/ciphertext during Open.
+//
+// sec-H4: the sealer retains its own copy of the raw 32-byte key so
+// Wipe() can zero it on lock/logout. The cipher.AEAD itself holds an
+// expanded AES key schedule we cannot reach from pure Go (no exported
+// zeroize on crypto/aes), so wiping our copy is best-effort: it shrinks
+// the window in which the raw key is recoverable from process memory but
+// does not (and cannot, without CGO/mlock) guarantee the expanded
+// schedule or swapped-out pages are scrubbed. Documented as such.
 type AESGCMSealer struct {
 	aead cipher.AEAD
+	key  []byte // owned copy of the raw AES-256 key; zeroed by Wipe
 }
 
-// Compile-time assertion that AESGCMSealer implements Sealer. Lives
-// here (next to the concrete type) rather than in a downstream package
-// per Q6: the assertion is load-bearing for the Sealer contract, not a
-// keep-import-alive crutch.
-var _ Sealer = (*AESGCMSealer)(nil)
+// Compile-time assertion that AESGCMSealer implements Sealer + Wipeable.
+// Lives here (next to the concrete type) rather than in a downstream
+// package per Q6: the assertions are load-bearing for the contracts, not
+// a keep-import-alive crutch.
+var (
+	_ Sealer   = (*AESGCMSealer)(nil)
+	_ Wipeable = (*AESGCMSealer)(nil)
+)
 
 // NewAESGCMSealer constructs an AESGCMSealer from a 32-byte key
-// (AES-256). Returns an error if the key length is wrong.
+// (AES-256). Returns an error if the key length is wrong. The sealer
+// copies the key so the caller may zero its own buffer immediately
+// after construction (sec-H4); the copy is scrubbed by Wipe.
 func NewAESGCMSealer(key []byte) (*AESGCMSealer, error) {
 	if len(key) != 32 {
 		return nil, fmt.Errorf("envelope: key must be 32 bytes, got %d", len(key))
 	}
-	block, err := aes.NewCipher(key)
+	owned := make([]byte, len(key))
+	copy(owned, key)
+	block, err := aes.NewCipher(owned)
 	if err != nil {
+		Wipe(owned)
 		return nil, fmt.Errorf("envelope: aes new cipher: %w", err)
 	}
 	aead, err := cipher.NewGCM(block)
 	if err != nil {
+		Wipe(owned)
 		return nil, fmt.Errorf("envelope: aes-gcm: %w", err)
 	}
-	return &AESGCMSealer{aead: aead}, nil
+	return &AESGCMSealer{aead: aead, key: owned}, nil
+}
+
+// Wipe zeros the sealer's owned copy of the raw key (sec-H4). Best-effort:
+// the expanded AES key schedule inside the cipher.AEAD is unreachable in
+// pure Go and may persist until GC; swapped-out pages and core dumps are
+// out of reach without CGO/mlock. Idempotent — a second call is a no-op.
+// After Wipe, the AEAD is dropped so subsequent Seal/Open on this value
+// would panic on a nil dereference; callers are expected to discard the
+// reference (the daemon nils it under sealerMu).
+func (s *AESGCMSealer) Wipe() {
+	if s == nil {
+		return
+	}
+	Wipe(s.key)
+	s.key = nil
+	s.aead = nil
 }
 
 // Seal encrypts plaintext with a fresh random nonce and returns the
 // version-prefixed envelope. Safe to call concurrently — the AEAD is
 // stateless and crypto/rand is goroutine-safe.
 func (s *AESGCMSealer) Seal(plaintext []byte) ([]byte, error) {
+	if s.aead == nil {
+		// Wiped sealer (sec-H4): fail closed rather than panic on the nil
+		// AEAD. Callers discard wiped sealers immediately, so this path is
+		// a defensive guard against a use-after-wipe race, not a hot path.
+		return nil, errors.New("envelope: sealer has been wiped")
+	}
 	nonce := make([]byte, s.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, fmt.Errorf("envelope: rand nonce: %w", err)
@@ -77,6 +132,9 @@ func (s *AESGCMSealer) Seal(plaintext []byte) ([]byte, error) {
 // error on version mismatch, length underrun, or AEAD tag failure
 // (wrong key, mutated bytes, or truncation).
 func (s *AESGCMSealer) Open(ciphertext []byte) ([]byte, error) {
+	if s.aead == nil {
+		return nil, errors.New("envelope: sealer has been wiped")
+	}
 	nonceSize := s.aead.NonceSize()
 	if len(ciphertext) < 1+nonceSize+s.aead.Overhead() {
 		return nil, errors.New("envelope: ciphertext too short")

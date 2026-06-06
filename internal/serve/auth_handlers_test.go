@@ -247,6 +247,51 @@ func TestLoginChallenge_ConstantShapeForUnknownEmail(t *testing.T) {
 		LoginReq{Email: "ghost@example.com", VerifierHash: bogus, Device: DeviceMetadata{Name: "x"}}, 401)
 }
 
+// TestLoginChallenge_UnknownEmailParamParity is the sharper sec-H1/I15
+// assertion the constant-shape test doesn't make: the Argon2id params
+// returned for an UNKNOWN email must be byte-for-byte identical to those
+// a real (default-registered) account emits. If they diverged, the
+// challenge endpoint would become an account-existence oracle ("default
+// params ⇒ decoy / real ⇒ different cost knobs"). Since register floors
+// params at the default and the CLI registers at the default, parity is
+// the invariant we lock in here.
+func TestLoginChallenge_UnknownEmailParamParity(t *testing.T) {
+	_, base, _ := newIdentityServer(t)
+
+	signup, err := auth.Signup("real@parity.com", "hunter22-good-pass")
+	if err != nil {
+		t.Fatalf("Signup: %v", err)
+	}
+	postStatus(t, base+"/v2/auth/register", "", RegisterReq{
+		Email:  signup.User.Email,
+		Params: Argon2idParams{MemoryKiB: signup.User.Params.MemoryKiB, TimeIters: signup.User.Params.TimeIters, Parallelism: signup.User.Params.Parallelism},
+		Password: PasswordEnv{
+			VerifierSalt: signup.User.PasswordVerifier.Salt, VerifierHash: signup.User.PasswordVerifier.Hash,
+			KEKSalt: signup.User.PasswordKEK.Salt, KEKNonce: signup.User.PasswordKEK.Nonce, KEKCT: signup.User.PasswordKEK.Ciphertext,
+		},
+		Recovery: PasswordEnv{
+			VerifierSalt: signup.User.RecoveryVerifier.Salt, VerifierHash: signup.User.RecoveryVerifier.Hash,
+			KEKSalt: signup.User.RecoveryKEK.Salt, KEKNonce: signup.User.RecoveryKEK.Nonce, KEKCT: signup.User.RecoveryKEK.Ciphertext,
+		},
+		Device: DeviceMetadata{Name: "tester"},
+	}, 201)
+
+	var known, unknown LoginChallengeResp
+	post(t, base+"/v2/auth/login-challenge", "", LoginChallengeReq{Email: "real@parity.com"}, &known, 200)
+	post(t, base+"/v2/auth/login-challenge", "", LoginChallengeReq{Email: "ghost@parity.com"}, &unknown, 200)
+
+	if known.Params != unknown.Params {
+		t.Errorf("param parity broken: known=%+v unknown=%+v (account-existence oracle)", known.Params, unknown.Params)
+	}
+	// And both must equal the server-enforced default (the floor), so a
+	// future param bump in DefaultArgon2idParams keeps register + the
+	// decoy in lockstep automatically.
+	def := paramsToWire(auth.DefaultArgon2idParams())
+	if unknown.Params != def {
+		t.Errorf("unknown-email params %+v != default %+v", unknown.Params, def)
+	}
+}
+
 func TestRegister_InvalidPayload(t *testing.T) {
 	_, base, _ := newIdentityServer(t)
 	postStatus(t, base+"/v2/auth/register", "", RegisterReq{}, 400)

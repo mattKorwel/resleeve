@@ -351,6 +351,32 @@ func TestPairClaim_LocksAfterFiveFailedAttempts(t *testing.T) {
 	}
 }
 
+// TestPairClaim_CorrectClaimBeforeLockoutSucceeds is the sec-H2
+// counterpart to the lockout test: a legitimate accepter who fat-fingers
+// the code a few times (below the threshold) and then types it correctly
+// must still succeed. Lockout protects against brute force; it must not
+// punish a human typo within the budget.
+func TestPairClaim_CorrectClaimBeforeLockoutSucceeds(t *testing.T) {
+	fx := newPairClaimFixture(t, "typo@b.com", "code-typo", 5*time.Minute)
+
+	// Two wrong attempts (well under pairClaimMaxAttempts) — code stays live.
+	for i := 0; i < 2; i++ {
+		status, body := claimRaw(t, fx.base, fx.codeID, fx.wrongHash)
+		if status != http.StatusUnauthorized {
+			t.Fatalf("wrong attempt %d: status %d (%q), want 401", i, status, body)
+		}
+	}
+	// Correct claim now succeeds despite the prior failures.
+	status, body := claimRaw(t, fx.base, fx.codeID, fx.rightHash)
+	if status != http.StatusOK {
+		t.Fatalf("correct claim before lockout: status %d (%q), want 200", status, body)
+	}
+	// Counter cleared on success.
+	if got := fixtureCounterFor(fx, fx.codeID); got != 0 {
+		t.Errorf("counter after successful claim: got %d, want 0", got)
+	}
+}
+
 // TestPairClaim_LockoutIsIndistinguishableFromExpiry asserts that the
 // status code AND error body are byte-identical between (a) a code
 // locked out via 5 failed attempts and (b) a code that ran past its TTL
