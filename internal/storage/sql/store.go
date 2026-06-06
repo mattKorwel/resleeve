@@ -287,6 +287,104 @@ type PairingStore interface {
 	SweepExpired(ctx context.Context, now time.Time) error
 }
 
+// BrainKind classifies a brain. A personal brain is auto-provisioned for
+// every user on register; a shared brain is simply a brain with more than
+// one member. See docs/design/round-11/02-multi-tenant.md §"Core model".
+type BrainKind string
+
+const (
+	BrainKindPersonal BrainKind = "personal"
+	BrainKindShared   BrainKind = "shared"
+)
+
+// Brain is a named namespace — a scope tree plus its memory (plans,
+// learnings). It is the unit of isolation and of sharing. OwnerUserID is
+// the creator, who can add/remove members; there is no role column —
+// every member reads and writes (round-11 "keep it dumb" constraint).
+type Brain struct {
+	ID          string
+	Name        string
+	Kind        BrainKind
+	OwnerUserID string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// Membership is the access edge: a (BrainID, UserID) pair. Its existence
+// is the access rule — you may touch a brain iff you are a member. No
+// role yet.
+type Membership struct {
+	BrainID   string
+	UserID    string
+	CreatedAt time.Time
+}
+
+// CredentialKind classifies how a credential proves identity. ssh = an
+// SSH public key (authorized_keys style); api = a long-lived bearer the
+// server stores only as a hash; oidc = an external IdP subject (tier 5,
+// stored here behind the same seam, verified later).
+type CredentialKind string
+
+const (
+	CredentialKindSSH  CredentialKind = "ssh"
+	CredentialKindAPI  CredentialKind = "api"
+	CredentialKindOIDC CredentialKind = "oidc"
+)
+
+// Credential is one way a user can authenticate: an SSH pubkey, an API
+// key hash, or an OIDC subject. Many users × many keys is just rows. This
+// slice persists the shape only; SSH-challenge / API-key verification
+// lands in a later slice. The server stores only a public key or a hash —
+// never a plaintext secret.
+type Credential struct {
+	ID              string
+	UserID          string
+	Kind            CredentialKind
+	PublicKeyOrHash string
+	Label           string
+	CreatedAt       time.Time
+	ExpiresAt       *time.Time // nil = no expiry
+}
+
+// BrainStore persists brains. Server-side only.
+type BrainStore interface {
+	// Create inserts a new brain row.
+	Create(ctx context.Context, b *Brain) error
+	// Get returns a brain by id; ErrNotFound if absent.
+	Get(ctx context.Context, id string) (*Brain, error)
+	// ListByOwner returns brains owned (created) by userID.
+	ListByOwner(ctx context.Context, userID string) ([]*Brain, error)
+	// ListForUser returns every brain userID is a member of (via the
+	// memberships join), regardless of ownership.
+	ListForUser(ctx context.Context, userID string) ([]*Brain, error)
+}
+
+// MembershipStore persists the brain↔user access edges. Server-side only.
+type MembershipStore interface {
+	// Add inserts a membership. Idempotent on (brain_id, user_id).
+	Add(ctx context.Context, m *Membership) error
+	// Remove deletes a membership. Idempotent.
+	Remove(ctx context.Context, brainID, userID string) error
+	// ListBrains returns the brain ids userID is a member of.
+	ListBrains(ctx context.Context, userID string) ([]string, error)
+	// ListMembers returns the user ids that are members of brainID.
+	ListMembers(ctx context.Context, brainID string) ([]string, error)
+	// IsMember reports whether userID is a member of brainID.
+	IsMember(ctx context.Context, userID, brainID string) (bool, error)
+}
+
+// CredentialStore persists per-user credentials. Server-side only.
+type CredentialStore interface {
+	// Add inserts a new credential row.
+	Add(ctx context.Context, c *Credential) error
+	// Get returns a credential by id; ErrNotFound if absent.
+	Get(ctx context.Context, id string) (*Credential, error)
+	// ListByUser returns all credentials for userID.
+	ListByUser(ctx context.Context, userID string) ([]*Credential, error)
+	// Delete removes a credential by id (e.g. revoke). Idempotent.
+	Delete(ctx context.Context, id string) error
+}
+
 // Store is the union — each backend exposes the sub-stores via typed
 // accessors. See docs/design/round-2/11-storage-backends.md.
 type Store interface {
@@ -299,5 +397,8 @@ type Store interface {
 	Devices() DeviceStore
 	Pairings() PairingStore
 	ServeMeta() ServeMetaStore
+	Brains() BrainStore
+	Memberships() MembershipStore
+	Credentials() CredentialStore
 	Close() error
 }

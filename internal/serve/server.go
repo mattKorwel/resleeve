@@ -54,6 +54,13 @@ type Config struct {
 	// is stable across `resleeve serve` reboots — removing the "did the
 	// server restart?" oracle a passive observer could otherwise mount.
 	ServeMeta rsql.ServeMetaStore
+	// Brains + Memberships are the round-11 multi-tenant foundation.
+	// When both are set, register auto-provisions a personal brain (and
+	// the registering user's membership of it). Keyspace partitioning and
+	// authz that consume these land in later slices. When nil, register
+	// still succeeds but provisions no brain (legacy single-user mode).
+	Brains      rsql.BrainStore
+	Memberships rsql.MembershipStore
 }
 
 // Server is the HTTP handler exposed at /v2/sync/* and /v2/auth/*.
@@ -64,6 +71,8 @@ type Server struct {
 	serverUsers rsql.ServerUserStore
 	devices     rsql.DeviceStore
 	pairings    rsql.PairingStore
+	brains      rsql.BrainStore
+	memberships rsql.MembershipStore
 
 	// loginChallengeKey is a persisted random secret used to derive
 	// synthetic Argon2id salts for unknown-email login-challenge requests
@@ -154,6 +163,8 @@ func New(cfg Config) (*Server, error) {
 		serverUsers:       cfg.ServerUsers,
 		devices:           cfg.Devices,
 		pairings:          cfg.Pairings,
+		brains:            cfg.Brains,
+		memberships:       cfg.Memberships,
 		loginChallengeKey: challengeKey,
 		loginTimingDecoy:  timingDecoy,
 		sseSubscribers:    map[chan PushRow]struct{}{},

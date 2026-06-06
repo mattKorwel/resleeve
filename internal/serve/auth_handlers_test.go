@@ -37,6 +37,8 @@ func newIdentityServer(t *testing.T) (*httptest.Server, string, *sqlite.Store) {
 		Devices:     store.Devices(),
 		Pairings:    store.Pairings(),
 		ServeMeta:   store.ServeMeta(),
+		Brains:      store.Brains(),
+		Memberships: store.Memberships(),
 	})
 	if err != nil {
 		t.Fatalf("serve.New: %v", err)
@@ -66,6 +68,8 @@ func newIdentityServerOnStore(t *testing.T, store *sqlite.Store, backendDir stri
 		Devices:     store.Devices(),
 		Pairings:    store.Pairings(),
 		ServeMeta:   store.ServeMeta(),
+		Brains:      store.Brains(),
+		Memberships: store.Memberships(),
 	})
 	if err != nil {
 		t.Fatalf("serve.New: %v", err)
@@ -598,10 +602,10 @@ func TestLoginTimingDecoy_RunsOnUnknownEmail(t *testing.T) {
 	}
 
 	// 2) The helper should be safe to call with various input shapes.
-	srv.runLoginTimingDecoy(nil)                   // empty hash → still runs
-	srv.runLoginTimingDecoy(make([]byte, 32))      // exact size → runs full-length compare
-	srv.runLoginTimingDecoy(make([]byte, 16))      // shorter → compares prefix
-	srv.runLoginTimingDecoy(make([]byte, 64))      // longer → capped at decoy length
+	srv.runLoginTimingDecoy(nil)              // empty hash → still runs
+	srv.runLoginTimingDecoy(make([]byte, 32)) // exact size → runs full-length compare
+	srv.runLoginTimingDecoy(make([]byte, 16)) // shorter → compares prefix
+	srv.runLoginTimingDecoy(make([]byte, 64)) // longer → capped at decoy length
 
 	// 3) End-to-end: an unknown-email login still 401s. The early-return
 	// path now goes through runLoginTimingDecoy instead of skipping the
