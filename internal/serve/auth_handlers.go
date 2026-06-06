@@ -289,6 +289,14 @@ func (s *Server) handleLoginChallenge(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		// sec-H1/I15 param parity: the decoy MUST emit the same Argon2id
+		// params a real account would, or the difference becomes an
+		// account-existence oracle. We return DefaultArgon2idParams() and
+		// rely on validateArgon2Params flooring every register at exactly
+		// that default (argon2MinMemoryKiB == default memory, etc.), so a
+		// real default-registered account and this decoy are byte-identical.
+		// If a future feature ever lets accounts register ABOVE the floor,
+		// this branch must be revisited (see TestLoginChallenge_UnknownEmailParamParity).
 		writeJSON(w, http.StatusOK, LoginChallengeResp{
 			Params:       paramsToWire(auth.DefaultArgon2idParams()),
 			VerifierSalt: s.syntheticChallengeSalt(email),

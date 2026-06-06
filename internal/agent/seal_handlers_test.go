@@ -173,6 +173,69 @@ func TestSealUnlock_NonLoopbackRejected(t *testing.T) {
 	}
 }
 
+// TestClearSealer_WipesKEKAndBlocksSealUntilReUnlock proves sec-H4 end
+// to end at the daemon boundary: after ClearSealer the underlying
+// AESGCMSealer's key bytes are zeroed, the wiped sealer can no longer
+// Seal, getSealer reports nil, and a fresh SetSealer (re-unlock) restores
+// a working sealer.
+func TestClearSealer_WipesKEKAndBlocksSealUntilReUnlock(t *testing.T) {
+	d, _ := newSealTestDaemon(t)
+
+	kek := bytes.Repeat([]byte{0x7E}, 32)
+	sealer, err := auth.NewAESGCMSealer(kek)
+	if err != nil {
+		t.Fatalf("NewAESGCMSealer: %v", err)
+	}
+	d.sync.SetSealer(sealer)
+
+	// Sanity: it works while installed.
+	if _, err := sealer.Seal([]byte("hi")); err != nil {
+		t.Fatalf("Seal while installed: %v", err)
+	}
+
+	// Lock: ClearSealer must wipe the sealer's key material.
+	d.sync.ClearSealer()
+	if d.sync.getSealer() != nil {
+		t.Fatal("getSealer should be nil after ClearSealer")
+	}
+	// We still hold the original reference: prove it was scrubbed in place,
+	// not merely dropped. Seal must now fail closed (wiped AEAD).
+	if _, err := sealer.Seal([]byte("after-lock")); err == nil {
+		t.Error("Seal on the wiped sealer should fail closed after logout")
+	}
+
+	// Re-unlock: a fresh sealer restores function.
+	sealer2, err := auth.NewAESGCMSealer(bytes.Repeat([]byte{0x11}, 32))
+	if err != nil {
+		t.Fatalf("NewAESGCMSealer (re-unlock): %v", err)
+	}
+	d.sync.SetSealer(sealer2)
+	ct, err := sealer2.Seal([]byte("relocked"))
+	if err != nil {
+		t.Fatalf("Seal after re-unlock: %v", err)
+	}
+	if pt, err := sealer2.Open(ct); err != nil || string(pt) != "relocked" {
+		t.Fatalf("round-trip after re-unlock: pt=%q err=%v", pt, err)
+	}
+}
+
+// TestSetSealer_WipesReplacedSealer proves SetSealer scrubs a prior
+// sealer it replaces (re-unlock / key rotation) rather than leaking the
+// old KEK to GC (sec-H4).
+func TestSetSealer_WipesReplacedSealer(t *testing.T) {
+	d, _ := newSealTestDaemon(t)
+	old, err := auth.NewAESGCMSealer(bytes.Repeat([]byte{0x33}, 32))
+	if err != nil {
+		t.Fatalf("NewAESGCMSealer: %v", err)
+	}
+	d.sync.SetSealer(old)
+	// Replace with a different sealer.
+	d.sync.SetSealer(mustSealer(t))
+	if _, err := old.Seal([]byte("x")); err == nil {
+		t.Error("replaced sealer should have been wiped by SetSealer")
+	}
+}
+
 func mustSealer(t *testing.T) auth.Sealer {
 	t.Helper()
 	sl, err := auth.NewAESGCMSealer(bytes.Repeat([]byte{2}, 32))

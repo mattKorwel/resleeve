@@ -82,6 +82,11 @@ func (d *Daemon) handleSealUnlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sealer, err := auth.NewAESGCMSealer(req.KEK)
+	// sec-H4: the sealer copied the KEK, so scrub the request-body copy
+	// now regardless of the construction outcome. This is best-effort —
+	// the JSON decoder may retain its own buffered copy until reuse — but
+	// it clears the longest-lived reference we directly control here.
+	auth.Wipe(req.KEK)
 	if err != nil {
 		writeErrorStatus(w, http.StatusInternalServerError, "build sealer: "+err.Error())
 		return

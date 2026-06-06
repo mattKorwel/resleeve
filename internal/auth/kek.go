@@ -22,6 +22,29 @@ func NewKEK() (KEK, error) {
 	return k, nil
 }
 
+// Wipe zeros a KEK in place (sec-H4). Best-effort RAM scrub: pure Go
+// cannot mlock the page against swap nor scrub copies the compiler may
+// have made by value, but zeroing the canonical array shortens the
+// window in which a memory-reading attacker can recover it. Callers
+// passing the KEK by slice (kek[:]) and then wiping the source array
+// also clear that view, since the slice aliases the array's backing.
+func (k *KEK) Wipe() {
+	if k == nil {
+		return
+	}
+	Wipe(k[:])
+}
+
+// Wipe overwrites b with zeros. Best-effort key zeroization (sec-H4):
+// see KEK.Wipe / AESGCMSealer.Wipe for the threat-model caveats. The
+// loop is written so the compiler cannot trivially optimize it away as
+// a dead store (the slice escapes via the exported function boundary).
+func Wipe(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
 // WrappedKEK is a KEK encrypted with a key derived from a user-held
 // secret (password or recovery key). Safe to persist; useless without
 // the originating secret.
