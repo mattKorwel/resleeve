@@ -97,7 +97,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  version          print version and exit")
 	fmt.Fprintln(w, "  agent            run the local daemon")
 	fmt.Fprintln(w, "  hook             process a hook event (stdin → daemon)")
-	fmt.Fprintln(w, "  install-bridge   install hooks into the harness's settings file")
+	fmt.Fprintln(w, "  install-bridge   install hooks (and, with --mcp, the resleeve MCP memory server) into the CLI's config")
 	fmt.Fprintln(w, "  session          list/show/search/tail captured sessions")
 	fmt.Fprintln(w, "  up               start the daemon and install bridges")
 	fmt.Fprintln(w, "  down             stop the daemon and remove bridges")

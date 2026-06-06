@@ -220,6 +220,7 @@ func printDoctorReport(ctx context.Context) int {
 	daemonRunning := printDaemon()
 	printLegacySealKey()
 	bridgeInstalled := printBridge()
+	printMCPCards()
 
 	// Sync cards (upstream / slow / fast) — additive helpers; only
 	// useful when the daemon is up since the snapshot lives in-process.
@@ -337,6 +338,108 @@ func printBridge() bool {
 	}
 	fmt.Printf("  bridge (claude)  ✗ not installed in %s\n", settingsPath)
 	return false
+}
+
+// mcpCardTarget describes one CLI's MCP config for the doctor card: where
+// it lives and how to find resleeve's server entry inside it.
+type mcpCardTarget struct {
+	cli  string
+	path string // resolved config path (empty → can't resolve home)
+	// check reports whether the resleeve MCP server is registered given the
+	// already-parsed top-level config object (nil when the file is absent
+	// or unparsable).
+	check func(parsed map[string]any) bool
+	// toml is true for codex (config.toml) — checked by text marker, not
+	// JSON parse.
+	toml bool
+}
+
+// printMCPCards renders one "mcp (<cli>)" card per supported CLI, reporting
+// whether resleeve's MCP memory server is registered in that CLI's config.
+// Mirrors printBridge's file-inspection style (doctor reads the on-disk
+// config directly rather than going through the adapter).
+func printMCPCards() {
+	for _, t := range mcpCardTargets() {
+		if t.path == "" {
+			fmt.Printf("  mcp (%s)%s? can't resolve config path\n", t.cli, mcpCardPad(t.cli))
+			continue
+		}
+		data, err := os.ReadFile(t.path)
+		if err != nil {
+			fmt.Printf("  mcp (%s)%s✗ not registered (no config at %s)\n", t.cli, mcpCardPad(t.cli), t.path)
+			continue
+		}
+		registered := false
+		if t.toml {
+			registered = strings.Contains(string(data), "[mcp_servers.resleeve]")
+		} else {
+			var parsed map[string]any
+			if json.Unmarshal(data, &parsed) == nil {
+				registered = t.check(parsed)
+			}
+		}
+		if registered {
+			fmt.Printf("  mcp (%s)%s✓ registered in %s\n", t.cli, mcpCardPad(t.cli), t.path)
+		} else {
+			fmt.Printf("  mcp (%s)%s✗ not registered in %s\n", t.cli, mcpCardPad(t.cli), t.path)
+		}
+	}
+}
+
+// mcpCardPad aligns the status column across the variable-length CLI names.
+func mcpCardPad(cli string) string {
+	// "  mcp (claude)" is the widest label among our CLIs ("antigravity").
+	width := len("mcp (antigravity)") + 2
+	cur := len("mcp (" + cli + ")")
+	pad := width - cur
+	if pad < 1 {
+		pad = 1
+	}
+	return strings.Repeat(" ", pad)
+}
+
+// hasNamedServer reports whether obj[topKey] is an object containing a
+// "resleeve" key (the JSON shape claude / opencode / antigravity all use,
+// differing only in the top-level key).
+func hasNamedServer(obj map[string]any, topKey string) bool {
+	m, _ := obj[topKey].(map[string]any)
+	if m == nil {
+		return false
+	}
+	_, ok := m["resleeve"]
+	return ok
+}
+
+// mcpCardTargets resolves the per-CLI MCP config locations for the doctor
+// cards. Paths mirror each adapter's install_mcp.go.
+func mcpCardTargets() []mcpCardTarget {
+	home, _ := os.UserHomeDir()
+	var claudePath, agyPath, opencodePath string
+	if home != "" {
+		claudePath = filepath.Join(home, ".claude.json")
+		agyPath = filepath.Join(home, ".gemini", "config", "mcp_config.json")
+		opencodePath = filepath.Join(home, ".config", "opencode", "opencode.jsonc")
+		if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
+			opencodePath = filepath.Join(xdg, "opencode", "opencode.jsonc")
+		}
+		// Prefer opencode.json when the jsonc variant is absent.
+		if _, err := os.Stat(opencodePath); err != nil {
+			opencodePath = strings.TrimSuffix(opencodePath, "c")
+		}
+	}
+	codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	codexPath := ""
+	if codexHome != "" {
+		codexPath = filepath.Join(codexHome, "config.toml")
+	} else if home != "" {
+		codexPath = filepath.Join(home, ".codex", "config.toml")
+	}
+	return []mcpCardTarget{
+		{cli: "claude", path: claudePath, check: func(p map[string]any) bool { return hasNamedServer(p, "mcpServers") }},
+		{cli: "codex", path: codexPath, toml: true},
+		{cli: "opencode", path: opencodePath, check: func(p map[string]any) bool { return hasNamedServer(p, "mcp") }},
+		{cli: "antigravity", path: agyPath, check: func(p map[string]any) bool { return hasNamedServer(p, "mcpServers") }},
+	}
 }
 
 // printBinaries renders the "claude binary" + "resleeve binary" cards.

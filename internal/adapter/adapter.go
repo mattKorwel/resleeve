@@ -26,6 +26,16 @@ type Adapter interface {
 	InstallBridge(ctx context.Context, opts InstallOpts) error
 	UninstallBridge(ctx context.Context) error
 
+	// MCP server registration. Each adapter owns its CLI's MCP config
+	// format and writes/removes a single `resleeve` MCP server entry that
+	// points at this resleeve binary running `resleeve mcp` (the cross-CLI
+	// memory-pull path). Idempotent (own-block keyed by the server name
+	// "resleeve"); user-authored MCP servers are preserved across
+	// install/uninstall. The server command is
+	// opts.ResleeveBinPath + ["mcp"]; DryRun computes without writing.
+	InstallMCP(ctx context.Context, opts InstallOpts) error
+	UninstallMCP(ctx context.Context) error
+
 	// Capture (translate native input to normalized events)
 	FromNative(ctx context.Context, raw []byte, src Source) ([]event.Event, error)
 
@@ -69,8 +79,8 @@ type SourceKind int
 
 const (
 	SourceUnknown SourceKind = iota
-	SourceHook              // one Claude-Code hook JSON envelope on stdin
-	SourceJSONL             // one JSONL line from a session file
+	SourceHook               // one Claude-Code hook JSON envelope on stdin
+	SourceJSONL              // one JSONL line from a session file
 )
 
 // SessionView is a read-only projection of a stored session, used by
