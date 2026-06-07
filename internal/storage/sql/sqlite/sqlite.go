@@ -32,6 +32,9 @@ type Store struct {
 	devices     *deviceStore
 	pairings    *pairingStore
 	serveMeta   *serveMetaStore
+	brains      *brainStore
+	memberships *membershipStore
+	credentials *credentialStore
 }
 
 // Open opens (and auto-migrates) a SQLite database at the given DSN.
@@ -59,6 +62,9 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	s.devices = &deviceStore{db: db}
 	s.pairings = &pairingStore{db: db}
 	s.serveMeta = &serveMetaStore{db: db}
+	s.brains = &brainStore{db: db}
+	s.memberships = &membershipStore{db: db}
+	s.credentials = &credentialStore{db: db}
 	if err := s.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -94,6 +100,18 @@ func (s *Store) Pairings() rsql.PairingStore { return s.pairings }
 // persisted login-challenge HMAC key (sec-M1) so the synthetic salt for
 // unknown-email probes is stable across `resleeve serve` restarts.
 func (s *Store) ServeMeta() rsql.ServeMetaStore { return s.serveMeta }
+
+// Brains returns the brain (namespace) store. Only `resleeve serve`
+// reads from this — brains are the server-side unit of tenancy.
+func (s *Store) Brains() rsql.BrainStore { return s.brains }
+
+// Memberships returns the brain↔user access-edge store. Only `resleeve
+// serve` reads from this.
+func (s *Store) Memberships() rsql.MembershipStore { return s.memberships }
+
+// Credentials returns the per-user credential store (SSH/API/OIDC).
+// Only `resleeve serve` reads from this.
+func (s *Store) Credentials() rsql.CredentialStore { return s.credentials }
 
 // Close releases the underlying database handle.
 func (s *Store) Close() error { return s.db.Close() }
@@ -262,7 +280,7 @@ func (s *sessionStore) SyncEventCount(ctx context.Context, sessionID string) err
 
 // UpdateCwd repairs sessions.cwd and sessions.scope for a single row.
 // Backfill use case: legacy sessions created before the F1+F2+F3
-// reconcile-fix have cwd='' / scope='unknown'. A no-op for an unknown
+// reconcile-fix have cwd=” / scope='unknown'. A no-op for an unknown
 // session_id (UPDATE matches zero rows, no error).
 func (s *sessionStore) UpdateCwd(ctx context.Context, sessionID, cwd, scope string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE sessions

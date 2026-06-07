@@ -35,13 +35,13 @@ import (
 // Floor matches round-2/10's baseline (OWASP-leaning interactive auth).
 // Ceiling is generous — anything above it is presumptive abuse.
 const (
-	argon2MinMemoryKiB   uint32 = 64 * 1024 // 64 MiB — OWASP interactive floor
-	argon2MaxMemoryKiB   uint32 = 4 * 1024 * 1024 // 4 GiB — DoS ceiling
-	argon2MinTimeIters   uint32 = 2
-	argon2MaxTimeIters   uint32 = 32
-	argon2MinParallelism uint8  = 1
-	argon2RequiredSaltLen   = 16 // 128 bits — matches auth.NewSalt()
-	argon2RequiredOutputLen = 32 // 256 bits — matches auth.keyLen (AES-256-GCM)
+	argon2MinMemoryKiB      uint32 = 64 * 1024       // 64 MiB — OWASP interactive floor
+	argon2MaxMemoryKiB      uint32 = 4 * 1024 * 1024 // 4 GiB — DoS ceiling
+	argon2MinTimeIters      uint32 = 2
+	argon2MaxTimeIters      uint32 = 32
+	argon2MinParallelism    uint8  = 1
+	argon2RequiredSaltLen          = 16 // 128 bits — matches auth.NewSalt()
+	argon2RequiredOutputLen        = 32 // 256 bits — matches auth.keyLen (AES-256-GCM)
 )
 
 // Auth-handler routes (added in punch-list #3). Wire format mirrors the
@@ -104,10 +104,14 @@ type DeviceMetadata struct {
 }
 
 // RegisterResp returns the assigned user_id + the first device token.
+// BrainID is the auto-provisioned personal brain (round-11 multi-tenant
+// foundation); empty when the server runs without a brain store
+// (legacy single-user mode).
 type RegisterResp struct {
 	UserID      string `json:"user_id"`
 	DeviceID    string `json:"device_id"`
 	DeviceToken string `json:"device_token"`
+	BrainID     string `json:"brain_id,omitempty"`
 }
 
 // LoginReq is POST /v2/auth/login: the client presents its verifier
@@ -256,11 +260,54 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "mint device: "+err.Error())
 		return
 	}
+
+	// round-11 multi-tenant foundation: auto-provision a personal brain
+	// for the new user plus their membership of it. Every user is a member
+	// of exactly one (their own) brain; a shared brain is later just a
+	// brain with count(members) > 1. Skipped when the brain stores are not
+	// configured (legacy single-user mode).
+	brainID, err := s.provisionPersonalBrain(r.Context(), u.ID, email)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "provision brain: "+err.Error())
+		return
+	}
+
 	writeJSON(w, http.StatusCreated, RegisterResp{
 		UserID:      u.ID,
 		DeviceID:    dev.ID,
 		DeviceToken: dev.DeviceToken,
+		BrainID:     brainID,
 	})
+}
+
+// provisionPersonalBrain creates the user's personal brain plus their
+// membership of it. Returns the new brain id, or "" when the brain stores
+// are unconfigured (legacy single-user mode — register still succeeds).
+// The brain row is created first so the membership FK is satisfied.
+func (s *Server) provisionPersonalBrain(ctx context.Context, userID, email string) (string, error) {
+	if s.brains == nil || s.memberships == nil {
+		return "", nil
+	}
+	now := time.Now().UTC()
+	b := &rsql.Brain{
+		ID:          newID(16),
+		Name:        email, // personal brain is named after its owner
+		Kind:        rsql.BrainKindPersonal,
+		OwnerUserID: userID,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if err := s.brains.Create(ctx, b); err != nil {
+		return "", err
+	}
+	if err := s.memberships.Add(ctx, &rsql.Membership{
+		BrainID:   b.ID,
+		UserID:    userID,
+		CreatedAt: now,
+	}); err != nil {
+		return "", err
+	}
+	return b.ID, nil
 }
 
 // --- login challenge ---
