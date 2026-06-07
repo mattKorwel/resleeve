@@ -54,6 +54,14 @@ type Config struct {
 	// reconcilers — daemon stays neutral. See Q12 / reconciler.go.
 	Reconcilers []Reconciler
 
+	// LocalAuthor is the author_user_id stamped on plan/learning writes
+	// made through this daemon (round-12B provenance). The daemon is a
+	// single-user process with a shared-secret bearer, so this is a
+	// process-wide identity, not per-request. Empty (the default) means
+	// "unknown / local" — provenance is then carried by the serve write
+	// path's per-device bearer instead. See memory_handlers.localAuthor.
+	LocalAuthor string
+
 	// Secret pins the bearer token used to authorize requests. Empty
 	// means Serve will generate a random token at startup (the
 	// production path). Test code that fronts the daemon via Handler()

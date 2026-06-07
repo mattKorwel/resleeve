@@ -84,7 +84,7 @@ func TestMemory_InvalidKindRejected(t *testing.T) {
 	}
 }
 
-func TestMemory_PlanUpsertNamedSlots(t *testing.T) {
+func TestMemory_PlanAppendVersionsNamedSlots(t *testing.T) {
 	ctx := context.Background()
 	st := openTestStore(t)
 	ms := st.Memory()
@@ -93,30 +93,84 @@ func TestMemory_PlanUpsertNamedSlots(t *testing.T) {
 		t.Fatalf("create scope: %v", err)
 	}
 
-	// Default slot.
-	if err := ms.PutPlan(ctx, &memory.Plan{Scope: "p", Content: "v1"}); err != nil {
-		t.Fatalf("put default: %v", err)
+	// First write into the default slot: base_version 0 (expect-new).
+	p1, err := ms.AppendPlanVersion(ctx, "p", "", "v1", "alice", memory.NewPlanBaseVersion, false)
+	if err != nil {
+		t.Fatalf("append default v1: %v", err)
 	}
+	if p1.Version != 1 || p1.ParentVersion != 0 {
+		t.Errorf("v1 version/parent: got %d/%d, want 1/0", p1.Version, p1.ParentVersion)
+	}
+
 	def, err := ms.GetPlan(ctx, "p", "")
 	if err != nil {
 		t.Fatalf("get default: %v", err)
 	}
-	if def.Name != memory.DefaultPlanSlot || def.Content != "v1" {
-		t.Errorf("default plan mismatch: %+v", def)
+	if def.Name != memory.DefaultPlanSlot || def.Content != "v1" || def.Version != 1 || def.Author != "alice" {
+		t.Errorf("default HEAD mismatch: %+v", def)
 	}
 
-	// Replace content (upsert).
-	if err := ms.PutPlan(ctx, &memory.Plan{Scope: "p", Content: "v2"}); err != nil {
-		t.Fatalf("put replace: %v", err)
+	// Correct base (HEAD=1) appends version 2 with parent_version=1.
+	p2, err := ms.AppendPlanVersion(ctx, "p", "", "v2", "bob", 1, false)
+	if err != nil {
+		t.Fatalf("append default v2: %v", err)
+	}
+	if p2.Version != 2 || p2.ParentVersion != 1 {
+		t.Errorf("v2 version/parent: got %d/%d, want 2/1", p2.Version, p2.ParentVersion)
 	}
 	def2, _ := ms.GetPlan(ctx, "p", memory.DefaultPlanSlot)
-	if def2.Content != "v2" {
-		t.Errorf("upsert didn't replace: %q", def2.Content)
+	if def2.Content != "v2" || def2.Version != 2 {
+		t.Errorf("HEAD after v2: %+v", def2)
+	}
+
+	// Stale base (1, but HEAD=2) => ErrPlanConflict carrying HEAD.
+	_, err = ms.AppendPlanVersion(ctx, "p", "", "v3-stale", "carol", 1, false)
+	if !errors.Is(err, memory.ErrPlanConflict) {
+		t.Fatalf("stale base: want ErrPlanConflict, got %v", err)
+	}
+	var conflict *memory.PlanConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("conflict not *PlanConflictError: %v", err)
+	}
+	if conflict.Head == nil || conflict.Head.Version != 2 || conflict.Head.Content != "v2" {
+		t.Errorf("conflict HEAD: %+v", conflict.Head)
+	}
+
+	// Expect-new (base 0) against an existing plan also conflicts.
+	if _, err := ms.AppendPlanVersion(ctx, "p", "", "x", "carol", memory.NewPlanBaseVersion, false); !errors.Is(err, memory.ErrPlanConflict) {
+		t.Errorf("expect-new on existing: want ErrPlanConflict, got %v", err)
+	}
+
+	// force bypasses the check and appends HEAD+1.
+	p4, err := ms.AppendPlanVersion(ctx, "p", "", "forced", "carol", 0, true)
+	if err != nil {
+		t.Fatalf("forced append: %v", err)
+	}
+	if p4.Version != 3 {
+		t.Errorf("forced version: got %d, want 3", p4.Version)
+	}
+
+	// History: 3 versions for the default slot.
+	hist, err := ms.ListPlanVersions(ctx, "p", "")
+	if err != nil {
+		t.Fatalf("list versions: %v", err)
+	}
+	if len(hist) != 3 {
+		t.Fatalf("history len: got %d, want 3", len(hist))
+	}
+	if hist[0].Version != 1 || hist[2].Version != 3 {
+		t.Errorf("history order: %d..%d", hist[0].Version, hist[2].Version)
+	}
+
+	// GetPlanVersion returns a specific historical row.
+	gv, err := ms.GetPlanVersion(ctx, "p", "", 1)
+	if err != nil || gv.Content != "v1" {
+		t.Errorf("GetPlanVersion(1): %+v err=%v", gv, err)
 	}
 
 	// Named slot is independent.
-	if err := ms.PutPlan(ctx, &memory.Plan{Scope: "p", Name: "architecture", Content: "AAA"}); err != nil {
-		t.Fatalf("put named: %v", err)
+	if _, err := ms.AppendPlanVersion(ctx, "p", "architecture", "AAA", "", memory.NewPlanBaseVersion, false); err != nil {
+		t.Fatalf("append named: %v", err)
 	}
 	slots, err := ms.ListPlans(ctx, "p")
 	if err != nil {
@@ -136,9 +190,15 @@ func TestMemory_LearningsAppendAndSupersede(t *testing.T) {
 		t.Fatalf("create scope: %v", err)
 	}
 
-	l1 := &memory.Learning{ID: "L1", Scope: "p", Content: "typo: we use JWT validation"}
+	l1 := &memory.Learning{ID: "L1", Scope: "p", Content: "typo: we use JWT validation", Author: "alice"}
 	if err := ms.AppendLearning(ctx, l1); err != nil {
 		t.Fatalf("append l1: %v", err)
+	}
+	// Provenance: author round-trips (round-12B).
+	if got, err := ms.GetLearning(ctx, "L1"); err != nil {
+		t.Errorf("get L1: %v", err)
+	} else if got.Author != "alice" {
+		t.Errorf("learning author: got %q, want alice", got.Author)
 	}
 	l1ID := l1.ID
 	l2 := &memory.Learning{ID: "L2", Scope: "p", Content: "we use JWT", SupersedesID: &l1ID}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -40,6 +41,25 @@ func (a args) stringOr(k, fallback string) string {
 func (a args) bool(k string) bool {
 	v, _ := a.m[k].(bool)
 	return v
+}
+
+// int64Or extracts an integer arg. JSON numbers decode to float64, so we
+// coerce; a string-typed number is also tolerated (some hosts stringify
+// args). Returns fallback when the key is absent or unparseable.
+func (a args) int64Or(k string, fallback int64) int64 {
+	switch v := a.m[k].(type) {
+	case float64:
+		return int64(v)
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			return n
+		}
+	case string:
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
+			return n
+		}
+	}
+	return fallback
 }
 
 // scope returns the scope arg, falling back to the server's default
@@ -81,6 +101,10 @@ func schemaString(desc string) map[string]any {
 
 func schemaBool(desc string) map[string]any {
 	return map[string]any{"type": "boolean", "description": desc}
+}
+
+func schemaInt(desc string) map[string]any {
+	return map[string]any{"type": "integer", "description": desc}
 }
 
 // ----- scope resolution (matches adapter.deriveScope semantics) -----

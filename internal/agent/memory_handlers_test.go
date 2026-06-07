@@ -101,3 +101,78 @@ func TestDeleteScope_ReturnsConflictWithHasChildrenBody(t *testing.T) {
 		t.Errorf("expected errors.Is(err, memory.ErrScopeHasChildren); got %v", err)
 	}
 }
+
+// TestPlanWrite_OptimisticConcurrency exercises the round-12B plan
+// versioning contract through the daemon HTTP boundary:
+//   - first write (base 0) creates version 1
+//   - correct base (1) appends version 2
+//   - stale base (1, HEAD=2) => HTTP 409 with the current HEAD in the body,
+//     surfaced client-side as *PlanConflict / memory.ErrPlanConflict
+//   - --force bypasses the check
+//   - GetPlan returns HEAD + version; history lists every version
+func TestPlanWrite_OptimisticConcurrency(t *testing.T) {
+	d, srv := newTestDaemonForMemory(t)
+	t.Cleanup(func() { _ = d.store.Close() })
+	ctx := context.Background()
+
+	if err := d.store.Memory().UpdateScope(ctx, &memory.Scope{Path: "svc", Kind: memory.ScopeKindProject}); err != nil {
+		t.Fatalf("seed scope: %v", err)
+	}
+	c := NewClient(srv.URL, d.secret)
+
+	p1, err := c.PutPlan(ctx, "svc", "", "v1", memory.NewPlanBaseVersion, false)
+	if err != nil {
+		t.Fatalf("write v1: %v", err)
+	}
+	if p1.Version != 1 {
+		t.Fatalf("v1 version: got %d, want 1", p1.Version)
+	}
+
+	p2, err := c.PutPlan(ctx, "svc", "", "v2", 1, false)
+	if err != nil {
+		t.Fatalf("write v2: %v", err)
+	}
+	if p2.Version != 2 || p2.ParentVersion != 1 {
+		t.Fatalf("v2 version/parent: got %d/%d, want 2/1", p2.Version, p2.ParentVersion)
+	}
+
+	// Stale base: 409 carrying HEAD.
+	_, err = c.PutPlan(ctx, "svc", "", "v3-stale", 1, false)
+	if !errors.Is(err, memory.ErrPlanConflict) {
+		t.Fatalf("stale write: want ErrPlanConflict, got %v", err)
+	}
+	var conflict *PlanConflict
+	if !errors.As(err, &conflict) {
+		t.Fatalf("err not *PlanConflict: %v", err)
+	}
+	if conflict.Head == nil || conflict.Head.Version != 2 || conflict.Head.Content != "v2" {
+		t.Fatalf("409 body HEAD: %+v", conflict.Head)
+	}
+
+	// Force bypass.
+	p3, err := c.PutPlan(ctx, "svc", "", "forced", 0, true)
+	if err != nil {
+		t.Fatalf("forced write: %v", err)
+	}
+	if p3.Version != 3 {
+		t.Fatalf("forced version: got %d, want 3", p3.Version)
+	}
+
+	// GetPlan returns HEAD + version.
+	head, err := c.GetPlan(ctx, "svc", "")
+	if err != nil {
+		t.Fatalf("get HEAD: %v", err)
+	}
+	if head.Version != 3 || head.Content != "forced" {
+		t.Fatalf("HEAD: %+v", head)
+	}
+
+	// History via the client.
+	hist, err := c.ListPlanVersions(ctx, "svc", "")
+	if err != nil {
+		t.Fatalf("list versions: %v", err)
+	}
+	if len(hist) != 3 {
+		t.Fatalf("history len: got %d, want 3", len(hist))
+	}
+}

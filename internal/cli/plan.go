@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -9,6 +10,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/mattkorwel/resleeve/internal/agent"
+	"github.com/mattkorwel/resleeve/internal/memory"
 )
 
 func runPlan(ctx context.Context, args []string) int {
@@ -33,9 +37,9 @@ func runPlan(ctx context.Context, args []string) int {
 func runPlanWrite(ctx context.Context, args []string) int {
 	// Hand-rolled flag parsing so the order is flexible and trailing
 	// positional (the scope path) doesn't get eaten by Go's flag pkg.
-	scope, slot, content, file, editFlag, ok := parsePlanWriteArgs(args)
+	scope, slot, content, file, editFlag, force, ok := parsePlanWriteArgs(args)
 	if !ok {
-		fmt.Fprintln(os.Stderr, "usage: resleeve plan write <scope> [--slot N] [--content S | --file F | --edit]")
+		fmt.Fprintln(os.Stderr, "usage: resleeve plan write <scope> [--slot N] [--content S | --file F | --edit] [--force]")
 		fmt.Fprintln(os.Stderr, "       default: read content from stdin (the agent-driven case)")
 		return 2
 	}
@@ -50,20 +54,53 @@ func runPlanWrite(ctx context.Context, args []string) int {
 		fmt.Fprintln(os.Stderr, "plan write:", err)
 		return 1
 	}
-	_ = c
-	if _, err := c.PutPlan(ctx, scope, slot, body); err != nil {
+
+	// Read the current HEAD version and write against it (optimistic
+	// concurrency). A missing plan -> base_version 0 (expect-new).
+	// --force bypasses the check. round-12B.
+	base := memory.NewPlanBaseVersion
+	if !force {
+		if p, err := c.GetPlan(ctx, scope, slot); err == nil && p != nil {
+			base = p.Version
+		}
+	}
+	p, err := c.PutPlan(ctx, scope, slot, body, base, force)
+	if err != nil {
+		var conflict *agent.PlanConflict
+		if errors.As(err, &conflict) {
+			headV := int64(0)
+			if conflict.Head != nil {
+				headV = conflict.Head.Version
+			}
+			fmt.Fprintf(os.Stderr,
+				"plan write: conflict — %s [%s] was advanced to version %d since you last read it.\n"+
+					"Re-read with `resleeve plan read %s%s`, merge, and retry (or pass --force to overwrite).\n",
+				scope, slotOrDefault(slot), headV, scope, slotFlagSuffix(slot))
+			return 1
+		}
 		fmt.Fprintln(os.Stderr, "plan write:", err)
 		return 1
 	}
-	fmt.Printf("plan write: %s [%s] (%d bytes)\n", scope, slotOrDefault(slot), len(body))
+	fmt.Printf("plan write: %s [%s] version %d (%d bytes)\n", scope, slotOrDefault(slot), p.Version, len(body))
 	return 0
 }
 
-func parsePlanWriteArgs(args []string) (scope, slot, content, file string, editFlag bool, ok bool) {
+// slotFlagSuffix renders the " --slot N" suffix for help hints, empty for
+// the default slot.
+func slotFlagSuffix(slot string) string {
+	if slot == "" {
+		return ""
+	}
+	return " --slot " + slot
+}
+
+func parsePlanWriteArgs(args []string) (scope, slot, content, file string, editFlag, force, ok bool) {
 	var positional []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
+		case a == "--force":
+			force = true
 		case a == "--slot":
 			if i+1 >= len(args) {
 				return
@@ -204,6 +241,10 @@ func runPlanRead(ctx context.Context, args []string) int {
 		fmt.Fprintln(os.Stderr, "plan read:", err)
 		return 1
 	}
+	// Version goes to stderr so stdout stays pure content (pipe-friendly,
+	// and re-feedable to `plan write`). round-12B: the printed version is
+	// what a caller passes back as --base / base_version on the next write.
+	fmt.Fprintf(os.Stderr, "# plan %s [%s] version %d\n", scope, slotOrDefault(*slot), p.Version)
 	fmt.Print(p.Content)
 	if !strings.HasSuffix(p.Content, "\n") {
 		fmt.Println()

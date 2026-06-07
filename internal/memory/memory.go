@@ -9,6 +9,7 @@ package memory
 
 import (
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -53,23 +54,36 @@ type Scope struct {
 // CLI / API caller doesn't specify one.
 const DefaultPlanSlot = "_default"
 
-// Plan is a named slot of markdown content attached to a scope.
-// (scope, name) is the storage primary key.
+// Plan is a named slot of markdown content attached to a scope. As of
+// round-12B plans are append-only: each write appends an immutable
+// version and reads materialize HEAD (the max-version row). A Plan value
+// represents one version row — a GetPlan returns HEAD, GetPlanVersion
+// returns a specific one.
+//
+// (scope, name, version) is the storage primary key. Version is 1-based
+// and monotonic per (scope, name); ParentVersion is the version this one
+// was derived from (0 for the first write). Author is the user that
+// recorded the version (empty = unknown / local daemon).
 type Plan struct {
-	Scope     string    `json:"scope"`
-	Name      string    `json:"name"` // DefaultPlanSlot for the conventional one
-	Content   string    `json:"content"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Scope         string    `json:"scope"`
+	Name          string    `json:"name"` // DefaultPlanSlot for the conventional one
+	Version       int64     `json:"version"`
+	Content       string    `json:"content"`
+	Author        string    `json:"author_user_id,omitempty"`
+	ParentVersion int64     `json:"parent_version"`
+	UpdatedAt     time.Time `json:"updated_at"` // = the version's created_at
 }
 
 // Learning is one append-only log entry on a scope. SupersedesID may
 // point at a prior learning this one corrects; the prior entry stays
-// in storage but is hidden from default reads.
+// in storage but is hidden from default reads. Author is the user that
+// contributed the learning (round-12B provenance; empty = unknown/local).
 type Learning struct {
 	ID           string    `json:"id"`
 	Scope        string    `json:"scope"`
 	Content      string    `json:"content"`
 	SupersedesID *string   `json:"supersedes_id,omitempty"`
+	Author       string    `json:"author_user_id,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 }
 
@@ -85,3 +99,42 @@ var (
 	// ErrEmptyPath is returned when an operation receives an empty path.
 	ErrEmptyPath = errors.New("memory: empty scope path")
 )
+
+// NewPlanBaseVersion is the base_version a caller passes when it expects
+// no existing plan (a first write). The append rejects it with
+// ErrPlanConflict if a HEAD already exists (unless force is used).
+const NewPlanBaseVersion int64 = 0
+
+// PlanConflictError is the typed optimistic-concurrency failure returned
+// by AppendPlanVersion when the supplied base_version does not match the
+// current HEAD version. It carries the current HEAD (version + content)
+// so the caller has everything needed to reconcile (re-render against
+// HEAD and retry) without a second round-trip. This *is* the
+// reconciliation signal — see docs/design/round-12/01-plan-versioning-slice.md.
+type PlanConflictError struct {
+	Scope string
+	Name  string
+	// Head is the current materialized HEAD the write lost the race to.
+	// nil only in the degenerate "expected-new but a plan exists" case
+	// where the conflict is reported with the existing HEAD populated.
+	Head *Plan
+}
+
+func (e *PlanConflictError) Error() string {
+	head := int64(0)
+	if e.Head != nil {
+		head = e.Head.Version
+	}
+	return fmt.Sprintf("memory: plan %s/%s conflict: current HEAD is version %d", e.Scope, e.Name, head)
+}
+
+// ErrPlanConflict is the sentinel that every PlanConflictError matches
+// under errors.Is, so callers can branch with
+// `errors.Is(err, memory.ErrPlanConflict)` and then type-assert to
+// *PlanConflictError to read the carried HEAD.
+var ErrPlanConflict = errors.New("memory: plan version conflict")
+
+// Is lets errors.Is(err, ErrPlanConflict) match any *PlanConflictError.
+func (e *PlanConflictError) Is(target error) bool {
+	return target == ErrPlanConflict
+}

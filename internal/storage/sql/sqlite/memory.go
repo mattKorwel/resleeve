@@ -144,24 +144,68 @@ func scanScope(row scanner) (*memory.Scope, error) {
 	return &sc, nil
 }
 
-// --- plans ---
+// --- plans (append-only versions; HEAD = max version) ---
 
-func (s *memoryStore) PutPlan(ctx context.Context, p *memory.Plan) error {
-	if p.Scope == "" {
-		return memory.ErrEmptyPath
+// AppendPlanVersion appends an immutable plan version with optimistic
+// concurrency. See the MemoryStore interface doc for the base-version /
+// force contract. The HEAD read + the insert run inside a single
+// transaction so two concurrent appends can't both observe the same HEAD
+// and write the same version number (the PK on (scope, name, version)
+// is the backstop, the tx is the correctness primitive).
+func (s *memoryStore) AppendPlanVersion(ctx context.Context, scope, name, content, author string, baseVersion int64, force bool) (*memory.Plan, error) {
+	if scope == "" {
+		return nil, memory.ErrEmptyPath
 	}
-	if p.Name == "" {
-		p.Name = memory.DefaultPlanSlot
+	if name == "" {
+		name = memory.DefaultPlanSlot
 	}
-	p.UpdatedAt = time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `INSERT INTO plans (scope, name, content, updated_at)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT(scope, name) DO UPDATE SET
-			content = excluded.content,
-			updated_at = excluded.updated_at`,
-		p.Scope, p.Name, p.Content, p.UpdatedAt.Format(time.RFC3339Nano),
-	)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	head, err := scanPlan(tx.QueryRowContext(ctx,
+		`SELECT scope, name, version, content, author_user_id, parent_version, created_at
+			FROM plan_versions WHERE scope = ? AND name = ?
+			ORDER BY version DESC LIMIT 1`, scope, name))
+	if err != nil && !errors.Is(err, rsql.ErrNotFound) {
+		return nil, err
+	}
+	headVersion := int64(0)
+	if head != nil {
+		headVersion = head.Version
+	}
+
+	if !force && baseVersion != headVersion {
+		// Stale (or expected-new against an existing plan): surface the
+		// current HEAD so the caller can reconcile.
+		return nil, &memory.PlanConflictError{Scope: scope, Name: name, Head: head}
+	}
+
+	next := headVersion + 1
+	now := time.Now().UTC()
+	parent := headVersion // parent of the appended row is the version it built on
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO plan_versions
+			(scope, name, version, content, author_user_id, parent_version, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		scope, name, next, content, author, parent, now.Format(time.RFC3339Nano),
+	); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &memory.Plan{
+		Scope:         scope,
+		Name:          name,
+		Version:       next,
+		Content:       content,
+		Author:        author,
+		ParentVersion: parent,
+		UpdatedAt:     now,
+	}, nil
 }
 
 func (s *memoryStore) GetPlan(ctx context.Context, scope, slot string) (*memory.Plan, error) {
@@ -169,15 +213,58 @@ func (s *memoryStore) GetPlan(ctx context.Context, scope, slot string) (*memory.
 		slot = memory.DefaultPlanSlot
 	}
 	row := s.db.QueryRowContext(ctx,
-		`SELECT scope, name, content, updated_at FROM plans WHERE scope = ? AND name = ?`,
+		`SELECT scope, name, version, content, author_user_id, parent_version, created_at
+			FROM plan_versions WHERE scope = ? AND name = ?
+			ORDER BY version DESC LIMIT 1`,
 		scope, slot)
 	return scanPlan(row)
 }
 
+func (s *memoryStore) GetPlanVersion(ctx context.Context, scope, slot string, version int64) (*memory.Plan, error) {
+	if slot == "" {
+		slot = memory.DefaultPlanSlot
+	}
+	row := s.db.QueryRowContext(ctx,
+		`SELECT scope, name, version, content, author_user_id, parent_version, created_at
+			FROM plan_versions WHERE scope = ? AND name = ? AND version = ?`,
+		scope, slot, version)
+	return scanPlan(row)
+}
+
+// ListPlans returns the HEAD of every slot at scope (one row per name).
 func (s *memoryStore) ListPlans(ctx context.Context, scope string) ([]*memory.Plan, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT scope, name, content, updated_at FROM plans WHERE scope = ? ORDER BY name`,
-		scope)
+		`SELECT pv.scope, pv.name, pv.version, pv.content, pv.author_user_id, pv.parent_version, pv.created_at
+			FROM plan_versions pv
+			JOIN (SELECT name, MAX(version) AS v FROM plan_versions WHERE scope = ? GROUP BY name) h
+			  ON pv.name = h.name AND pv.version = h.v
+			WHERE pv.scope = ?
+			ORDER BY pv.name`,
+		scope, scope)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*memory.Plan
+	for rows.Next() {
+		p, err := scanPlan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ListPlanVersions returns the full version history of one slot, oldest first.
+func (s *memoryStore) ListPlanVersions(ctx context.Context, scope, slot string) ([]*memory.Plan, error) {
+	if slot == "" {
+		slot = memory.DefaultPlanSlot
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT scope, name, version, content, author_user_id, parent_version, created_at
+			FROM plan_versions WHERE scope = ? AND name = ? ORDER BY version ASC`,
+		scope, slot)
 	if err != nil {
 		return nil, err
 	}
@@ -197,20 +284,20 @@ func (s *memoryStore) DeletePlan(ctx context.Context, scope, slot string) error 
 	if slot == "" {
 		slot = memory.DefaultPlanSlot
 	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM plans WHERE scope = ? AND name = ?`, scope, slot)
+	_, err := s.db.ExecContext(ctx, `DELETE FROM plan_versions WHERE scope = ? AND name = ?`, scope, slot)
 	return err
 }
 
 func scanPlan(row scanner) (*memory.Plan, error) {
 	var p memory.Plan
-	var updatedAt string
-	if err := row.Scan(&p.Scope, &p.Name, &p.Content, &updatedAt); err != nil {
+	var createdAt string
+	if err := row.Scan(&p.Scope, &p.Name, &p.Version, &p.Content, &p.Author, &p.ParentVersion, &createdAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, rsql.ErrNotFound
 		}
 		return nil, err
 	}
-	if t, err := time.Parse(time.RFC3339Nano, updatedAt); err == nil {
+	if t, err := time.Parse(time.RFC3339Nano, createdAt); err == nil {
 		p.UpdatedAt = t
 	}
 	return &p, nil
@@ -232,29 +319,29 @@ func (s *memoryStore) AppendLearning(ctx context.Context, l *memory.Learning) er
 	if l.SupersedesID != nil {
 		supersedes = sql.NullString{Valid: true, String: *l.SupersedesID}
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO learnings (id, scope, content, supersedes_id, created_at)
-		VALUES (?, ?, ?, ?, ?)`,
-		l.ID, l.Scope, l.Content, supersedes, l.CreatedAt.Format(time.RFC3339Nano),
+	_, err := s.db.ExecContext(ctx, `INSERT INTO learnings (id, scope, content, supersedes_id, author_user_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		l.ID, l.Scope, l.Content, supersedes, l.Author, l.CreatedAt.Format(time.RFC3339Nano),
 	)
 	return err
 }
 
 func (s *memoryStore) GetLearning(ctx context.Context, id string) (*memory.Learning, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, scope, content, supersedes_id, created_at FROM learnings WHERE id = ?`, id)
+		`SELECT id, scope, content, supersedes_id, author_user_id, created_at FROM learnings WHERE id = ?`, id)
 	return scanLearning(row)
 }
 
 func (s *memoryStore) ListLearnings(ctx context.Context, scope string, includeSuperseded bool) ([]*memory.Learning, error) {
 	var q string
 	if includeSuperseded {
-		q = `SELECT id, scope, content, supersedes_id, created_at
+		q = `SELECT id, scope, content, supersedes_id, author_user_id, created_at
 			FROM learnings WHERE scope = ?
 			ORDER BY created_at ASC`
 	} else {
 		// Hide rows that have been superseded by another learning. A learning
 		// is "superseded" when some other row has supersedes_id = this.id.
-		q = `SELECT l1.id, l1.scope, l1.content, l1.supersedes_id, l1.created_at
+		q = `SELECT l1.id, l1.scope, l1.content, l1.supersedes_id, l1.author_user_id, l1.created_at
 			FROM learnings l1
 			WHERE l1.scope = ?
 			  AND NOT EXISTS (
@@ -282,7 +369,7 @@ func scanLearning(row scanner) (*memory.Learning, error) {
 	var l memory.Learning
 	var supersedes sql.NullString
 	var createdAt string
-	if err := row.Scan(&l.ID, &l.Scope, &l.Content, &supersedes, &createdAt); err != nil {
+	if err := row.Scan(&l.ID, &l.Scope, &l.Content, &supersedes, &l.Author, &createdAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, rsql.ErrNotFound
 		}
