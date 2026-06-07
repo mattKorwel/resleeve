@@ -66,15 +66,12 @@ Platform support: macOS, Linux, and Windows are CI-tested every PR. Platform-spe
 - [Security review](docs/REVIEW_SECURITY.md) · [Code quality review](docs/REVIEW_QUALITY.md) — read-only audits
 - [Releasing](docs/RELEASING.md) · [Smoke tests](docs/SMOKE.md) · [Changelog](docs/CHANGELOG.md)
 
-## Project status
-
-Pre-1.0, self-hosted, single Go binary. Four CLI adapters ship today: **Claude Code**, **Codex**, and **opencode** with full capture + native resume, and **Antigravity** (experimental) with capture + prime resume. Multi-tenant team mode — per-user "brains", shared brains, and key-based auth — is in active development (design: [docs/design/round-11](docs/design/round-11/)).
-
-See the [security review](docs/REVIEW_SECURITY.md) and [code quality review](docs/REVIEW_QUALITY.md) for the audit floor.
-
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Shortest path: read [AGENTS.md](AGENTS.md) and the [architecture doc](docs/ARCHITECTURE.md), pick an open item from the [quality](docs/REVIEW_QUALITY.md) or [security](docs/REVIEW_SECURITY.md) review, and open a PR. Security issues: [SECURITY.md](SECURITY.md).
+- Read [AGENTS.md](AGENTS.md) and the [architecture doc](docs/ARCHITECTURE.md)
+- Pick an open item from the [quality](docs/REVIEW_QUALITY.md) or [security](docs/REVIEW_SECURITY.md) review
+- Open a PR — see [CONTRIBUTING.md](CONTRIBUTING.md)
+- Report security issues via [SECURITY.md](SECURITY.md)
 
 ## License
 
