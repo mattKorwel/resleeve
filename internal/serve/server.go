@@ -56,23 +56,36 @@ type Config struct {
 	ServeMeta rsql.ServeMetaStore
 	// Brains + Memberships are the round-11 multi-tenant foundation.
 	// When both are set, register auto-provisions a personal brain (and
-	// the registering user's membership of it). Keyspace partitioning and
-	// authz that consume these land in later slices. When nil, register
-	// still succeeds but provisions no brain (legacy single-user mode).
+	// the registering user's membership of it), and (unless SingleTenant
+	// is set) /v2/sync/* partitions the keyspace by brain + enforces read
+	// authz — see internal/serve/tenancy.go and
+	// docs/design/round-11/04-keyspace-authz-slice.md. When nil, register
+	// still succeeds but provisions no brain (legacy single-user mode), and
+	// sync stays content-blind regardless of SingleTenant.
 	Brains      rsql.BrainStore
 	Memberships rsql.MembershipStore
+	// SingleTenant is the --single-tenant escape hatch for solo
+	// self-hosters (tiers 1–2). When true, /v2/sync/* keeps the legacy
+	// content-blind behavior: NO brain prefixing, and the legacy no-user
+	// bearer (AuthToken) is accepted. When false (the multi-tenant default)
+	// AND the brain stores are wired, sync routes prefix the keyspace by
+	// the caller's brain and reject the legacy no-user bearer (closing the
+	// cross-tenant hole). With the brain stores unset, the server is
+	// content-blind regardless — there is no tenant to resolve.
+	SingleTenant bool
 }
 
 // Server is the HTTP handler exposed at /v2/sync/* and /v2/auth/*.
 type Server struct {
-	mux         *http.ServeMux
-	backend     rsync.Backend
-	authToken   string
-	serverUsers rsql.ServerUserStore
-	devices     rsql.DeviceStore
-	pairings    rsql.PairingStore
-	brains      rsql.BrainStore
-	memberships rsql.MembershipStore
+	mux          *http.ServeMux
+	backend      rsync.Backend
+	authToken    string
+	serverUsers  rsql.ServerUserStore
+	devices      rsql.DeviceStore
+	pairings     rsql.PairingStore
+	brains       rsql.BrainStore
+	memberships  rsql.MembershipStore
+	singleTenant bool
 
 	// loginChallengeKey is a persisted random secret used to derive
 	// synthetic Argon2id salts for unknown-email login-challenge requests
@@ -165,6 +178,7 @@ func New(cfg Config) (*Server, error) {
 		pairings:          cfg.Pairings,
 		brains:            cfg.Brains,
 		memberships:       cfg.Memberships,
+		singleTenant:      cfg.SingleTenant,
 		loginChallengeKey: challengeKey,
 		loginTimingDecoy:  timingDecoy,
 		sseSubscribers:    map[chan PushRow]struct{}{},
@@ -179,9 +193,22 @@ func New(cfg Config) (*Server, error) {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v2/sync/health", s.handleHealth)
-	s.mux.HandleFunc("POST /v2/sync/push", s.requireAuth(s.handlePush))
-	s.mux.HandleFunc("GET /v2/sync/pull", s.requireAuth(s.handlePull))
-	s.mux.HandleFunc("GET /v2/sync/sse", s.requireAuth(s.handleSSE))
+	if s.multiTenant() {
+		// Multi-tenant: requireBrain rejects the legacy no-user bearer and
+		// resolves the acting brain, which the handlers use to prefix
+		// (push) / scope+strip (pull/SSE) the keyspace. See tenancy.go.
+		s.mux.HandleFunc("POST /v2/sync/push", s.requireBrain(s.handlePush))
+		s.mux.HandleFunc("GET /v2/sync/pull", s.requireBrain(s.handlePull))
+		s.mux.HandleFunc("GET /v2/sync/sse", s.requireBrain(s.handleSSE))
+		return
+	}
+	// Single-tenant (or no brain stores): legacy content-blind behavior.
+	// requireAuth accepts the legacy no-user bearer; handlers run with an
+	// empty brain, which the brainKey/brainPrefix helpers treat as "no
+	// prefix" — the on-disk keyspace is exactly the pre-slice-2 layout.
+	s.mux.HandleFunc("POST /v2/sync/push", s.requireAuth(s.handlePushBrain("")))
+	s.mux.HandleFunc("GET /v2/sync/pull", s.requireAuth(s.handlePullBrain("")))
+	s.mux.HandleFunc("GET /v2/sync/sse", s.requireAuth(s.handleSSEBrain("")))
 }
 
 // ServeHTTP makes *Server an http.Handler.
@@ -230,7 +257,19 @@ type PushResp struct {
 	Committed []string `json:"committed"`
 }
 
-func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
+// handlePushBrain adapts handlePush to the requireAuth middleware
+// (single-tenant route), binding a fixed brainID ("" = no prefixing).
+func (s *Server) handlePushBrain(brainID string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) { s.handlePush(w, r, brainID) }
+}
+
+// handlePush stores a push batch under the caller's brain. The client
+// sends kind-scoped keys (`sessions/<id>`); after the sec-M2 prefix gate
+// validates the client key, the server prepends `<brain_id>/` so the blob
+// lands in the caller's storage namespace. The client never supplies (nor
+// learns) the brain segment — the committed keys echoed back are the
+// original client keys. brainID == "" (single-tenant) stores flat.
+func (s *Server) handlePush(w http.ResponseWriter, r *http.Request, brainID string) {
 	defer r.Body.Close()
 	var req PushReq
 	dec := json.NewDecoder(r.Body)
@@ -247,14 +286,16 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	for _, row := range req.Batch {
 		// sec-M2: gate the key prefix so a misbehaving or compromised
 		// client can't write blobs under arbitrary prefixes (disk fill /
-		// blob smuggling). The three allowed prefixes mirror the wire
-		// kinds validated by validateKind on the pull/SSE side; keep them
-		// in sync if a new kind ships.
+		// blob smuggling). The gate runs on the CLIENT key (before the
+		// brain prefix is applied) so the three allowed prefixes still
+		// mirror the wire kinds validated by validateKind on the pull/SSE
+		// side; keep them in sync if a new kind ships.
 		if !isAllowedPushKey(row.Key) {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("rejected key %q: must start with sessions/, events/, or memory/", row.Key))
 			return
 		}
-		if err := s.backend.Put(r.Context(), row.Key, row.Blob); err != nil {
+		storageKey := brainKey(brainID, row.Key)
+		if err := s.backend.Put(r.Context(), storageKey, row.Blob); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("put %q: %v", row.Key, err))
 			return
 		}
@@ -263,9 +304,11 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		// subscribers. Backend.Put has already persisted; SSE is just
 		// the low-latency notification path. Slow subscribers (full
 		// buffer) silently drop — they'll catch up on reconnect via
-		// the backlog replay window.
+		// the backlog replay window. We fan out the STORAGE key (brain-
+		// prefixed) so subscribers can filter to their own brain; each
+		// SSE subscriber strips its own brain prefix before emitting.
 		if strings.HasPrefix(row.Key, "memory/") {
-			s.fanoutMemory(row)
+			s.fanoutMemory(PushRow{Key: storageKey, Blob: row.Blob})
 		}
 	}
 	writeJSON(w, http.StatusOK, PushResp{Committed: committed})
@@ -289,7 +332,20 @@ type PullResp struct {
 	NextCursor string    `json:"next_cursor,omitempty"`
 }
 
-func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
+// handlePullBrain adapts handlePull to the requireAuth middleware
+// (single-tenant route), binding a fixed brainID ("" = no prefixing).
+func (s *Server) handlePullBrain(brainID string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) { s.handlePull(w, r, brainID) }
+}
+
+// handlePull serves rows under the caller's brain only. The List prefix is
+// `<brain_id>/<kind>`, so a user never sees another brain's rows (read
+// authz falls out of the prefix scoping). The client's `since` cursor and
+// the returned keys are in the UNCHANGED kind-scoped keyspace: we re-prefix
+// the cursor into the brain namespace before listing, then strip the brain
+// prefix off every returned key (and the next cursor) so the wire protocol
+// is identical to single-tenant. brainID == "" lists the flat keyspace.
+func (s *Server) handlePull(w http.ResponseWriter, r *http.Request, brainID string) {
 	q := r.URL.Query()
 	kind := q.Get("kind")
 	if kind == "" {
@@ -300,37 +356,67 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// The client cursor is a kind-scoped key; promote it into the brain
+	// namespace so the backend's lexicographic cursor stays correct under
+	// the prefix. An empty cursor stays empty (first page).
 	since := q.Get("since")
+	if since != "" {
+		since = brainKey(brainID, since)
+	}
 	limit := parseLimit(q.Get("limit"), 100)
 
-	keys, next, err := s.backend.List(r.Context(), kind, since, limit)
+	keys, next, err := s.backend.List(r.Context(), brainPrefix(brainID, kind), since, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("list: %v", err))
 		return
 	}
 	rows := make([]PushRow, 0, len(keys))
 	for _, k := range keys {
+		clientKey, ok := stripBrainPrefix(brainID, k)
+		if !ok {
+			// Defense-in-depth: List is already prefix-scoped, so a key
+			// without our brain prefix should be impossible. Drop it
+			// rather than risk leaking another brain's row to the client.
+			continue
+		}
 		blob, err := s.backend.Get(r.Context(), k)
 		if err != nil {
 			// A key that listed but failed to Get is a backend bug;
 			// surface but continue so partial pagination still works.
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("get %q: %v", k, err))
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("get %q: %v", clientKey, err))
 			return
 		}
-		rows = append(rows, PushRow{Key: k, Blob: blob})
+		rows = append(rows, PushRow{Key: clientKey, Blob: blob})
+	}
+	// Strip the brain prefix off the next cursor too, so the client stores
+	// (and re-sends) a kind-scoped cursor — never a brain-aware one.
+	if next != "" {
+		if stripped, ok := stripBrainPrefix(brainID, next); ok {
+			next = stripped
+		}
 	}
 	writeJSON(w, http.StatusOK, PullResp{Rows: rows, NextCursor: next})
 }
 
-// handleSSE serves GET /v2/sync/sse?kind=memory[&since=<cursor>].
-// It first replays the memory backlog strictly after `since`, then
-// subscribes to live pushes. Emits a heartbeat (":\n\n") every 15s
-// to keep proxies from closing the idle connection.
+// handleSSEBrain adapts handleSSE to the requireAuth middleware
+// (single-tenant route), binding a fixed brainID ("" = no prefixing).
+func (s *Server) handleSSEBrain(brainID string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) { s.handleSSE(w, r, brainID) }
+}
+
+// handleSSE serves GET /v2/sync/sse?kind=memory[&since=<cursor>] scoped to
+// the caller's brain. It first replays the brain's memory backlog strictly
+// after `since`, then subscribes to live pushes — dropping any live event
+// whose storage key isn't under this brain's prefix (the fan-out is global;
+// each subscriber filters to its own brain). Both backlog and live keys are
+// stripped of the brain prefix before emission, so the wire format is
+// unchanged. Emits a heartbeat (":\n\n") every 15s to keep proxies from
+// closing the idle connection.
 //
 // Wire format: each event is one SSE data frame whose body is the JSON
 // encoding of a PushRow ({"key":..., "blob":<base64>}). Heartbeats are
 // SSE comments (a leading ":") and the client ignores them.
-func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request, brainID string) {
 	q := r.URL.Query()
 	kind := q.Get("kind")
 	if kind != "memory" {
@@ -363,20 +449,30 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	// Backlog replay: ship every memory row strictly after `since`.
-	// Paginates internally via List's cursor semantics.
+	// Paginates internally via List's cursor semantics. The client cursor
+	// is kind-scoped; promote it into the brain namespace for List, emit
+	// keys with the brain prefix stripped.
 	since := q.Get("since")
+	if since != "" {
+		since = brainKey(brainID, since)
+	}
+	memPrefix := brainPrefix(brainID, "memory")
 	for {
-		keys, next, err := s.backend.List(r.Context(), "memory", since, 500)
+		keys, next, err := s.backend.List(r.Context(), memPrefix, since, 500)
 		if err != nil {
 			// Connection's already 200; can't change status. Just close.
 			return
 		}
 		for _, k := range keys {
+			clientKey, ok := stripBrainPrefix(brainID, k)
+			if !ok {
+				continue
+			}
 			blob, err := s.backend.Get(r.Context(), k)
 			if err != nil {
 				continue
 			}
-			if err := writeSSEEvent(w, PushRow{Key: k, Blob: blob}); err != nil {
+			if err := writeSSEEvent(w, PushRow{Key: clientKey, Blob: blob}); err != nil {
 				return
 			}
 			since = k
@@ -400,7 +496,14 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			}
 			flusher.Flush()
 		case row := <-ch:
-			if err := writeSSEEvent(w, row); err != nil {
+			// The fan-out is global and carries STORAGE keys (brain-
+			// prefixed). Drop events for other brains; strip our prefix
+			// off our own before emitting so the wire key stays kind-scoped.
+			clientKey, ok := stripBrainPrefix(brainID, row.Key)
+			if !ok {
+				continue
+			}
+			if err := writeSSEEvent(w, PushRow{Key: clientKey, Blob: row.Blob}); err != nil {
 				return
 			}
 			flusher.Flush()

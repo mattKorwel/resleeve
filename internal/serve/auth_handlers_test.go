@@ -51,6 +51,44 @@ func newIdentityServer(t *testing.T) (*httptest.Server, string, *sqlite.Store) {
 	return ts, ts.URL, store
 }
 
+// newSingleTenantIdentityServer mirrors newIdentityServer but runs with
+// SingleTenant=true — the solo self-hoster escape hatch. The legacy
+// no-user bearer stays valid on /v2/sync/* and no brain prefixing is
+// applied. Used by the round-11a slice-2 tests that assert single-tenant
+// preserves the pre-slice behavior.
+func newSingleTenantIdentityServer(t *testing.T) (*httptest.Server, string, *sqlite.Store) {
+	t.Helper()
+	backend, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("local.New: %v", err)
+	}
+	dsn := "file:" + t.TempDir() + "/id.db?_pragma=journal_mode=WAL&_pragma=foreign_keys=on"
+	store, err := sqlite.Open(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	s, err := New(Config{
+		Backend:      backend,
+		AuthToken:    testToken,
+		ServerUsers:  store.ServerUsers(),
+		Devices:      store.Devices(),
+		Pairings:     store.Pairings(),
+		ServeMeta:    store.ServeMeta(),
+		Brains:       store.Brains(),
+		Memberships:  store.Memberships(),
+		SingleTenant: true,
+	})
+	if err != nil {
+		t.Fatalf("serve.New: %v", err)
+	}
+	ts := httptest.NewServer(s)
+	t.Cleanup(func() {
+		ts.Close()
+		_ = store.Close()
+	})
+	return ts, ts.URL, store
+}
+
 // newIdentityServerOnStore builds an httptest.Server like newIdentityServer
 // but reuses an existing sqlite.Store + local backend dir (sec-M1 test
 // needs two Server instances that share the same persisted serve_meta
@@ -396,11 +434,23 @@ func TestRegister_AcceptsRoundTwoTenBaseline(t *testing.T) {
 	}
 }
 
-func TestSync_LegacyBearerStillWorks(t *testing.T) {
-	// Migration overlap: register a user, but the existing legacy bearer
-	// must keep authenticating /v2/sync/* calls until operators rotate
-	// devices to per-device tokens.
+// TestSync_LegacyBearerRejectedMultiTenant asserts the round-11a slice-2
+// cross-tenant fix: in multi-tenant mode (the default once brain stores are
+// wired) the legacy no-user bearer can no longer authenticate /v2/sync/*.
+// It resolves to a synthetic device with UserID="" which cannot be mapped
+// to a tenant, so requireBrain 403s it. (In --single-tenant mode it still
+// works — see TestSync_LegacyBearerAcceptedSingleTenant.)
+func TestSync_LegacyBearerRejectedMultiTenant(t *testing.T) {
 	_, base, _ := newIdentityServer(t)
+	postStatus(t, base+"/v2/sync/push", testToken,
+		PushReq{Batch: []PushRow{{Key: "sessions/legacy", Blob: []byte("b")}}}, 403)
+}
+
+// TestSync_LegacyBearerAcceptedSingleTenant is the escape-hatch companion:
+// with --single-tenant the legacy bearer keeps working on /v2/sync/* (no
+// brain prefixing, content-blind) for solo self-hosters.
+func TestSync_LegacyBearerAcceptedSingleTenant(t *testing.T) {
+	_, base, _ := newSingleTenantIdentityServer(t)
 	postStatus(t, base+"/v2/sync/push", testToken,
 		PushReq{Batch: []PushRow{{Key: "sessions/legacy", Blob: []byte("b")}}}, 200)
 }
@@ -418,12 +468,12 @@ func TestPairPublish_RejectsLegacyBearerWithEmptyUID(t *testing.T) {
 	}, 401)
 }
 
-// TestSyncPush_StillAcceptsLegacyBearer is the regression companion:
-// the sec-H3 guard must NOT bleed into content-blind sync endpoints.
-// Legacy bearer + /v2/sync/push remains 200 until operators rotate
-// devices.
-func TestSyncPush_StillAcceptsLegacyBearer(t *testing.T) {
-	_, base, _ := newIdentityServer(t)
+// TestSyncPush_LegacyBearerAcceptedSingleTenant is the regression
+// companion: in --single-tenant mode the legacy bearer + /v2/sync/push
+// stays 200 (content-blind). The multi-tenant rejection is covered by
+// TestSync_LegacyBearerRejectedMultiTenant.
+func TestSyncPush_LegacyBearerAcceptedSingleTenant(t *testing.T) {
+	_, base, _ := newSingleTenantIdentityServer(t)
 	postStatus(t, base+"/v2/sync/push", testToken,
 		PushReq{Batch: []PushRow{{Key: "sessions/regression", Blob: []byte("b")}}}, 200)
 }
