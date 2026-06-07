@@ -46,6 +46,15 @@ type SyncClient struct {
 	httpc    *http.Client
 	sseHTTPc *http.Client // separate client; no timeout (long-lived stream)
 
+	// brainMu guards brain — the globally-selected "active brain" id. When
+	// non-empty, push/pull/SSE append ?brain=<id> so this machine syncs
+	// into a chosen SHARED brain instead of the user's personal brain.
+	// Empty = personal brain (server default). Set at construction from
+	// the persisted active-brain config and mutable at runtime via
+	// SetActiveBrain (round-11b GLOBAL selection; per-scope routing later).
+	brainMu sync.RWMutex
+	brain   string
+
 	drainInterval time.Duration
 	pullInterval  time.Duration
 	batchSize     int
@@ -145,6 +154,33 @@ func (s *SyncClient) getSealer() auth.Sealer {
 	s.sealerMu.RLock()
 	defer s.sealerMu.RUnlock()
 	return s.sealer
+}
+
+// SetActiveBrain sets (or clears, with "") the active brain id appended
+// as ?brain=<id> on every upstream push/pull/SSE call. Concurrent-safe;
+// the loops re-sample it on each request so a `resleeve brain use` change
+// takes effect on the next cycle without a daemon restart.
+func (s *SyncClient) SetActiveBrain(brainID string) {
+	s.brainMu.Lock()
+	s.brain = strings.TrimSpace(brainID)
+	s.brainMu.Unlock()
+}
+
+// ActiveBrain returns the currently-selected active brain id ("" =
+// personal brain / server default).
+func (s *SyncClient) ActiveBrain() string {
+	s.brainMu.RLock()
+	defer s.brainMu.RUnlock()
+	return s.brain
+}
+
+// brainQuery returns "&brain=<id>" when an active brain is set, else "".
+// Callers build their base query first, then append this.
+func (s *SyncClient) brainQuery() string {
+	if b := s.ActiveBrain(); b != "" {
+		return "&brain=" + url.QueryEscape(b)
+	}
+	return ""
 }
 
 // NewSyncClientWithSealer is NewSyncClient plus a Sealer that wraps
@@ -363,7 +399,12 @@ func (s *SyncClient) drainOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("marshal push: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", s.upstream+"/v2/sync/push", bytes.NewReader(body))
+	pushURL := s.upstream + "/v2/sync/push"
+	if bq := s.brainQuery(); bq != "" {
+		// Strip the leading '&' since this URL has no prior query.
+		pushURL += "?" + strings.TrimPrefix(bq, "&")
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", pushURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -470,8 +511,8 @@ func (s *SyncClient) pullKind(ctx context.Context, kind string) (int, error) {
 	}
 	ingested := 0
 	for {
-		u := fmt.Sprintf("%s/v2/sync/pull?kind=%s&since=%s&limit=500",
-			s.upstream, kind, url.QueryEscape(cursor))
+		u := fmt.Sprintf("%s/v2/sync/pull?kind=%s&since=%s&limit=500%s",
+			s.upstream, kind, url.QueryEscape(cursor), s.brainQuery())
 		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 		if err != nil {
 			return ingested, err
@@ -732,8 +773,8 @@ func (s *SyncClient) runSSE(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("get cursor: %w", err)
 	}
-	u := fmt.Sprintf("%s/v2/sync/sse?kind=memory&since=%s",
-		s.upstream, url.QueryEscape(cursor))
+	u := fmt.Sprintf("%s/v2/sync/sse?kind=memory&since=%s%s",
+		s.upstream, url.QueryEscape(cursor), s.brainQuery())
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return err

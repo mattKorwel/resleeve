@@ -30,10 +30,12 @@ func runServe(ctx context.Context, args []string) int {
 		token   string
 	)
 	var dsn string
+	var singleTenant bool
 	fs.StringVar(&addr, "addr", "127.0.0.1:7860", "listen address")
 	fs.StringVar(&root, "root", "", "blob storage root (default: ~/.local/share/resleeve/serve)")
 	fs.StringVar(&token, "auth-token", "", "legacy single bearer token (default: $RESLEEVE_SERVE_TOKEN; empty disables legacy auth — per-device only)")
 	fs.StringVar(&dsn, "dsn", "", "sqlite DSN for the identity database (default: ~/.local/share/resleeve/serve/identity.db)")
+	fs.BoolVar(&singleTenant, "single-tenant", false, "solo self-host mode: no brain partitioning, legacy bearer accepted on /v2/sync/* (tiers 1–2)")
 
 	fs.SetOutput(os.Stderr)
 	if err := fs.Parse(args); err != nil {
@@ -91,11 +93,15 @@ func runServe(ctx context.Context, args []string) int {
 	}
 
 	srv, err := serve.New(serve.Config{
-		Backend:     backend,
-		AuthToken:   token,
-		ServerUsers: store.ServerUsers(),
-		Devices:     store.Devices(),
-		Pairings:    store.Pairings(),
+		Backend:      backend,
+		AuthToken:    token,
+		ServerUsers:  store.ServerUsers(),
+		Devices:      store.Devices(),
+		Pairings:     store.Pairings(),
+		ServeMeta:    store.ServeMeta(),
+		Brains:       store.Brains(),
+		Memberships:  store.Memberships(),
+		SingleTenant: singleTenant,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "serve:", err)
@@ -117,6 +123,12 @@ func runServe(ctx context.Context, args []string) int {
 	fmt.Fprintln(os.Stderr, "  routes   POST /v2/sync/push  GET /v2/sync/pull  GET /v2/sync/sse  GET /v2/sync/health")
 	fmt.Fprintln(os.Stderr, "           POST /v2/auth/register  /v2/auth/login-challenge  /v2/auth/login  /v2/auth/logout")
 	fmt.Fprintln(os.Stderr, "           POST /v2/auth/pair/publish  /v2/auth/pair/claim")
+	fmt.Fprintln(os.Stderr, "           POST/GET /v1/brains  GET/POST/DELETE /v1/brains/{id}/members")
+	if singleTenant {
+		fmt.Fprintln(os.Stderr, "  tenancy  single-tenant (no brain partitioning; legacy bearer accepted)")
+	} else {
+		fmt.Fprintln(os.Stderr, "  tenancy  multi-tenant (brain-scoped; per-device bearer required on /v2/sync/*)")
+	}
 
 	// Graceful shutdown on context cancel.
 	errCh := make(chan error, 1)
