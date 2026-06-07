@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -146,12 +147,19 @@ func (s *Server) registerTools() {
 	// ----- plan slots -----
 
 	s.register(&tool{
-		name:        "resleeve_plan_write",
-		description: "Overwrite a plan slot on a scope. Slot defaults to '_default'. Use named slots for sibling drafts.",
+		name: "resleeve_plan_write",
+		description: "Append a new version of a plan slot on a scope (plans are append-only). " +
+			"Slot defaults to '_default'. Pass base_version = the version you last read " +
+			"(from resleeve_plan_read) to write safely: if HEAD has advanced since, the " +
+			"write is rejected as a conflict and the current HEAD (version + content) is " +
+			"returned so you can merge and retry. Omit base_version (or pass 0) for a first " +
+			"write to an empty slot. Use named slots for sibling drafts.",
 		inputSchema: schemaObject(map[string]any{
-			"scope":   schemaString("Scope path. Optional if $RESLEEVE_SCOPE / marker resolves a default."),
-			"slot":    schemaString("Plan slot name; default '_default'."),
-			"content": schemaString("Markdown plan content."),
+			"scope":        schemaString("Scope path. Optional if $RESLEEVE_SCOPE / marker resolves a default."),
+			"slot":         schemaString("Plan slot name; default '_default'."),
+			"content":      schemaString("Markdown plan content."),
+			"base_version": schemaInt("The HEAD version you derived this edit from (from resleeve_plan_read). 0/omitted = expect-new."),
+			"force":        schemaBool("Bypass the base_version conflict check and append unconditionally."),
 		}, []string{"content"}),
 		handler: func(ctx context.Context, c *agent.Client, defaultScope string, raw json.RawMessage) (toolCallResult, error) {
 			a := decodeArgs(raw)
@@ -161,11 +169,32 @@ func (s *Server) registerTools() {
 			}
 			slot := a.stringOr("slot", memory.DefaultPlanSlot)
 			content := a.string("content")
-			p, err := c.PutPlan(ctx, scope, slot, content)
+			base := a.int64Or("base_version", memory.NewPlanBaseVersion)
+			force := a.bool("force")
+			p, err := c.PutPlan(ctx, scope, slot, content, base, force)
 			if err != nil {
+				// On conflict, return a clear, actionable result (not a
+				// generic error) carrying the current HEAD so the agent can
+				// merge against it and retry with the new base_version.
+				var conflict *agent.PlanConflict
+				if errors.As(err, &conflict) {
+					headV := int64(0)
+					headContent := ""
+					if conflict.Head != nil {
+						headV = conflict.Head.Version
+						headContent = conflict.Head.Content
+					}
+					msg := fmt.Sprintf(
+						"CONFLICT: plan %s/%s was advanced by another writer.\n"+
+							"Your base_version (%d) is stale; current HEAD is version %d.\n"+
+							"Merge your edit against the HEAD below, then retry resleeve_plan_write "+
+							"with base_version=%d.\n\n--- current HEAD (v%d) ---\n%s",
+						scope, slot, base, headV, headV, headV, safeText(headContent, "(empty)"))
+					return toolCallResult{Content: textBlock(msg), IsError: true}, nil
+				}
 				return toolCallResult{}, err
 			}
-			return toolCallResult{Content: textBlock(fmt.Sprintf("ok: plan %s/%s written (%d bytes)", scope, p.Name, len(content)))}, nil
+			return toolCallResult{Content: textBlock(fmt.Sprintf("ok: plan %s/%s written as version %d (%d bytes)", scope, p.Name, p.Version, len(content)))}, nil
 		},
 	})
 
@@ -206,7 +235,10 @@ func (s *Server) registerTools() {
 			if err != nil {
 				return toolCallResult{}, err
 			}
-			return toolCallResult{Content: textBlock(safeText(p.Content, fmt.Sprintf("(empty plan at %s/%s)", scope, slot)))}, nil
+			// Surface the version so an agent that intends to write back can
+			// pass it as base_version for a safe (conflict-checked) update.
+			header := fmt.Sprintf("<!-- version: %d -->\n", p.Version)
+			return toolCallResult{Content: textBlock(header + safeText(p.Content, fmt.Sprintf("(empty plan at %s/%s)", scope, slot)))}, nil
 		},
 	})
 

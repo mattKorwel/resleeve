@@ -217,7 +217,7 @@ func TestSyncClient_MemoryEnqueueAndPush(t *testing.T) {
 
 	now := time.Now().UTC()
 	scope := &memory.Scope{Path: "monorepo/svc-billing", Kind: memory.ScopeKindProject, Title: "billing", CreatedAt: now, UpdatedAt: now}
-	plan := &memory.Plan{Scope: "monorepo/svc-billing", Name: memory.DefaultPlanSlot, Content: "## plan", UpdatedAt: now}
+	plan := &memory.Plan{Scope: "monorepo/svc-billing", Name: memory.DefaultPlanSlot, Version: 1, Content: "## plan", UpdatedAt: now}
 	learning := &memory.Learning{ID: "L_123_abc", Scope: "monorepo/svc-billing", Content: "watch the FK ordering", CreatedAt: now}
 
 	if err := sc.EnqueueScope(ctx, scope); err != nil {
@@ -249,9 +249,9 @@ func TestSyncClient_MemoryEnqueueAndPush(t *testing.T) {
 		t.Fatalf("backend.List: %v", err)
 	}
 	want := map[string]bool{
-		"memory/monorepo:svc-billing":                              true,
-		"memory/monorepo:svc-billing/plans/" + memory.DefaultPlanSlot: true,
-		"memory/monorepo:svc-billing/learnings/L_123_abc":          true,
+		"memory/monorepo:svc-billing":                                                       true,
+		"memory/monorepo:svc-billing/plans/" + memory.DefaultPlanSlot + "/00000000000000000001": true,
+		"memory/monorepo:svc-billing/learnings/L_123_abc":                                   true,
 	}
 	for _, k := range keys {
 		if !want[k] {

@@ -111,10 +111,30 @@ type MemoryStore interface {
 	DeleteScope(ctx context.Context, path string) error // memory.ErrScopeHasChildren if children exist
 	ListScopes(ctx context.Context) ([]*memory.Scope, error)
 
-	// Plans (named slots, upsert per (scope, name))
-	PutPlan(ctx context.Context, p *memory.Plan) error
+	// Plans (append-only versions per (scope, name); HEAD = max version).
+	// See docs/design/round-12/01-plan-versioning-slice.md.
+	//
+	// AppendPlanVersion appends a new immutable version under (scope,
+	// name). Optimistic concurrency: baseVersion is the HEAD version the
+	// caller derived from. If baseVersion != current HEAD version it
+	// returns a *memory.PlanConflictError (matches memory.ErrPlanConflict)
+	// carrying the current HEAD so the caller can reconcile. A baseVersion
+	// of memory.NewPlanBaseVersion (0) means "expect no existing plan" —
+	// rejected with a conflict if a HEAD already exists. force bypasses the
+	// base-version check entirely and appends HEAD+1 unconditionally (used
+	// by sync ingest and the CLI --force path). On success the appended
+	// version's number is returned via p.Version.
+	AppendPlanVersion(ctx context.Context, scope, name, content, author string, baseVersion int64, force bool) (*memory.Plan, error)
+	// GetPlan returns the materialized HEAD (max-version row) for
+	// (scope, slot), including its Version. ErrNotFound if no version exists.
 	GetPlan(ctx context.Context, scope, slot string) (*memory.Plan, error)
+	// ListPlans returns the HEAD of every slot at scope.
 	ListPlans(ctx context.Context, scope string) ([]*memory.Plan, error)
+	// ListPlanVersions returns every version of one slot, oldest first.
+	ListPlanVersions(ctx context.Context, scope, slot string) ([]*memory.Plan, error)
+	// GetPlanVersion returns a specific historical version. ErrNotFound if absent.
+	GetPlanVersion(ctx context.Context, scope, slot string, version int64) (*memory.Plan, error)
+	// DeletePlan removes all versions of a slot (the whole history).
 	DeletePlan(ctx context.Context, scope, slot string) error
 
 	// Learnings (append-only with soft-supersede)

@@ -18,6 +18,7 @@ func (d *Daemon) registerMemoryRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/scope", d.requireBearer(d.handleScope))
 	mux.HandleFunc("/v1/scopes", d.requireBearer(d.handleScopes))
 	mux.HandleFunc("/v1/plan", d.requireBearer(d.handlePlan))
+	mux.HandleFunc("/v1/plan/versions", d.requireBearer(d.handlePlanVersions))
 	mux.HandleFunc("/v1/plans", d.requireBearer(d.handlePlans))
 	mux.HandleFunc("/v1/learnings", d.requireBearer(d.handleLearnings))
 	mux.HandleFunc("/v1/context", d.requireBearer(d.handleContext))
@@ -156,22 +157,48 @@ func (d *Daemon) handlePlan(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// planConflictBody is the JSON returned with HTTP 409 on a stale write:
+// it carries the current HEAD (version + content) so the caller can
+// reconcile against it and retry. See
+// docs/design/round-12/01-plan-versioning-slice.md.
+type planConflictBody struct {
+	Error string       `json:"error"`
+	Head  *memory.Plan `json:"head,omitempty"`
+}
+
 func (d *Daemon) putPlan(w http.ResponseWriter, r *http.Request, scope, slot string) {
 	defer r.Body.Close()
 	var body struct {
 		Content string `json:"content"`
+		// BaseVersion is the HEAD version the caller derived from (0 =
+		// expect-new). A pointer distinguishes "omitted" from an explicit
+		// 0, though both are treated the same unless Force is set.
+		BaseVersion *int64 `json:"base_version"`
+		Force       bool   `json:"force"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErrorStatus(w, http.StatusBadRequest, "decode: "+err.Error())
 		return
 	}
-	p := &memory.Plan{Scope: scope, Name: slot, Content: body.Content}
-	if err := d.store.Memory().PutPlan(r.Context(), p); err != nil {
-		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
-		return
+	base := memory.NewPlanBaseVersion
+	if body.BaseVersion != nil {
+		base = *body.BaseVersion
 	}
-	got, err := d.store.Memory().GetPlan(r.Context(), scope, slot)
+	// Daemon is a single-user local process — there is no per-request user
+	// identity (the bearer is a shared local secret), so author is the
+	// local identity if configured, else empty. round-12B: serve's
+	// per-device bearer path stamps the real user; see the slice doc.
+	author := d.localAuthor()
+	got, err := d.store.Memory().AppendPlanVersion(r.Context(), scope, slot, body.Content, author, base, body.Force)
 	if err != nil {
+		var conflict *memory.PlanConflictError
+		if errors.As(err, &conflict) {
+			writeJSON(w, http.StatusConflict, planConflictBody{
+				Error: "plan version conflict: base_version is stale; reconcile against head and retry",
+				Head:  conflict.Head,
+			})
+			return
+		}
 		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -224,6 +251,50 @@ func (d *Daemon) handlePlans(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"plans": ps})
 }
 
+// --- /v1/plan/versions (history) ---
+
+func (d *Daemon) handlePlanVersions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErrorStatus(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	q := r.URL.Query()
+	scope := q.Get("scope")
+	if scope == "" {
+		writeErrorStatus(w, http.StatusBadRequest, "missing scope")
+		return
+	}
+	slot := q.Get("slot")
+	// Optional ?version=N selects a single historical version.
+	if vs := q.Get("version"); vs != "" {
+		v, err := strconv.ParseInt(vs, 10, 64)
+		if err != nil {
+			writeErrorStatus(w, http.StatusBadRequest, "bad version")
+			return
+		}
+		p, err := d.store.Memory().GetPlanVersion(r.Context(), scope, slot, v)
+		if err != nil {
+			if errors.Is(err, rsql.ErrNotFound) {
+				writeErrorStatus(w, http.StatusNotFound, "not found")
+				return
+			}
+			writeErrorStatus(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, p)
+		return
+	}
+	vs, err := d.store.Memory().ListPlanVersions(r.Context(), scope, slot)
+	if err != nil {
+		writeErrorStatus(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if vs == nil {
+		vs = []*memory.Plan{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"versions": vs})
+}
+
 // --- /v1/learnings ---
 
 func (d *Daemon) handleLearnings(w http.ResponseWriter, r *http.Request) {
@@ -255,7 +326,7 @@ func (d *Daemon) appendLearning(w http.ResponseWriter, r *http.Request, scope, s
 		return
 	}
 	id := newLearningID()
-	l := &memory.Learning{ID: id, Scope: scope, Content: body.Content}
+	l := &memory.Learning{ID: id, Scope: scope, Content: body.Content, Author: d.localAuthor()}
 	if supersedes != "" {
 		v := supersedes
 		l.SupersedesID = &v
@@ -320,6 +391,18 @@ func newLearningID() string {
 	var buf [12]byte
 	_, _ = rand.Read(buf[:])
 	return "L_" + strconv.FormatInt(timeNowNano(), 10) + "_" + hex.EncodeToString(buf[:])
+}
+
+// localAuthor returns the author_user_id to stamp on plan/learning
+// writes made through the local daemon. The daemon is a single-user
+// process with a shared-secret bearer (no per-request identity), so this
+// is the configured local identity if one exists, else empty. round-12B:
+// the serve side (per-device bearer) stamps the authenticated user; this
+// local path is deliberately a stub returning "" until a local-identity
+// config lands. Provenance for shared brains is therefore set on the
+// serve write path, not here.
+func (d *Daemon) localAuthor() string {
+	return d.cfg.LocalAuthor
 }
 
 // logSyncEnqueueErr is non-fatal: the local store is already committed,

@@ -632,7 +632,16 @@ func (s *SyncClient) ingestMemoryRow(ctx context.Context, key string, blob []byt
 		if err := json.Unmarshal(blob, &plan); err != nil {
 			return fmt.Errorf("unmarshal plan: %w", err)
 		}
-		return s.store.Memory().PutPlan(ctx, &plan)
+		// round-12B follow-up: ingest force-appends the pulled version
+		// rather than enforcing optimistic concurrency. That is correct
+		// for the PULL direction (we are materializing the server's
+		// already-resolved log), but the PUSH direction is NOT yet
+		// conflict-aware — a local plan version that 409s upstream must
+		// reconcile rather than blind-retry. See EnqueuePlan and the
+		// outbox push loop for where that hook belongs.
+		_, err := s.store.Memory().AppendPlanVersion(
+			ctx, plan.Scope, plan.Name, plan.Content, plan.Author, plan.ParentVersion, true /* force */)
+		return err
 	case strings.Contains(rest, "/learnings/"):
 		var l memory.Learning
 		if err := json.Unmarshal(blob, &l); err != nil {
@@ -678,11 +687,24 @@ func (s *SyncClient) EnqueueScope(ctx context.Context, scope *memory.Scope) erro
 	return s.store.Sync().EnqueueOutbox(ctx, "memory", key, blob, time.Now().UTC())
 }
 
-// EnqueuePlan enqueues a plan write. Key shape:
-// memory/<encoded-scope>/plans/<slot>. The plans/ sub-segment sorts
-// AFTER the scope's own key (which has no extra segment), so a fresh
-// machine reading the memory prefix in lexicographic order applies the
-// scope before any of its plans (FK-safe).
+// EnqueuePlan enqueues a plan version write. Key shape:
+// memory/<encoded-scope>/plans/<slot>/<version>. The plans/ sub-segment
+// sorts AFTER the scope's own key (which has no extra segment), so a
+// fresh machine reading the memory prefix in lexicographic order applies
+// the scope before any of its plans (FK-safe). The trailing <version>
+// (zero-padded) makes every append a distinct, immutable outbox/blob key
+// — older versions are never overwritten, mirroring the append-only log.
+//
+// round-12B follow-up — SYNC RECONCILE (DEFERRED, this is the hook):
+// today the outbox push (see pushLoop / handlePush) is a blind
+// idempotent Put. Once the server enforces plan optimistic concurrency
+// across machines, a plan push that the server 409s (because some other
+// machine advanced HEAD first) must NOT blind-retry: the outbox item
+// needs reconcile — re-derive the local version against the server's
+// returned HEAD and re-enqueue. Only PLAN rows change; sessions / events
+// / learnings stay append-idempotent. The reconcile branch belongs in
+// the outbox push result handling, keyed off this "/plans/" prefix and
+// a 409 from the upstream push.
 func (s *SyncClient) EnqueuePlan(ctx context.Context, plan *memory.Plan) error {
 	blob, err := json.Marshal(plan)
 	if err != nil {
@@ -694,7 +716,7 @@ func (s *SyncClient) EnqueuePlan(ctx context.Context, plan *memory.Plan) error {
 			return fmt.Errorf("sync: seal plan: %w", err)
 		}
 	}
-	key := "memory/" + encodeScopePath(plan.Scope) + "/plans/" + plan.Name
+	key := fmt.Sprintf("memory/%s/plans/%s/%020d", encodeScopePath(plan.Scope), plan.Name, plan.Version)
 	return s.store.Sync().EnqueueOutbox(ctx, "memory", key, blob, time.Now().UTC())
 }
 

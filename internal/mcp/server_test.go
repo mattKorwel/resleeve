@@ -160,7 +160,7 @@ func TestAutoLoadedScopeContext(t *testing.T) {
 	if _, err := c.PutScope(ctx, memScopePtr("resleeve", "project", "Resleeve")); err != nil {
 		t.Fatalf("seed PutScope: %v", err)
 	}
-	if _, err := c.PutPlan(ctx, "resleeve", "_default", "## Now\nbuild the mcp server"); err != nil {
+	if _, err := c.PutPlan(ctx, "resleeve", "_default", "## Now\nbuild the mcp server", memory.NewPlanBaseVersion, false); err != nil {
 		t.Fatalf("seed PutPlan: %v", err)
 	}
 
@@ -238,6 +238,55 @@ func TestPlanReadEmptyHasTextField(t *testing.T) {
 	if textStr == "" {
 		t.Fatalf("text field empty — friendly-placeholder regression")
 	}
+}
+
+// TestPlanWriteConflictResultShape drives the round-12B optimistic
+// concurrency path end-to-end through the MCP tool: write v1 (creates
+// version 1), then a SECOND write with a stale base_version=0 must come
+// back as an isError result whose text carries the current HEAD (its
+// version number + content) so an in-session agent can merge and retry.
+func TestPlanWriteConflictResultShape(t *testing.T) {
+	c := newDaemonClient(t)
+	ctx := context.Background()
+	if _, err := c.PutScope(ctx, memScopePtr("conflict", "project", "Conflict")); err != nil {
+		t.Fatalf("seed PutScope: %v", err)
+	}
+
+	resp := driveStdio(t, mcp.Config{Client: c},
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+		// First write: base_version 0, expect-new. Succeeds as version 1.
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"resleeve_plan_write","arguments":{"scope":"conflict","content":"HEAD CONTENT v1","base_version":0}}}`,
+		// Second write: stale base_version 0 against an existing plan.
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"resleeve_plan_write","arguments":{"scope":"conflict","content":"my edit","base_version":0}}}`,
+		// Force write: bypass the check, lands as version 2.
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"resleeve_plan_write","arguments":{"scope":"conflict","content":"forced","force":true}}}`,
+	)
+	if len(resp) != 4 {
+		t.Fatalf("expected 4 responses, got %d:\n%s", len(resp), strings.Join(resp, "\n"))
+	}
+
+	// First write succeeded as version 1.
+	requireOK(t, resp[1], "version 1")
+
+	// Second write is a conflict: isError=true, text carries HEAD v1 + content.
+	frame := decodeResp(t, resp[2])
+	result, _ := frame["result"].(map[string]any)
+	if isErr, _ := result["isError"].(bool); !isErr {
+		t.Fatalf("conflict write should set isError=true: %v", result)
+	}
+	content, _ := result["content"].([]any)
+	if len(content) == 0 {
+		t.Fatalf("conflict result has no content: %v", result)
+	}
+	text, _ := content[0].(map[string]any)["text"].(string)
+	for _, want := range []string{"CONFLICT", "version 1", "HEAD CONTENT v1", "base_version=1"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("conflict text missing %q:\n%s", want, text)
+		}
+	}
+
+	// Force write bypassed the check and appended version 2.
+	requireOK(t, resp[3], "version 2")
 }
 
 // --- tiny test helpers ---
