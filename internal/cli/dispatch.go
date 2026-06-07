@@ -79,6 +79,8 @@ func Main(args []string) int {
 		return runLogout(ctx, rest)
 	case "pair":
 		return runPair(ctx, rest)
+	case "brain":
+		return runBrain(ctx, rest)
 	case "migrate-key":
 		return runMigrateKey(ctx, rest)
 	case "help", "--help", "-h":
@@ -116,6 +118,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  login            unlock the local daemon with your master password")
 	fmt.Fprintln(w, "  logout           revoke this device + lock the local daemon")
 	fmt.Fprintln(w, "  pair             pair invite / pair accept (multi-device onboarding)")
+	fmt.Fprintln(w, "  brain            create/list shared brains, manage members, select active brain")
 	fmt.Fprintln(w, "  migrate-key      re-encrypt upstream rows from legacy seal.key to the master-password KEK")
 	fmt.Fprintln(w, "  help             show this help")
 	fmt.Fprintln(w, "")

@@ -23,7 +23,11 @@ func newTestServer(t *testing.T) (*httptest.Server, string) {
 	if err != nil {
 		t.Fatalf("local.New: %v", err)
 	}
-	s, err := New(Config{Backend: backend, AuthToken: testToken})
+	// These tests exercise the legacy content-blind sync path with the
+	// single shared bearer; that is the single-tenant (tier-1/2 solo)
+	// mode, where /v2/sync/* accepts the legacy bearer and the keyspace
+	// stays global (no brain partitioning).
+	s, err := New(Config{Backend: backend, AuthToken: testToken, SingleTenant: true})
 	if err != nil {
 		t.Fatalf("serve.New: %v", err)
 	}

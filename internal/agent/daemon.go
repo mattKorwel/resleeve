@@ -78,6 +78,14 @@ func New(ctx context.Context, cfg Config) (*Daemon, error) {
 		} else {
 			d.sync = NewSyncClient(store, cfg.Upstream, cfg.UpstreamToken)
 		}
+		// round-11b: seed the active-brain selection from the persisted
+		// client config so this machine syncs into the chosen shared brain
+		// (if any) from first boot. Empty/absent = personal brain.
+		if brainID, err := LoadActiveBrain(); err != nil {
+			log.Printf("agent: read active brain (continuing with personal): %v", err)
+		} else if brainID != "" {
+			d.sync.SetActiveBrain(brainID)
+		}
 	}
 	mux := http.NewServeMux()
 	d.registerRoutes(mux)

@@ -106,6 +106,65 @@ func LogPath() (string, error) {
 	return filepath.Join(dir, "daemon.log"), nil
 }
 
+// ActiveBrainPath returns the path to the file recording the globally
+// selected "active brain" (under DataDir). When the file is present and
+// non-empty, the daemon's upstream sync appends ?brain=<id> to its
+// push/pull/SSE calls so the machine acts in that shared brain instead of
+// the user's personal brain. Absent/empty = personal brain (the server
+// default). This is a GLOBAL selection for round-11b; per-scope routing
+// is a later refinement (see docs/design/round-11/05-sharing-slice.md).
+func ActiveBrainPath() (string, error) {
+	dir, err := DataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "active_brain"), nil
+}
+
+// LoadActiveBrain returns the persisted active-brain id, or "" when none
+// is set (file absent or empty). A read error other than "not exist" is
+// returned so callers can surface a corrupt config rather than silently
+// defaulting.
+func LoadActiveBrain() (string, error) {
+	path, err := ActiveBrainPath()
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read active-brain file %s: %w", path, err)
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+// WriteActiveBrain persists the active-brain id atomically (tempfile +
+// rename). An empty id clears the selection (removes the file), reverting
+// the machine to its personal brain.
+func WriteActiveBrain(brainID string) error {
+	path, err := ActiveBrainPath()
+	if err != nil {
+		return err
+	}
+	brainID = strings.TrimSpace(brainID)
+	if brainID == "" {
+		return RemoveEndpoint(path) // reuse the idempotent-remove helper
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(brainID+"\n"), 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("rename: %w", err)
+	}
+	return nil
+}
+
 func generateSecret() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {

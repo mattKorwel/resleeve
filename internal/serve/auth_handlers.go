@@ -192,6 +192,10 @@ func (s *Server) registerAuthRoutes() {
 	s.mux.HandleFunc("POST /v2/auth/logout", s.handleLogout)
 	s.mux.HandleFunc("POST /v2/auth/pair/publish", s.requireDevice(s.handlePairPublish))
 	s.mux.HandleFunc("POST /v2/auth/pair/claim", s.handlePairClaim)
+	// round-11b: brain + membership management (tier 4 sharing).
+	if s.brains != nil && s.memberships != nil {
+		s.registerBrainRoutes()
+	}
 }
 
 // --- register ---

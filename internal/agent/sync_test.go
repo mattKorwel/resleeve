@@ -28,7 +28,7 @@ func newSyncTestServer(t *testing.T) (*httptest.Server, *local.Backend) {
 	if err != nil {
 		t.Fatalf("local.New: %v", err)
 	}
-	srv, err := serve.New(serve.Config{Backend: backend, AuthToken: testSyncToken})
+	srv, err := serve.New(serve.Config{Backend: backend, AuthToken: testSyncToken, SingleTenant: true})
 	if err != nil {
 		t.Fatalf("serve.New: %v", err)
 	}

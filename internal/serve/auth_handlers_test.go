@@ -396,13 +396,15 @@ func TestRegister_AcceptsRoundTwoTenBaseline(t *testing.T) {
 	}
 }
 
-func TestSync_LegacyBearerStillWorks(t *testing.T) {
-	// Migration overlap: register a user, but the existing legacy bearer
-	// must keep authenticating /v2/sync/* calls until operators rotate
-	// devices to per-device tokens.
+func TestSync_LegacyBearerRejectedInMultiTenant(t *testing.T) {
+	// round-11 gap #3: in MULTI-tenant mode (the default for any server
+	// with an identity store) the legacy no-user bearer is a cross-tenant
+	// hole and must be rejected on /v2/sync/* — it can't identify the user
+	// whose brain the call should act in. Single-tenant mode (tested in
+	// server_test.go via SingleTenant:true) still accepts it.
 	_, base, _ := newIdentityServer(t)
 	postStatus(t, base+"/v2/sync/push", testToken,
-		PushReq{Batch: []PushRow{{Key: "sessions/legacy", Blob: []byte("b")}}}, 200)
+		PushReq{Batch: []PushRow{{Key: "sessions/legacy", Blob: []byte("b")}}}, 401)
 }
 
 // TestPairPublish_RejectsLegacyBearerWithEmptyUID guards sec-H3: the
@@ -418,14 +420,14 @@ func TestPairPublish_RejectsLegacyBearerWithEmptyUID(t *testing.T) {
 	}, 401)
 }
 
-// TestSyncPush_StillAcceptsLegacyBearer is the regression companion:
-// the sec-H3 guard must NOT bleed into content-blind sync endpoints.
-// Legacy bearer + /v2/sync/push remains 200 until operators rotate
-// devices.
-func TestSyncPush_StillAcceptsLegacyBearer(t *testing.T) {
+// TestSyncPush_LegacyBearerRejectedInMultiTenant is the companion to the
+// pair/publish guard: in multi-tenant mode the legacy bearer is rejected
+// on /v2/sync/push too (round-11 gap #3). The content-blind acceptance
+// that used to live here now requires SingleTenant mode.
+func TestSyncPush_LegacyBearerRejectedInMultiTenant(t *testing.T) {
 	_, base, _ := newIdentityServer(t)
 	postStatus(t, base+"/v2/sync/push", testToken,
-		PushReq{Batch: []PushRow{{Key: "sessions/regression", Blob: []byte("b")}}}, 200)
+		PushReq{Batch: []PushRow{{Key: "sessions/regression", Blob: []byte("b")}}}, 401)
 }
 
 // TestRequireUserDevice_RejectsEmptyUID is a direct unit test on the
