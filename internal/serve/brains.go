@@ -133,6 +133,12 @@ func (s *Server) handleCreateBrain(w http.ResponseWriter, r *http.Request, dev *
 		writeError(w, http.StatusInternalServerError, "add owner membership: "+err.Error())
 		return
 	}
+	// Server-at-rest (round-12 Part A): provision a per-brain DEK wrapped
+	// under the operator master key. No-op when no master key is set.
+	if err := s.provisionBrainKey(r.Context(), b.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, "provision brain key: "+err.Error())
+		return
+	}
 	writeJSON(w, http.StatusCreated, CreateBrainResp{BrainID: b.ID})
 }
 

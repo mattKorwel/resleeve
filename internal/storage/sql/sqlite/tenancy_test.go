@@ -210,6 +210,54 @@ func TestCredentialStore_CRUD(t *testing.T) {
 	}
 }
 
+// TestBrainKeyStore_PutGet exercises the round-12 brain_keys store:
+// upsert + get + ErrNotFound + FK cascade behavior, and the
+// encryption_policy default surfaced on the brain row.
+func TestBrainKeyStore_PutGet(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStoreFile(t)
+	seedServerUser(t, ctx, st, "user-a")
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	mkBrain(t, ctx, st, "brain-1", "user-a", now)
+
+	// No key yet → ErrNotFound.
+	if _, err := st.BrainKeys().GetBrainKey(ctx, "brain-1"); !errors.Is(err, rsql.ErrNotFound) {
+		t.Fatalf("GetBrainKey before put: want ErrNotFound, got %v", err)
+	}
+
+	wrapped := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02}
+	if err := st.BrainKeys().PutBrainKey(ctx, "brain-1", wrapped); err != nil {
+		t.Fatalf("PutBrainKey: %v", err)
+	}
+	got, err := st.BrainKeys().GetBrainKey(ctx, "brain-1")
+	if err != nil {
+		t.Fatalf("GetBrainKey: %v", err)
+	}
+	if string(got) != string(wrapped) {
+		t.Fatalf("wrapped DEK round-trip: got %x want %x", got, wrapped)
+	}
+
+	// Upsert overwrites in place.
+	wrapped2 := []byte{0x11, 0x22, 0x33}
+	if err := st.BrainKeys().PutBrainKey(ctx, "brain-1", wrapped2); err != nil {
+		t.Fatalf("PutBrainKey (upsert): %v", err)
+	}
+	got, _ = st.BrainKeys().GetBrainKey(ctx, "brain-1")
+	if string(got) != string(wrapped2) {
+		t.Fatalf("upsert: got %x want %x", got, wrapped2)
+	}
+
+	// encryption_policy defaults to server-side on a brain created without
+	// an explicit policy.
+	b, err := st.Brains().Get(ctx, "brain-1")
+	if err != nil {
+		t.Fatalf("Brains.Get: %v", err)
+	}
+	if b.EncryptionPolicy != rsql.EncryptionPolicyServerSide {
+		t.Fatalf("encryption_policy = %q, want server-side", b.EncryptionPolicy)
+	}
+}
+
 // --- helpers ---
 
 func mkBrain(t *testing.T, ctx context.Context, st *Store, id, owner string, ts time.Time) {
