@@ -13,12 +13,16 @@ import (
 // (migration 0008). Server-side only; the client daemon never reads it.
 type brainStore struct{ db *sql.DB }
 
-const brainColumns = `id, name, kind, owner_user_id, created_at, updated_at`
+const brainColumns = `id, name, kind, owner_user_id, encryption_policy, created_at, updated_at`
 
 func (s *brainStore) Create(ctx context.Context, b *rsql.Brain) error {
+	policy := b.EncryptionPolicy
+	if policy == "" {
+		policy = rsql.EncryptionPolicyServerSide
+	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO brains (`+brainColumns+`) VALUES (?,?,?,?,?,?)`,
-		b.ID, b.Name, string(b.Kind), b.OwnerUserID,
+		`INSERT INTO brains (`+brainColumns+`) VALUES (?,?,?,?,?,?,?)`,
+		b.ID, b.Name, string(b.Kind), b.OwnerUserID, string(policy),
 		b.CreatedAt.UTC().Format(time.RFC3339Nano),
 		b.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	)
@@ -29,14 +33,15 @@ func (s *brainStore) Get(ctx context.Context, id string) (*rsql.Brain, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT `+brainColumns+` FROM brains WHERE id = ?`, id)
 	var b rsql.Brain
-	var kind, created, updated string
-	if err := row.Scan(&b.ID, &b.Name, &kind, &b.OwnerUserID, &created, &updated); err != nil {
+	var kind, policy, created, updated string
+	if err := row.Scan(&b.ID, &b.Name, &kind, &b.OwnerUserID, &policy, &created, &updated); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, rsql.ErrNotFound
 		}
 		return nil, err
 	}
 	b.Kind = rsql.BrainKind(kind)
+	b.EncryptionPolicy = rsql.EncryptionPolicy(policy)
 	if t, err := time.Parse(time.RFC3339Nano, created); err == nil {
 		b.CreatedAt = t
 	}
@@ -72,17 +77,18 @@ func (s *brainStore) ListForUser(ctx context.Context, userID string) ([]*rsql.Br
 
 // prefixedBrainColumns is brainColumns qualified with the `b` alias for
 // the membership join in ListForUser.
-const prefixedBrainColumns = `b.id, b.name, b.kind, b.owner_user_id, b.created_at, b.updated_at`
+const prefixedBrainColumns = `b.id, b.name, b.kind, b.owner_user_id, b.encryption_policy, b.created_at, b.updated_at`
 
 func scanBrains(rows *sql.Rows) ([]*rsql.Brain, error) {
 	var out []*rsql.Brain
 	for rows.Next() {
 		var b rsql.Brain
-		var kind, created, updated string
-		if err := rows.Scan(&b.ID, &b.Name, &kind, &b.OwnerUserID, &created, &updated); err != nil {
+		var kind, policy, created, updated string
+		if err := rows.Scan(&b.ID, &b.Name, &kind, &b.OwnerUserID, &policy, &created, &updated); err != nil {
 			return nil, err
 		}
 		b.Kind = rsql.BrainKind(kind)
+		b.EncryptionPolicy = rsql.EncryptionPolicy(policy)
 		if t, err := time.Parse(time.RFC3339Nano, created); err == nil {
 			b.CreatedAt = t
 		}
@@ -92,6 +98,34 @@ func scanBrains(rows *sql.Rows) ([]*rsql.Brain, error) {
 		out = append(out, &b)
 	}
 	return out, rows.Err()
+}
+
+// brainKeyStore implements rsql.BrainKeyStore against the `brain_keys`
+// table (migration 0010). Server-side only; holds the per-brain DEK
+// wrapped under the operator's master key (envelope encryption).
+type brainKeyStore struct{ db *sql.DB }
+
+func (s *brainKeyStore) PutBrainKey(ctx context.Context, brainID string, wrappedDEK []byte) error {
+	// Upsert on brain_id so a future master-key rotation can re-wrap in
+	// place. created_at tracks first provision; left untouched on update.
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO brain_keys (brain_id, wrapped_dek, created_at) VALUES (?,?,?)
+		 ON CONFLICT(brain_id) DO UPDATE SET wrapped_dek = excluded.wrapped_dek`,
+		brainID, wrappedDEK, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (s *brainKeyStore) GetBrainKey(ctx context.Context, brainID string) ([]byte, error) {
+	var wrapped []byte
+	err := s.db.QueryRowContext(ctx,
+		`SELECT wrapped_dek FROM brain_keys WHERE brain_id = ?`, brainID).Scan(&wrapped)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, rsql.ErrNotFound
+		}
+		return nil, err
+	}
+	return wrapped, nil
 }
 
 // membershipStore implements rsql.MembershipStore against the
@@ -238,6 +272,7 @@ func (s *credentialStore) Delete(ctx context.Context, id string) error {
 // Compile-time assertions that our impls satisfy the contracts.
 var (
 	_ rsql.BrainStore      = (*brainStore)(nil)
+	_ rsql.BrainKeyStore   = (*brainKeyStore)(nil)
 	_ rsql.MembershipStore = (*membershipStore)(nil)
 	_ rsql.CredentialStore = (*credentialStore)(nil)
 )

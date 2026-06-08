@@ -33,6 +33,7 @@ type Store struct {
 	pairings    *pairingStore
 	serveMeta   *serveMetaStore
 	brains      *brainStore
+	brainKeys   *brainKeyStore
 	memberships *membershipStore
 	credentials *credentialStore
 }
@@ -63,6 +64,7 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	s.pairings = &pairingStore{db: db}
 	s.serveMeta = &serveMetaStore{db: db}
 	s.brains = &brainStore{db: db}
+	s.brainKeys = &brainKeyStore{db: db}
 	s.memberships = &membershipStore{db: db}
 	s.credentials = &credentialStore{db: db}
 	if err := s.migrate(ctx); err != nil {
@@ -104,6 +106,10 @@ func (s *Store) ServeMeta() rsql.ServeMetaStore { return s.serveMeta }
 // Brains returns the brain (namespace) store. Only `resleeve serve`
 // reads from this — brains are the server-side unit of tenancy.
 func (s *Store) Brains() rsql.BrainStore { return s.brains }
+
+// BrainKeys returns the per-brain wrapped-DEK store for server-at-rest
+// envelope encryption (round-12 Part A). Only `resleeve serve` reads it.
+func (s *Store) BrainKeys() rsql.BrainKeyStore { return s.brainKeys }
 
 // Memberships returns the brain↔user access-edge store. Only `resleeve
 // serve` reads from this.

@@ -61,6 +61,19 @@ type Config struct {
 	// still succeeds but provisions no brain (legacy single-user mode).
 	Brains      rsql.BrainStore
 	Memberships rsql.MembershipStore
+	// BrainKeys persists the per-brain wrapped DEKs for server-at-rest
+	// envelope encryption (round-12 Part A). When set alongside MasterKey,
+	// brain provisioning generates+wraps a DEK and the sync handlers
+	// encrypt blobs before backend.Put / decrypt after backend.Get. When
+	// nil (or MasterKey unset), blobs are stored as-is (legacy behavior).
+	BrainKeys rsql.BrainKeyStore
+	// MasterKey is the operator's 32-byte server-at-rest master key. When
+	// set (with BrainKeys), it wraps each brain's DEK (envelope
+	// encryption) and gates the at-rest encrypt/decrypt path. When nil,
+	// the server skips at-rest encryption entirely and stores blobs as
+	// today — slice 1 keeps this optional; the client default-flip slice
+	// will make it required in multi-tenant mode. Never logged.
+	MasterKey []byte
 	// SingleTenant relaxes the multi-tenant brain partitioning for solo
 	// self-hosters (tiers 1–2). When true: /v2/sync/* accepts the legacy
 	// no-user bearer, no ?brain selector is required, and the keyspace
@@ -80,8 +93,24 @@ type Server struct {
 	devices      rsql.DeviceStore
 	pairings     rsql.PairingStore
 	brains       rsql.BrainStore
+	brainKeys    rsql.BrainKeyStore
 	memberships  rsql.MembershipStore
 	singleTenant bool
+
+	// masterKey is the operator's 32-byte server-at-rest master key (round-12
+	// Part A). When non-nil (with brainKeys), brain provisioning wraps a
+	// per-brain DEK and the sync handlers encrypt/decrypt blobs at rest.
+	// When nil, the at-rest path is skipped and blobs are stored as-is.
+	// Never logged.
+	masterKey []byte
+
+	// dekCacheMu + dekCache memoize the unwrapped per-brain DEK so we
+	// don't re-fetch + re-unwrap on every blob within (and across)
+	// requests. The wrapped DEK lives in brain_keys; this cache only holds
+	// the plaintext DEK in memory for the process lifetime. Keyed by
+	// brainID.
+	dekCacheMu sync.RWMutex
+	dekCache   map[string][]byte
 
 	// loginChallengeKey is a persisted random secret used to derive
 	// synthetic Argon2id salts for unknown-email login-challenge requests
@@ -147,6 +176,12 @@ func New(cfg Config) (*Server, error) {
 	if cfg.AuthToken == "" && cfg.Devices == nil {
 		return nil, errors.New("serve: no auth configured (set AuthToken or Devices)")
 	}
+	// Server-at-rest (round-12 Part A): the master key, when present, must
+	// be exactly 32 bytes (AES-256). A configured-but-malformed key is an
+	// operator error we fail fast on rather than silently disable.
+	if cfg.MasterKey != nil && len(cfg.MasterKey) != 32 {
+		return nil, fmt.Errorf("serve: master key must be 32 bytes, got %d", len(cfg.MasterKey))
+	}
 	// sec-M1: persist the login-challenge HMAC key so the synthetic salt
 	// for unknown-email probes is stable across `resleeve serve` restarts.
 	// First-boot generates 32 random bytes; subsequent boots re-read the
@@ -173,8 +208,11 @@ func New(cfg Config) (*Server, error) {
 		devices:           cfg.Devices,
 		pairings:          cfg.Pairings,
 		brains:            cfg.Brains,
+		brainKeys:         cfg.BrainKeys,
 		memberships:       cfg.Memberships,
 		singleTenant:      cfg.SingleTenant,
+		masterKey:         cfg.MasterKey,
+		dekCache:          map[string][]byte{},
 		loginChallengeKey: challengeKey,
 		loginTimingDecoy:  timingDecoy,
 		sseSubscribers:    map[chan PushRow]struct{}{},
@@ -261,7 +299,16 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		storedKey := scopeKey(bc.brainID, row.Key)
-		if err := s.backend.Put(r.Context(), storedKey, row.Blob); err != nil {
+		// Server-at-rest (round-12 Part A): encrypt the blob with the brain
+		// DEK before persisting. No-op (returns row.Blob) when no master
+		// key / brain DEK is configured. The SSE fan-out below still ships
+		// the PLAINTEXT row.Blob, matching what pull returns to clients.
+		stored, err := s.encryptForBrain(r.Context(), bc.brainID, row.Blob)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("encrypt %q: %v", storedKey, err))
+			return
+		}
+		if err := s.backend.Put(r.Context(), storedKey, stored); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("put %q: %v", storedKey, err))
 			return
 		}
@@ -335,9 +382,16 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("get %q: %v", k, err))
 			return
 		}
+		// Server-at-rest (round-12 Part A): decrypt with the brain DEK
+		// before returning. No-op when no master key / brain DEK.
+		plain, err := s.decryptForBrain(r.Context(), bc.brainID, blob)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("decrypt %q: %v", k, err))
+			return
+		}
 		// Strip the brain prefix so the daemon sees brain-agnostic keys
 		// and its ingest + cursor logic is unchanged across the flip.
-		rows = append(rows, PushRow{Key: unscopeKey(bc.brainID, k), Blob: blob})
+		rows = append(rows, PushRow{Key: unscopeKey(bc.brainID, k), Blob: plain})
 	}
 	writeJSON(w, http.StatusOK, PullResp{Rows: rows, NextCursor: unscopeKey(bc.brainID, next)})
 }
@@ -412,7 +466,15 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
-			if err := writeSSEEvent(w, PushRow{Key: unscopeKey(bc.brainID, k), Blob: blob}); err != nil {
+			// Server-at-rest (round-12 Part A): decrypt the backlog row with
+			// the brain DEK. The live fan-out path below already carries the
+			// plaintext blob (from push), so only this stored-read branch
+			// decrypts. No-op when no master key / brain DEK.
+			plain, err := s.decryptForBrain(r.Context(), bc.brainID, blob)
+			if err != nil {
+				continue
+			}
+			if err := writeSSEEvent(w, PushRow{Key: unscopeKey(bc.brainID, k), Blob: plain}); err != nil {
 				return
 			}
 			since = k

@@ -3,7 +3,9 @@ package cli
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -25,17 +27,19 @@ import (
 func runServe(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	var (
-		addr    string
-		root    string
-		token   string
+		addr  string
+		root  string
+		token string
 	)
 	var dsn string
 	var singleTenant bool
+	var masterKeyFile string
 	fs.StringVar(&addr, "addr", "127.0.0.1:7860", "listen address")
 	fs.StringVar(&root, "root", "", "blob storage root (default: ~/.local/share/resleeve/serve)")
 	fs.StringVar(&token, "auth-token", "", "legacy single bearer token (default: $RESLEEVE_SERVE_TOKEN; empty disables legacy auth — per-device only)")
 	fs.StringVar(&dsn, "dsn", "", "sqlite DSN for the identity database (default: ~/.local/share/resleeve/serve/identity.db)")
 	fs.BoolVar(&singleTenant, "single-tenant", false, "solo self-host mode: no brain partitioning, legacy bearer accepted on /v2/sync/* (tiers 1–2)")
+	fs.StringVar(&masterKeyFile, "master-key", "", "file holding the 32-byte server-at-rest master key (hex or base64; default: $RESLEEVE_SERVER_MASTER_KEY; absent = at-rest encryption disabled)")
 
 	fs.SetOutput(os.Stderr)
 	if err := fs.Parse(args); err != nil {
@@ -92,6 +96,15 @@ func runServe(ctx context.Context, args []string) int {
 		return 1
 	}
 
+	// Server-at-rest (round-12 Part A): load the optional operator master
+	// key from --master-key <file> or $RESLEEVE_SERVER_MASTER_KEY (hex or
+	// base64, 32 bytes). When absent we skip at-rest encryption entirely.
+	masterKey, err := loadMasterKey(masterKeyFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "serve: master key:", err)
+		return 1
+	}
+
 	srv, err := serve.New(serve.Config{
 		Backend:      backend,
 		AuthToken:    token,
@@ -100,8 +113,10 @@ func runServe(ctx context.Context, args []string) int {
 		Pairings:     store.Pairings(),
 		ServeMeta:    store.ServeMeta(),
 		Brains:       store.Brains(),
+		BrainKeys:    store.BrainKeys(),
 		Memberships:  store.Memberships(),
 		SingleTenant: singleTenant,
+		MasterKey:    masterKey,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "serve:", err)
@@ -129,6 +144,11 @@ func runServe(ctx context.Context, args []string) int {
 	} else {
 		fmt.Fprintln(os.Stderr, "  tenancy  multi-tenant (brain-scoped; per-device bearer required on /v2/sync/*)")
 	}
+	if len(masterKey) == 32 {
+		fmt.Fprintln(os.Stderr, "  at-rest  server-side envelope encryption ON (per-brain DEKs wrapped under master key)")
+	} else {
+		fmt.Fprintln(os.Stderr, "  at-rest  DISABLED (no --master-key / $RESLEEVE_SERVER_MASTER_KEY); blobs stored as received")
+	}
 
 	// Graceful shutdown on context cancel.
 	errCh := make(chan error, 1)
@@ -150,6 +170,53 @@ func runServe(ctx context.Context, args []string) int {
 		fmt.Fprintln(os.Stderr, "serve: listen:", err)
 		return 1
 	}
+}
+
+// loadMasterKey resolves the optional server-at-rest master key (round-12
+// Part A). Source precedence: --master-key <file> if non-empty, else
+// $RESLEEVE_SERVER_MASTER_KEY. The value (file contents or env var) is
+// trimmed and decoded as hex first, then base64; the result must be
+// exactly 32 bytes (AES-256). Returns (nil, nil) when neither source is
+// set — at-rest encryption is then disabled. Never logs the key bytes.
+func loadMasterKey(file string) ([]byte, error) {
+	var raw string
+	switch {
+	case file != "":
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("read --master-key file: %w", err)
+		}
+		raw = string(b)
+	default:
+		raw = os.Getenv("RESLEEVE_SERVER_MASTER_KEY")
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	key, err := decodeKeyMaterial(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(key) != 32 {
+		return nil, fmt.Errorf("master key must be 32 bytes, got %d (accepts 64 hex chars or base64)", len(key))
+	}
+	return key, nil
+}
+
+// decodeKeyMaterial decodes s as hex, falling back to base64 (standard
+// then raw URL). Returns an error only when neither yields bytes.
+func decodeKeyMaterial(s string) ([]byte, error) {
+	if b, err := hex.DecodeString(s); err == nil {
+		return b, nil
+	}
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	if b, err := base64.RawStdEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	return nil, errors.New("master key is neither valid hex nor base64")
 }
 
 // generateToken produces a 32-byte random hex token for bearer auth

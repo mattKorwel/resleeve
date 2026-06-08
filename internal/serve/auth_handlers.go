@@ -311,6 +311,11 @@ func (s *Server) provisionPersonalBrain(ctx context.Context, userID, email strin
 	}); err != nil {
 		return "", err
 	}
+	// Server-at-rest (round-12 Part A): provision a per-brain DEK wrapped
+	// under the operator master key. No-op when no master key is set.
+	if err := s.provisionBrainKey(ctx, b.ID); err != nil {
+		return "", err
+	}
 	return b.ID, nil
 }
 

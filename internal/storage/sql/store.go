@@ -317,6 +317,18 @@ const (
 	BrainKindShared   BrainKind = "shared"
 )
 
+// EncryptionPolicy is the per-brain layer the round-12 encryption matrix
+// reads. 'server-side' (the default and the only value exercised in
+// slice 1) means the server encrypts blobs at rest with a per-brain DEK
+// it can decrypt. 'e2e' (zero-knowledge / end-to-end) is a later slice —
+// stored now, not branched on yet.
+type EncryptionPolicy string
+
+const (
+	EncryptionPolicyServerSide EncryptionPolicy = "server-side"
+	EncryptionPolicyE2E        EncryptionPolicy = "e2e"
+)
+
 // Brain is a named namespace — a scope tree plus its memory (plans,
 // learnings). It is the unit of isolation and of sharing. OwnerUserID is
 // the creator, who can add/remove members; there is no role column —
@@ -326,8 +338,12 @@ type Brain struct {
 	Name        string
 	Kind        BrainKind
 	OwnerUserID string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// EncryptionPolicy is the round-12 per-brain encryption-matrix policy
+	// (defaults to 'server-side'). Slice 1 stores it but does not branch
+	// on it — server-side at-rest is the only path exercised.
+	EncryptionPolicy EncryptionPolicy
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 // Membership is the access edge: a (BrainID, UserID) pair. Its existence
@@ -379,6 +395,20 @@ type BrainStore interface {
 	ListForUser(ctx context.Context, userID string) ([]*Brain, error)
 }
 
+// BrainKeyStore persists the per-brain wrapped Data Encryption Keys for
+// server-at-rest envelope encryption (round-12 Part A). The stored
+// wrapped_dek is the brain's DEK encrypted under the operator's master
+// key — useless without that key. Server-side only.
+type BrainKeyStore interface {
+	// PutBrainKey upserts the wrapped DEK for a brain. Idempotent on
+	// brain_id: re-wrapping (e.g. a future master-key rotation) overwrites.
+	PutBrainKey(ctx context.Context, brainID string, wrappedDEK []byte) error
+	// GetBrainKey returns the wrapped DEK for a brain, or ErrNotFound when
+	// no key has been provisioned (e.g. a brain created while no master
+	// key was configured).
+	GetBrainKey(ctx context.Context, brainID string) ([]byte, error)
+}
+
 // MembershipStore persists the brain↔user access edges. Server-side only.
 type MembershipStore interface {
 	// Add inserts a membership. Idempotent on (brain_id, user_id).
@@ -418,6 +448,7 @@ type Store interface {
 	Pairings() PairingStore
 	ServeMeta() ServeMetaStore
 	Brains() BrainStore
+	BrainKeys() BrainKeyStore
 	Memberships() MembershipStore
 	Credentials() CredentialStore
 	Close() error
