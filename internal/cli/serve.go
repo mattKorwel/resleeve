@@ -104,6 +104,19 @@ func runServe(ctx context.Context, args []string) int {
 		fmt.Fprintln(os.Stderr, "serve: master key:", err)
 		return 1
 	}
+	// Round-12 Part A slice 2 (default-flip): a multi-tenant server has its
+	// clients send PLAINTEXT under the default server-side policy, so the
+	// server's at-rest DEK is the SOLE encryption layer — refuse to boot
+	// without a master key rather than persisting plaintext. Single-tenant
+	// solo self-hosters keep zero-knowledge client sealing, so the key
+	// stays optional there. (serve.New enforces the same invariant; this
+	// pre-check surfaces the actionable flag/env hint.)
+	if !singleTenant && len(masterKey) == 0 {
+		fmt.Fprintln(os.Stderr, "serve: multi-tenant serve requires --master-key / $RESLEEVE_SERVER_MASTER_KEY")
+		fmt.Fprintln(os.Stderr, "       (clients send plaintext under the default server-side policy; the server's at-rest key is the only encryption layer)")
+		fmt.Fprintln(os.Stderr, "       pass --single-tenant for a solo self-host (zero-knowledge client sealing, master key optional)")
+		return 1
+	}
 
 	srv, err := serve.New(serve.Config{
 		Backend:      backend,

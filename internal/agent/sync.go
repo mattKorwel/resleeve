@@ -80,6 +80,22 @@ type SyncClient struct {
 	// a sealer has been installed. Kept short for snappy login UX.
 	parkInterval time.Duration
 
+	// sealDecisionMu + shouldSeal cache the round-12 client seal decision:
+	// whether the daemon should ZERO-KNOWLEDGE seal blobs before push (and
+	// unseal after pull). It's computed from the upstream's
+	// GET /v2/sync/whoami handshake — shouldSeal = !multiTenant ||
+	// policy=="e2e" — and re-sampled whenever the active brain changes
+	// (SetActiveBrain) so a `resleeve brain use` into a different-policy
+	// brain takes effect without a restart. Defaults to TRUE (seal) so we
+	// fail CLOSED: until whoami answers, we behave like the legacy zero-
+	// knowledge daemon and never ship plaintext by accident.
+	//
+	// NOTE: this is orthogonal to the sealer being installed. A nil sealer
+	// parks the loops regardless; shouldSeal only decides whether an
+	// installed sealer is APPLIED on the push/pull boundary.
+	sealDecisionMu sync.RWMutex
+	shouldSeal     bool
+
 	// parkLogMu guards parkLogAt — used to throttle "waiting for login"
 	// log lines to once per minute per loop.
 	parkLogMu sync.Mutex
@@ -107,6 +123,10 @@ func NewSyncClient(store rsql.Store, upstream, token string) *SyncClient {
 		parkInterval:  5 * time.Second,
 		batchSize:     100,
 		done:          make(chan struct{}, 3),
+		// Fail closed: seal until whoami says otherwise (legacy zero-
+		// knowledge behavior). sampleSealDecision flips this after the
+		// handshake; SetActiveBrain re-samples on a brain change.
+		shouldSeal: true,
 	}
 }
 
@@ -160,10 +180,105 @@ func (s *SyncClient) getSealer() auth.Sealer {
 // as ?brain=<id> on every upstream push/pull/SSE call. Concurrent-safe;
 // the loops re-sample it on each request so a `resleeve brain use` change
 // takes effect on the next cycle without a daemon restart.
+//
+// round-12: a brain change can flip the seal decision (different brain →
+// different encryption_policy, or personal→shared crossing a tenancy
+// boundary). We re-run the whoami handshake in the background so
+// shouldSeal is re-sampled for the new brain. The probe is best-effort:
+// on failure we keep the current (fail-closed) decision and the next
+// startup/SetActiveBrain re-tries.
 func (s *SyncClient) SetActiveBrain(brainID string) {
 	s.brainMu.Lock()
 	s.brain = strings.TrimSpace(brainID)
 	s.brainMu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := s.sampleSealDecision(ctx); err != nil {
+			log.Printf("sync: re-sample seal decision after brain change: %v", err)
+		}
+	}()
+}
+
+// getShouldSeal reads the cached client seal decision (round-12). True =
+// zero-knowledge seal/unseal at the push/pull boundary; false = ship
+// plaintext (multi-tenant server-side policy, where the server's at-rest
+// DEK is the sole layer).
+func (s *SyncClient) getShouldSeal() bool {
+	s.sealDecisionMu.RLock()
+	defer s.sealDecisionMu.RUnlock()
+	return s.shouldSeal
+}
+
+func (s *SyncClient) setShouldSeal(v bool) {
+	s.sealDecisionMu.Lock()
+	s.shouldSeal = v
+	s.sealDecisionMu.Unlock()
+}
+
+// sampleSealDecision runs the GET /v2/sync/whoami handshake against the
+// upstream and updates the cached shouldSeal flag:
+//
+//	shouldSeal = !multiTenant || policy == "e2e"
+//
+// The daemon seals (zero-knowledge) for a single-tenant server (solo
+// self-host, maybe untrusted) or an e2e brain; it ships PLAINTEXT only
+// when the server is multi-tenant AND the acting brain's policy is
+// server-side, where the server's at-rest DEK is the sole encryption
+// layer.
+//
+// whoami is AUTH-ONLY (it returns no blob bytes), so this may run even
+// while the sync loops are parked pre-login. It does NOT require an
+// installed sealer. On any error the cached decision is left unchanged
+// (we started fail-closed at shouldSeal=true).
+func (s *SyncClient) sampleSealDecision(ctx context.Context) error {
+	if s.upstream == "" {
+		return nil
+	}
+	who, err := s.fetchWhoami(ctx)
+	if err != nil {
+		return err
+	}
+	decision := computeShouldSeal(who.MultiTenant, who.EncryptionPolicy)
+	s.setShouldSeal(decision)
+	return nil
+}
+
+// computeShouldSeal applies the round-12 seal-decision rule. Split out as
+// a pure helper so the rule is unit-testable and the De Morgan form stays
+// readable (no negated disjunction — staticcheck QF1001).
+func computeShouldSeal(multiTenant bool, policy string) bool {
+	if !multiTenant {
+		return true
+	}
+	return policy == string(rsql.EncryptionPolicyE2E)
+}
+
+// fetchWhoami calls GET /v2/sync/whoami (honoring the active ?brain) and
+// returns the server's seal-decision handshake.
+func (s *SyncClient) fetchWhoami(ctx context.Context) (serve.WhoamiResp, error) {
+	var who serve.WhoamiResp
+	u := s.upstream + "/v2/sync/whoami"
+	if bq := s.brainQuery(); bq != "" {
+		u += "?" + strings.TrimPrefix(bq, "&")
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return who, err
+	}
+	req.Header.Set("Authorization", "Bearer "+s.token)
+	resp, err := s.httpc.Do(req)
+	if err != nil {
+		return who, fmt.Errorf("whoami http: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return who, fmt.Errorf("whoami status %d", resp.StatusCode)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&who); err != nil {
+		return who, fmt.Errorf("whoami decode: %w", err)
+	}
+	return who, nil
 }
 
 // ActiveBrain returns the currently-selected active brain id ("" =
@@ -197,6 +312,18 @@ func NewSyncClientWithSealer(store rsql.Store, upstream, token string, sealer au
 // second Start replaces the prior cancel func; tests assume one Start.
 func (s *SyncClient) Start(ctx context.Context) {
 	ctx, s.stop = context.WithCancel(ctx)
+	// round-12: run the seal-decision handshake before the loops so the
+	// first drain/pull uses the right mode. whoami is auth-only (no
+	// plaintext) so it's safe even while the loops are parked pre-login.
+	// Best-effort: on failure we keep the fail-closed default (seal) and
+	// the next brain change / restart re-tries.
+	go func() {
+		hctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		if err := s.sampleSealDecision(hctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("sync: initial seal-decision handshake: %v (defaulting to seal)", err)
+		}
+	}()
 	go s.drainLoop(ctx)
 	go s.pullLoop(ctx)
 	go s.sseLoop(ctx)
@@ -233,7 +360,7 @@ func (s *SyncClient) EnqueueSession(ctx context.Context, ses *rsql.Session) erro
 	if err != nil {
 		return fmt.Errorf("sync: marshal session: %w", err)
 	}
-	if sl := s.getSealer(); sl != nil {
+	if sl := s.getSealer(); sl != nil && s.getShouldSeal() {
 		blob, err = sl.Seal(blob)
 		if err != nil {
 			return fmt.Errorf("sync: seal session: %w", err)
@@ -265,7 +392,7 @@ func (s *SyncClient) EnqueueEvents(ctx context.Context, events []event.Event) er
 		if err != nil {
 			return fmt.Errorf("sync: marshal event %s: %w", e.EventUUID, err)
 		}
-		if sl := s.getSealer(); sl != nil {
+		if sl := s.getSealer(); sl != nil && s.getShouldSeal() {
 			blob, err = sl.Seal(blob)
 			if err != nil {
 				return fmt.Errorf("sync: seal event %s: %w", e.EventUUID, err)
@@ -564,7 +691,10 @@ func (s *SyncClient) pullKind(ctx context.Context, kind string) (int, error) {
 }
 
 func (s *SyncClient) ingestPulled(ctx context.Context, kind string, blob []byte) error {
-	if sl := s.getSealer(); sl != nil {
+	// Unseal only when we sealed: in multi-tenant server-side mode the
+	// server already decrypted at-rest and returns PLAINTEXT, so there's
+	// no envelope to open.
+	if sl := s.getSealer(); sl != nil && s.getShouldSeal() {
 		opened, err := sl.Open(blob)
 		if err != nil {
 			return fmt.Errorf("open envelope: %w", err)
@@ -615,7 +745,9 @@ func (s *SyncClient) ingestPulled(ctx context.Context, kind string, blob []byte)
 // All operations are idempotent against the local memory store, so
 // replaying the same row (e.g. SSE backlog + live) is safe.
 func (s *SyncClient) ingestMemoryRow(ctx context.Context, key string, blob []byte) error {
-	if sl := s.getSealer(); sl != nil {
+	// Unseal only when we sealed (see ingestPulled): server-side multi-
+	// tenant rows arrive as plaintext (decrypted at-rest by the server).
+	if sl := s.getSealer(); sl != nil && s.getShouldSeal() {
 		opened, err := sl.Open(blob)
 		if err != nil {
 			return fmt.Errorf("sync: open memory blob %q: %w", key, err)
@@ -677,7 +809,7 @@ func (s *SyncClient) EnqueueScope(ctx context.Context, scope *memory.Scope) erro
 	if err != nil {
 		return fmt.Errorf("sync: marshal scope: %w", err)
 	}
-	if sl := s.getSealer(); sl != nil {
+	if sl := s.getSealer(); sl != nil && s.getShouldSeal() {
 		blob, err = sl.Seal(blob)
 		if err != nil {
 			return fmt.Errorf("sync: seal scope: %w", err)
@@ -710,7 +842,7 @@ func (s *SyncClient) EnqueuePlan(ctx context.Context, plan *memory.Plan) error {
 	if err != nil {
 		return fmt.Errorf("sync: marshal plan: %w", err)
 	}
-	if sl := s.getSealer(); sl != nil {
+	if sl := s.getSealer(); sl != nil && s.getShouldSeal() {
 		blob, err = sl.Seal(blob)
 		if err != nil {
 			return fmt.Errorf("sync: seal plan: %w", err)
@@ -730,7 +862,7 @@ func (s *SyncClient) EnqueueLearning(ctx context.Context, l *memory.Learning) er
 	if err != nil {
 		return fmt.Errorf("sync: marshal learning: %w", err)
 	}
-	if sl := s.getSealer(); sl != nil {
+	if sl := s.getSealer(); sl != nil && s.getShouldSeal() {
 		blob, err = sl.Seal(blob)
 		if err != nil {
 			return fmt.Errorf("sync: seal learning: %w", err)
