@@ -15,8 +15,16 @@ import (
 // newAtRestServer builds an identity server with a 32-byte master key and
 // the BrainKeys store wired, returning the test server, its base URL, the
 // store, and the local backend (so tests can inspect raw stored blobs and
-// brain_keys rows). masterKey lets callers reuse / rotate the key.
+// brain_keys rows). masterKey lets callers reuse / rotate the key. A nil
+// masterKey is only valid in single-tenant mode (multi-tenant New rejects
+// a missing key after the slice-2 default-flip), so the nil-key callers
+// flip on singleTenant.
 func newAtRestServer(t *testing.T, masterKey []byte) (string, *sqlite.Store, *local.Backend) {
+	t.Helper()
+	return newAtRestServerTenancy(t, masterKey, len(masterKey) == 0)
+}
+
+func newAtRestServerTenancy(t *testing.T, masterKey []byte, singleTenant bool) (string, *sqlite.Store, *local.Backend) {
 	t.Helper()
 	backend, err := local.New(t.TempDir())
 	if err != nil {
@@ -28,16 +36,17 @@ func newAtRestServer(t *testing.T, masterKey []byte) (string, *sqlite.Store, *lo
 		t.Fatalf("sqlite.Open: %v", err)
 	}
 	s, err := New(Config{
-		Backend:     backend,
-		AuthToken:   testToken,
-		ServerUsers: store.ServerUsers(),
-		Devices:     store.Devices(),
-		Pairings:    store.Pairings(),
-		ServeMeta:   store.ServeMeta(),
-		Brains:      store.Brains(),
-		BrainKeys:   store.BrainKeys(),
-		Memberships: store.Memberships(),
-		MasterKey:   masterKey,
+		Backend:      backend,
+		AuthToken:    testToken,
+		ServerUsers:  store.ServerUsers(),
+		Devices:      store.Devices(),
+		Pairings:     store.Pairings(),
+		ServeMeta:    store.ServeMeta(),
+		Brains:       store.Brains(),
+		BrainKeys:    store.BrainKeys(),
+		Memberships:  store.Memberships(),
+		MasterKey:    masterKey,
+		SingleTenant: singleTenant,
 	})
 	if err != nil {
 		t.Fatalf("serve.New: %v", err)
@@ -129,21 +138,17 @@ func TestAtRest_PushIsCiphertextPullIsPlaintext(t *testing.T) {
 	}
 }
 
-// TestAtRest_NoMasterKeyStoresAsIs: with no master key, the stored blob
-// is byte-identical to what the client pushed (legacy passthrough).
+// TestAtRest_NoMasterKeyStoresAsIs: with no master key (single-tenant),
+// push→pull round-trips the original blob (legacy passthrough on the
+// at-rest path).
 func TestAtRest_NoMasterKeyStoresAsIs(t *testing.T) {
-	// newIdentityServer wires no master key / brain-keys store.
-	ts, base, _ := newIdentityServer(t)
-	_ = ts
+	base, _, _ := newAtRestServer(t, nil) // single-tenant, no at-rest crypto
 	_, tok, personal := regUser(t, base, "owner@example.com")
 
 	plaintext := []byte("plain-blob-no-crypto")
 	push := PushReq{Batch: []PushRow{{Key: "memory/scope-a", Blob: plaintext}}}
 	postStatus(t, base+"/v2/sync/push", tok, push, 200)
 
-	// Reach into the same store/backend via a fresh pull and confirm the
-	// round-trip works; for the raw-bytes assertion use a dedicated
-	// at-rest server with a nil master key.
 	var pulled PullResp
 	getOK(t, base+"/v2/sync/pull?kind=memory", tok, &pulled)
 	if len(pulled.Rows) != 1 || !bytes.Equal(pulled.Rows[0].Blob, plaintext) {
@@ -152,10 +157,14 @@ func TestAtRest_NoMasterKeyStoresAsIs(t *testing.T) {
 	_ = personal
 }
 
-// TestAtRest_NoMasterKeyRawBytesUnchanged: with a nil master key, the
-// backend holds exactly what the client sent (no envelope).
+// TestAtRest_NoMasterKeyRawBytesUnchanged: with a nil master key (only
+// valid in single-tenant mode after the slice-2 flip), the backend holds
+// exactly what the client sent — no at-rest envelope. Note the daemon
+// would still CLIENT-seal in single-tenant mode (whoami → shouldSeal);
+// this test pushes raw bytes directly to assert the server's at-rest path
+// is the no-op, independent of any client sealing.
 func TestAtRest_NoMasterKeyRawBytesUnchanged(t *testing.T) {
-	base, store, backend := newAtRestServer(t, nil) // nil master key → disabled
+	base, store, backend := newAtRestServer(t, nil) // nil master key → single-tenant, at-rest disabled
 	_, tok, personal := regUser(t, base, "owner@example.com")
 
 	// No DEK should have been provisioned.
@@ -167,13 +176,15 @@ func TestAtRest_NoMasterKeyRawBytesUnchanged(t *testing.T) {
 	push := PushReq{Batch: []PushRow{{Key: "memory/scope-a", Blob: plaintext}}}
 	postStatus(t, base+"/v2/sync/push", tok, push, 200)
 
-	raw, err := backend.Get(context.Background(), personal+"/memory/scope-a")
+	// Single-tenant keyspace is global (no brain prefix).
+	raw, err := backend.Get(context.Background(), "memory/scope-a")
 	if err != nil {
 		t.Fatalf("backend.Get: %v", err)
 	}
 	if !bytes.Equal(raw, plaintext) {
 		t.Fatalf("stored blob = %q, want verbatim %q", raw, plaintext)
 	}
+	_ = personal
 }
 
 // TestAtRest_RotatedMasterKeyFailsToUnwrap: data written under one master

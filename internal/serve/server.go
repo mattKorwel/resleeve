@@ -182,6 +182,16 @@ func New(cfg Config) (*Server, error) {
 	if cfg.MasterKey != nil && len(cfg.MasterKey) != 32 {
 		return nil, fmt.Errorf("serve: master key must be 32 bytes, got %d", len(cfg.MasterKey))
 	}
+	// Round-12 Part A slice 2 (default-flip): in MULTI-TENANT mode the
+	// client default policy is server-side, so the daemon sends PLAINTEXT
+	// over TLS and the server's at-rest DEK is the sole encryption layer.
+	// A multi-tenant server with no master key would therefore persist
+	// plaintext for every brain — so we require the key here rather than
+	// silently degrading. Single-tenant solo self-hosters keep zero-
+	// knowledge client sealing, so the master key stays optional there.
+	if !cfg.SingleTenant && len(cfg.MasterKey) == 0 {
+		return nil, errors.New("serve: multi-tenant serve requires a 32-byte master key (clients send plaintext under the default server-side policy)")
+	}
 	// sec-M1: persist the login-challenge HMAC key so the synthetic salt
 	// for unknown-email probes is stable across `resleeve serve` restarts.
 	// First-boot generates 32 random bytes; subsequent boots re-read the
@@ -230,9 +240,18 @@ func (s *Server) routes() {
 	// /v2/sync/* are brain-scoped: requireBrain resolves the acting brain
 	// from the ?brain selector (default: personal), validates membership,
 	// and the handlers prepend/strip the brain prefix transparently.
+	s.mux.HandleFunc("GET /v2/sync/whoami", s.requireBrain(s.handleWhoami))
 	s.mux.HandleFunc("POST /v2/sync/push", s.requireBrain(s.handlePush))
 	s.mux.HandleFunc("GET /v2/sync/pull", s.requireBrain(s.handlePull))
 	s.mux.HandleFunc("GET /v2/sync/sse", s.requireBrain(s.handleSSE))
+}
+
+// multiTenant reports whether this server partitions data by brain and
+// requires a per-device (user-identifying) bearer on /v2/sync/*. It is
+// the inverse of single-tenant mode. The round-12 client seal-decision
+// and the master-key requirement both key off this.
+func (s *Server) multiTenant() bool {
+	return !s.singleTenant
 }
 
 // ServeHTTP makes *Server an http.Handler.
@@ -248,6 +267,60 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "service": "resleeve-serve", "version": "v2"})
+}
+
+// WhoamiResp is the wire body for GET /v2/sync/whoami (round-12 Part A,
+// slice 2). It is the daemon's seal-decision handshake: the client reads
+// MultiTenant + EncryptionPolicy and computes shouldSeal =
+// !MultiTenant || EncryptionPolicy == "e2e". The endpoint is auth-only —
+// it returns NO plaintext blob bytes — so the daemon may probe it even
+// while sync is parked pre-login.
+//
+// In single-tenant mode MultiTenant is false and BrainID/EncryptionPolicy
+// are empty: there is no brain partitioning and the daemon always seals
+// (zero-knowledge), matching the legacy solo behavior. In multi-tenant
+// mode the fields describe the acting brain (the ?brain selector,
+// defaulting to the caller's personal brain).
+type WhoamiResp struct {
+	MultiTenant      bool   `json:"multi_tenant"`
+	BrainID          string `json:"brain_id"`
+	EncryptionPolicy string `json:"encryption_policy"`
+}
+
+// handleWhoami answers the seal-decision handshake. It is wrapped by
+// requireBrain, so by the time we get here the caller is authenticated
+// and (in multi-tenant mode) the acting brain is resolved + membership-
+// validated. Single-tenant mode reports {multi_tenant:false} with empty
+// brain/policy.
+func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
+	bc, ok := brainFromContext(r)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "missing brain context")
+		return
+	}
+	resp := WhoamiResp{MultiTenant: s.multiTenant()}
+	if !s.multiTenant() {
+		// Single-tenant: no brain, no per-brain policy. shouldSeal is
+		// forced true client-side off MultiTenant=false.
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	resp.BrainID = bc.brainID
+	// Resolve the acting brain's encryption policy. A brain row always
+	// carries a policy (defaults to server-side at the storage layer), so
+	// a lookup miss is an internal inconsistency, not a client error.
+	if s.brains != nil && bc.brainID != "" {
+		b, err := s.brains.Get(r.Context(), bc.brainID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "lookup brain policy: "+err.Error())
+			return
+		}
+		resp.EncryptionPolicy = string(b.EncryptionPolicy)
+	}
+	if resp.EncryptionPolicy == "" {
+		resp.EncryptionPolicy = string(rsql.EncryptionPolicyServerSide)
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // PushReq is the wire body for POST /v2/sync/push.

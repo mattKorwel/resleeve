@@ -38,7 +38,12 @@ func newIdentityServer(t *testing.T) (*httptest.Server, string, *sqlite.Store) {
 		Pairings:    store.Pairings(),
 		ServeMeta:   store.ServeMeta(),
 		Brains:      store.Brains(),
+		BrainKeys:   store.BrainKeys(),
 		Memberships: store.Memberships(),
+		// Multi-tenant (the default) now requires a master key — slice 2's
+		// default-flip makes the server's at-rest DEK the sole layer when
+		// clients send plaintext under the server-side policy.
+		MasterKey: mustMaster(t),
 	})
 	if err != nil {
 		t.Fatalf("serve.New: %v", err)
@@ -69,7 +74,9 @@ func newIdentityServerOnStore(t *testing.T, store *sqlite.Store, backendDir stri
 		Pairings:    store.Pairings(),
 		ServeMeta:   store.ServeMeta(),
 		Brains:      store.Brains(),
+		BrainKeys:   store.BrainKeys(),
 		Memberships: store.Memberships(),
+		MasterKey:   mustMaster(t),
 	})
 	if err != nil {
 		t.Fatalf("serve.New: %v", err)

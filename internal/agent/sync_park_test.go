@@ -20,7 +20,12 @@ import (
 func TestDrainLoop_ParksWithoutSealer(t *testing.T) {
 	var pushCalls int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&pushCalls, 1)
+		// round-12: whoami (GET /v2/sync/whoami) is auth-only and runs even
+		// while parked, so the park assertion must count ONLY the push POST.
+		// A catch-all counter would wrongly tick on the whoami handshake.
+		if r.Method == http.MethodPost && r.URL.Path == "/v2/sync/push" {
+			atomic.AddInt32(&pushCalls, 1)
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"committed":[]}`))
 	}))
