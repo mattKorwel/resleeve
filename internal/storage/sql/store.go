@@ -393,6 +393,12 @@ type BrainStore interface {
 	// ListForUser returns every brain userID is a member of (via the
 	// memberships join), regardless of ownership.
 	ListForUser(ctx context.Context, userID string) ([]*Brain, error)
+	// UpdatePolicy sets a brain's encryption_policy (round-12 Part A
+	// slice 3). policy must be one of the EncryptionPolicy constants;
+	// any other value is rejected. Touches updated_at. ErrNotFound when
+	// the brain does not exist. Authz (owner-only, personal-only for e2e)
+	// is enforced above the store, at the HTTP layer.
+	UpdatePolicy(ctx context.Context, brainID string, policy EncryptionPolicy) error
 }
 
 // BrainKeyStore persists the per-brain wrapped Data Encryption Keys for

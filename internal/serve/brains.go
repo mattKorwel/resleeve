@@ -59,6 +59,13 @@ type ListMembersResp struct {
 	Members []string `json:"members"`
 }
 
+// SetPolicyReq is the body of PUT /v1/brains/{id}/policy (round-12 Part A
+// slice 3). The owner flips the brain's encryption_policy — e.g. back to
+// 'e2e' (zero-knowledge) on a trusted multi-tenant server.
+type SetPolicyReq struct {
+	EncryptionPolicy string `json:"encryption_policy"`
+}
+
 // --- route registration ---
 
 // registerBrainRoutes wires the brain management endpoints. Called from
@@ -69,6 +76,7 @@ func (s *Server) registerBrainRoutes() {
 	s.mux.HandleFunc("GET /v1/brains/{id}/members", s.requireUser(s.handleListMembers))
 	s.mux.HandleFunc("POST /v1/brains/{id}/members", s.requireUser(s.handleAddMember))
 	s.mux.HandleFunc("DELETE /v1/brains/{id}/members/{user_id}", s.requireUser(s.handleRemoveMember))
+	s.mux.HandleFunc("PUT /v1/brains/{id}/policy", s.requireUser(s.handleSetPolicy))
 }
 
 // requireUser gates a handler on a per-device bearer that resolves to a
@@ -243,6 +251,55 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request, dev 
 	}
 	if err := s.memberships.Remove(r.Context(), brainID, target); err != nil {
 		writeError(w, http.StatusInternalServerError, "remove member: "+err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleSetPolicy flips a brain's encryption_policy (round-12 Part A
+// slice 3). Owner-only (requireOwner → 404 unknown / 403 not owner).
+// Validation: 'e2e' is only allowed on a PERSONAL brain — end-to-end on a
+// shared brain needs group keys (not built yet), so it's a 400.
+// 'server-side' is always allowed.
+//
+// Green-field note: switching an existing server-side brain to e2e does
+// NOT re-encrypt rows already at rest under the server DEK. Only NEW client
+// writes get sealed (the daemon re-samples shouldSeal at its next whoami
+// handshake). See docs/design/round-12/04-e2e-opt-in-slice.md.
+func (s *Server) handleSetPolicy(w http.ResponseWriter, r *http.Request, dev *rsql.Device) {
+	defer r.Body.Close()
+	brainID := r.PathValue("id")
+	b, ok := s.requireOwner(w, r, dev, brainID)
+	if !ok {
+		return
+	}
+	var req SetPolicyReq
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("decode: %v", err))
+		return
+	}
+	policy := rsql.EncryptionPolicy(strings.TrimSpace(req.EncryptionPolicy))
+	switch policy {
+	case rsql.EncryptionPolicyServerSide:
+		// Always allowed.
+	case rsql.EncryptionPolicyE2E:
+		// e2e is zero-knowledge: the server holds no key, so a shared brain
+		// would need group keys to let members read each other's writes.
+		// Not built yet — reject rather than silently lock out members.
+		if b.Kind != rsql.BrainKindPersonal {
+			writeError(w, http.StatusBadRequest,
+				"end-to-end encryption on a shared brain needs group keys; not supported yet")
+			return
+		}
+	default:
+		writeError(w, http.StatusBadRequest,
+			"invalid encryption_policy (want \"server-side\" or \"e2e\")")
+		return
+	}
+	if err := s.brains.UpdatePolicy(r.Context(), brainID, policy); err != nil {
+		writeError(w, http.StatusInternalServerError, "update policy: "+err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

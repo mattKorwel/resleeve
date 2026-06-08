@@ -59,6 +59,57 @@ func TestBrainStore_CRUD(t *testing.T) {
 	}
 }
 
+// TestBrainStore_UpdatePolicy round-trips UpdatePolicy: a created brain
+// defaults to server-side; flipping it to e2e and back persists; an
+// invalid value is rejected (and leaves the row untouched); an unknown
+// brain is ErrNotFound.
+func TestBrainStore_UpdatePolicy(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStoreFile(t)
+	seedServerUser(t, ctx, st, "user-a")
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if err := st.Brains().Create(ctx, &rsql.Brain{
+		ID: "brain-p", Name: "personal", Kind: rsql.BrainKindPersonal,
+		OwnerUserID: "user-a", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, _ := st.Brains().Get(ctx, "brain-p")
+	if got.EncryptionPolicy != rsql.EncryptionPolicyServerSide {
+		t.Fatalf("default policy = %q, want server-side", got.EncryptionPolicy)
+	}
+
+	if err := st.Brains().UpdatePolicy(ctx, "brain-p", rsql.EncryptionPolicyE2E); err != nil {
+		t.Fatalf("UpdatePolicy e2e: %v", err)
+	}
+	got, _ = st.Brains().Get(ctx, "brain-p")
+	if got.EncryptionPolicy != rsql.EncryptionPolicyE2E {
+		t.Fatalf("after update, policy = %q, want e2e", got.EncryptionPolicy)
+	}
+
+	if err := st.Brains().UpdatePolicy(ctx, "brain-p", rsql.EncryptionPolicyServerSide); err != nil {
+		t.Fatalf("UpdatePolicy server-side: %v", err)
+	}
+	got, _ = st.Brains().Get(ctx, "brain-p")
+	if got.EncryptionPolicy != rsql.EncryptionPolicyServerSide {
+		t.Fatalf("after revert, policy = %q, want server-side", got.EncryptionPolicy)
+	}
+
+	if err := st.Brains().UpdatePolicy(ctx, "brain-p", rsql.EncryptionPolicy("garbage")); err == nil {
+		t.Fatal("UpdatePolicy(garbage): want error, got nil")
+	}
+	got, _ = st.Brains().Get(ctx, "brain-p")
+	if got.EncryptionPolicy != rsql.EncryptionPolicyServerSide {
+		t.Fatalf("after rejected update, policy = %q, want unchanged server-side", got.EncryptionPolicy)
+	}
+
+	if err := st.Brains().UpdatePolicy(ctx, "no-such-brain", rsql.EncryptionPolicyE2E); !errors.Is(err, rsql.ErrNotFound) {
+		t.Fatalf("UpdatePolicy(unknown): want ErrNotFound, got %v", err)
+	}
+}
+
 func TestMembershipStore_AddListIsMember(t *testing.T) {
 	ctx := context.Background()
 	st := openTestStoreFile(t)

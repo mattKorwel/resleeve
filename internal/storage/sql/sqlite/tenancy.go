@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	rsql "github.com/mattkorwel/resleeve/internal/storage/sql"
@@ -73,6 +74,34 @@ func (s *brainStore) ListForUser(ctx context.Context, userID string) ([]*rsql.Br
 	}
 	defer rows.Close()
 	return scanBrains(rows)
+}
+
+// UpdatePolicy sets a brain's encryption_policy (round-12 Part A slice 3).
+// It validates the policy value (the only two the matrix knows) so a typo
+// never lands a junk policy the daemon would then read at handshake time.
+// Authz — owner-only, and e2e only on a personal brain — is enforced at the
+// HTTP layer; the store just persists a validated value and bumps
+// updated_at.
+func (s *brainStore) UpdatePolicy(ctx context.Context, brainID string, policy rsql.EncryptionPolicy) error {
+	switch policy {
+	case rsql.EncryptionPolicyServerSide, rsql.EncryptionPolicyE2E:
+	default:
+		return fmt.Errorf("invalid encryption_policy %q", policy)
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE brains SET encryption_policy = ?, updated_at = ? WHERE id = ?`,
+		string(policy), time.Now().UTC().Format(time.RFC3339Nano), brainID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return rsql.ErrNotFound
+	}
+	return nil
 }
 
 // prefixedBrainColumns is brainColumns qualified with the `b` alias for

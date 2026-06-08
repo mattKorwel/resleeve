@@ -23,6 +23,7 @@ import (
 //	resleeve brain member list <brain>    list a brain's members
 //	resleeve brain member add <brain> <user>   add a member (owner only)
 //	resleeve brain member rm  <brain> <user>   remove a member (owner only)
+//	resleeve brain encrypt <brain> <e2e|server-side>  set a brain's policy (owner only)
 //	resleeve brain use <brain-id>         set the machine's active brain
 //	resleeve brain use --clear            revert to your personal brain
 //
@@ -31,7 +32,7 @@ import (
 // (it writes the active-brain client config the daemon reads).
 func runBrain(ctx context.Context, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: resleeve brain <create|list|member|use> [args]")
+		fmt.Fprintln(os.Stderr, "usage: resleeve brain <create|list|member|encrypt|use> [args]")
 		return 2
 	}
 	sub, rest := args[0], args[1:]
@@ -42,6 +43,8 @@ func runBrain(ctx context.Context, args []string) int {
 		return runBrainList(ctx, rest)
 	case "member":
 		return runBrainMember(ctx, rest)
+	case "encrypt":
+		return runBrainEncrypt(ctx, rest)
 	case "use":
 		return runBrainUse(ctx, rest)
 	default:
@@ -236,6 +239,52 @@ func runBrainMemberList(ctx context.Context, args []string) int {
 	return 0
 }
 
+// runBrainEncrypt sets a brain's encryption_policy (round-12 Part A
+// slice 3). Owner-only on the server. `e2e` (zero-knowledge) is only valid
+// on a PERSONAL brain; the server rejects e2e on a shared brain with 400.
+//
+// The policy takes effect for NEW client writes the next time the daemon
+// runs its whoami handshake — it samples shouldSeal at Start and on brain
+// change, so an already-running daemon needs a restart (`resleeve down &&
+// resleeve up`) or a `resleeve brain use` to re-sample. Existing rows are
+// not re-encrypted.
+func runBrainEncrypt(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("brain encrypt", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	upstream := fs.String("upstream", "", "v2 sync upstream URL (default: $RESLEEVE_UPSTREAM)")
+	email := fs.String("email", "", "account email (for keychain lookup; default: prompt)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	rest := fs.Args()
+	if len(rest) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: resleeve brain encrypt [--upstream URL] [--email E] <brain-id> <e2e|server-side>")
+		return 2
+	}
+	brainID := strings.TrimSpace(rest[0])
+	policy := strings.TrimSpace(rest[1])
+	switch policy {
+	case "e2e", "server-side":
+	default:
+		fmt.Fprintf(os.Stderr, "brain encrypt: policy must be \"e2e\" or \"server-side\", got %q\n", policy)
+		return 2
+	}
+
+	up, token, ok := upstreamAuth(*upstream, *email)
+	if !ok {
+		return 1
+	}
+	if err := putJSON(ctx, up+"/v1/brains/"+brainID+"/policy", token,
+		serve.SetPolicyReq{EncryptionPolicy: policy}, nil); err != nil {
+		fmt.Fprintln(os.Stderr, "brain encrypt:", err)
+		return 1
+	}
+	fmt.Printf("brain %s encryption policy set to %s\n", brainID, policy)
+	fmt.Println("the running daemon picks this up on its next handshake — restart")
+	fmt.Println("(resleeve down && resleeve up) or `resleeve brain use` to re-sample.")
+	return 0
+}
+
 // runBrainUse sets (or clears) the machine's GLOBAL active brain. This is
 // a local-only operation: it writes the active-brain client config that
 // the daemon's sync client reads to append ?brain=<id> upstream. A
@@ -294,6 +343,12 @@ func getJSON(ctx context.Context, endpoint, bearer string, out any) error {
 // drained. Used by `brain member rm`.
 func deleteJSON(ctx context.Context, endpoint, bearer string) error {
 	return requestJSON(ctx, http.MethodDelete, endpoint, bearer, nil, nil)
+}
+
+// putJSON issues an authenticated PUT with a JSON body. Used by `brain
+// encrypt` to set a brain's encryption_policy.
+func putJSON(ctx context.Context, endpoint, bearer string, body, out any) error {
+	return requestJSON(ctx, http.MethodPut, endpoint, bearer, body, out)
 }
 
 // requestJSON is the shared GET/DELETE driver. POST keeps using postJSON

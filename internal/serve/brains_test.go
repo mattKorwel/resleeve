@@ -1,6 +1,7 @@
 package serve
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -170,7 +171,111 @@ func TestBrain_SharedKeyspaceRoundTrip(t *testing.T) {
 	}
 }
 
-// --- GET / DELETE test helpers (post/postStatus only cover POST) ---
+// TestBrain_SetPolicy_PersonalE2E: the owner flips their PERSONAL brain to
+// e2e (204), and whoami then reflects e2e for that brain. Reverting to
+// server-side is likewise 204 and reflected.
+func TestBrain_SetPolicy_PersonalE2E(t *testing.T) {
+	_, base, _ := newIdentityServer(t)
+	_, tok, personal := regUser(t, base, "owner@example.com")
+
+	// Baseline: whoami reports the default server-side.
+	var who WhoamiResp
+	getOK(t, base+"/v2/sync/whoami", tok, &who)
+	if who.EncryptionPolicy != "server-side" {
+		t.Fatalf("baseline policy = %q, want server-side", who.EncryptionPolicy)
+	}
+
+	// Flip the personal brain to e2e.
+	putStatus(t, base+"/v1/brains/"+personal+"/policy", tok,
+		SetPolicyReq{EncryptionPolicy: "e2e"}, 204)
+
+	// whoami (no selector → personal brain) now reflects e2e — confirms the
+	// 12A.2 handshake reads the updated policy.
+	getOK(t, base+"/v2/sync/whoami", tok, &who)
+	if who.EncryptionPolicy != "e2e" {
+		t.Fatalf("after set e2e, whoami policy = %q, want e2e", who.EncryptionPolicy)
+	}
+
+	// Revert to server-side.
+	putStatus(t, base+"/v1/brains/"+personal+"/policy", tok,
+		SetPolicyReq{EncryptionPolicy: "server-side"}, 204)
+	getOK(t, base+"/v2/sync/whoami", tok, &who)
+	if who.EncryptionPolicy != "server-side" {
+		t.Fatalf("after revert, whoami policy = %q, want server-side", who.EncryptionPolicy)
+	}
+}
+
+// TestBrain_SetPolicy_E2EOnSharedRejected: e2e on a SHARED brain is a 400
+// (group keys not built yet); server-side on the same shared brain is fine.
+func TestBrain_SetPolicy_E2EOnSharedRejected(t *testing.T) {
+	_, base, _ := newIdentityServer(t)
+	_, ownerTok, _ := regUser(t, base, "owner@example.com")
+
+	var created CreateBrainResp
+	post(t, base+"/v1/brains", ownerTok, CreateBrainReq{Name: "team"}, &created, 201)
+
+	putStatus(t, base+"/v1/brains/"+created.BrainID+"/policy", ownerTok,
+		SetPolicyReq{EncryptionPolicy: "e2e"}, 400)
+	// server-side is always allowed, even on a shared brain.
+	putStatus(t, base+"/v1/brains/"+created.BrainID+"/policy", ownerTok,
+		SetPolicyReq{EncryptionPolicy: "server-side"}, 204)
+}
+
+// TestBrain_SetPolicy_Authz: a non-owner gets 403; an unknown brain 404.
+func TestBrain_SetPolicy_Authz(t *testing.T) {
+	_, base, _ := newIdentityServer(t)
+	_, ownerTok, _ := regUser(t, base, "owner@example.com")
+	_, strangerTok, strangerPersonal := regUser(t, base, "stranger@example.com")
+
+	var created CreateBrainResp
+	post(t, base+"/v1/brains", ownerTok, CreateBrainReq{Name: "team"}, &created, 201)
+
+	// A stranger cannot set the owner's brain policy (403, not 404 — the
+	// brain exists, they just don't own it).
+	putStatus(t, base+"/v1/brains/"+created.BrainID+"/policy", strangerTok,
+		SetPolicyReq{EncryptionPolicy: "server-side"}, 403)
+
+	// Unknown brain → 404 (no info leak), even for a real user.
+	putStatus(t, base+"/v1/brains/deadbeef/policy", ownerTok,
+		SetPolicyReq{EncryptionPolicy: "server-side"}, 404)
+
+	// Sanity: the stranger CAN set policy on their own personal brain.
+	putStatus(t, base+"/v1/brains/"+strangerPersonal+"/policy", strangerTok,
+		SetPolicyReq{EncryptionPolicy: "e2e"}, 204)
+}
+
+// TestBrain_SetPolicy_InvalidValue: an unknown policy string is a 400.
+func TestBrain_SetPolicy_InvalidValue(t *testing.T) {
+	_, base, _ := newIdentityServer(t)
+	_, tok, personal := regUser(t, base, "owner@example.com")
+	putStatus(t, base+"/v1/brains/"+personal+"/policy", tok,
+		SetPolicyReq{EncryptionPolicy: "nonsense"}, 400)
+}
+
+// --- GET / DELETE / PUT test helpers (post/postStatus only cover POST) ---
+
+func putStatus(t *testing.T, url, bearer string, body any, want int) {
+	t.Helper()
+	b, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("new PUT req: %v", err)
+	}
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	resp, err := newHTTPClient().Do(req)
+	if err != nil {
+		t.Fatalf("PUT %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != want {
+		t.Fatalf("PUT %s: got %d, want %d (%s)", url, resp.StatusCode, want, readAll(t, resp.Body))
+	}
+}
 
 func getOK(t *testing.T, url, bearer string, out any) {
 	t.Helper()
