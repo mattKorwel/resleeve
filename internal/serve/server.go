@@ -126,11 +126,21 @@ type Server struct {
 	// and pre-dates the identity stack the oracle would target.
 	loginChallengeKey []byte
 
-	// sseSubscribers is the live SSE fan-out set for kind=memory.
-	// Each subscriber owns a buffered channel; slow subscribers get
-	// their events dropped (the SSE backlog replay covers catch-up).
-	sseMu          sync.RWMutex
-	sseSubscribers map[chan PushRow]struct{}
+	// fanout is the brain-keyed live SSE pub/sub for kind=memory
+	// (round-13 slice 1). handlePush publishes a brain's memory row under
+	// its brain_id; handleSSE subscribes to its acting brain_id. Slow
+	// subscribers get rows dropped (the SSE backlog replay covers
+	// catch-up). SEAM: a Postgres LISTEN/NOTIFY backplane replaces the
+	// in-process impl behind the fanoutHub interface for scale-out — see
+	// fanout.go. The in-process impl is sufficient for a single instance.
+	fanout fanoutHub
+
+	// sseHeartbeat is the interval between SSE keepalive comments
+	// (": ping\n\n"). Reverse proxies / LBs buffer or time out idle SSE
+	// connections; the heartbeat keeps the connection live with zero
+	// payload. Defaults to 15s; tests override it to assert heartbeats
+	// without a 15s wait. Zero means "use the default".
+	sseHeartbeat time.Duration
 
 	// loginTimingDecoy is a per-process random 32-byte value compared
 	// against the client's verifier_hash on the unknown-email branch of
@@ -225,7 +235,7 @@ func New(cfg Config) (*Server, error) {
 		dekCache:          map[string][]byte{},
 		loginChallengeKey: challengeKey,
 		loginTimingDecoy:  timingDecoy,
-		sseSubscribers:    map[chan PushRow]struct{}{},
+		fanout:            newInProcessHub(),
 		pairAttempts:      map[string]int{},
 	}
 	s.routes()
@@ -388,29 +398,22 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		// Ack the CLIENT's (brain-agnostic) key so the daemon's outbox
 		// ack matches what it sent.
 		committed = append(committed, row.Key)
-		// Fast-tier fan-out: memory rows trigger live delivery to SSE
-		// subscribers. We fan out the STORED (brain-prefixed) key so each
-		// subscriber can filter to its own brain. Backend.Put has already
-		// persisted; SSE is just the low-latency notification path. Slow
-		// subscribers (full buffer) silently drop — they catch up on
+		// Fast-tier fan-out (round-13 slice 1): memory rows trigger live
+		// delivery to the SSE subscribers OF THIS BRAIN. We publish under
+		// bc.brainID, so the hub routes the row only to connections whose
+		// acting brain is this one — that's the cross-member guarantee
+		// (member B subscribed to shared brain X receives member A's push
+		// live) without amplifying every brain's writes to every
+		// connection. We ship the STORED (brain-prefixed) key + the
+		// PLAINTEXT blob (matching what pull returns). Backend.Put has
+		// already persisted; SSE is just the low-latency notification path.
+		// Slow subscribers (full buffer) silently drop — they catch up on
 		// reconnect via the backlog replay window.
 		if strings.HasPrefix(row.Key, "memory/") {
-			s.fanoutMemory(PushRow{Key: storedKey, Blob: row.Blob})
+			s.fanout.Publish(bc.brainID, PushRow{Key: storedKey, Blob: row.Blob})
 		}
 	}
 	writeJSON(w, http.StatusOK, PushResp{Committed: committed})
-}
-
-func (s *Server) fanoutMemory(row PushRow) {
-	s.sseMu.RLock()
-	defer s.sseMu.RUnlock()
-	for ch := range s.sseSubscribers {
-		select {
-		case ch <- row:
-		default:
-			// Drop: subscriber is slow. SSE reconnect+since= will replay.
-		}
-	}
 }
 
 // PullResp is the wire body for GET /v2/sync/pull.
@@ -481,8 +484,9 @@ func scopeCursor(brainID, cursor string) string {
 
 // handleSSE serves GET /v2/sync/sse?kind=memory[&since=<cursor>].
 // It first replays the memory backlog strictly after `since`, then
-// subscribes to live pushes. Emits a heartbeat (":\n\n") every 15s
-// to keep proxies from closing the idle connection.
+// subscribes (via the brain-keyed fan-out hub) to live pushes for its
+// acting brain. Emits a heartbeat (": ping\n\n") every 15s to keep
+// proxies/LBs from closing the idle connection.
 //
 // Wire format: each event is one SSE data frame whose body is the JSON
 // encoding of a PushRow ({"key":..., "blob":<base64>}). Heartbeats are
@@ -511,18 +515,14 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	// Subscribe FIRST so events that arrive between the backlog read
-	// and the live loop aren't lost. We tolerate duplicates between
-	// backlog and live (the client's ingester is idempotent on key).
-	ch := make(chan PushRow, 64)
-	s.sseMu.Lock()
-	s.sseSubscribers[ch] = struct{}{}
-	s.sseMu.Unlock()
-	defer func() {
-		s.sseMu.Lock()
-		delete(s.sseSubscribers, ch)
-		s.sseMu.Unlock()
-	}()
+	// Subscribe FIRST (to this connection's acting brain) so events that
+	// arrive between the backlog read and the live loop aren't lost. The
+	// hub is keyed on brain_id, so we only ever receive rows for THIS
+	// brain — no cross-brain rows to filter out. We tolerate duplicates
+	// between backlog and live (the client's ingester is idempotent on
+	// key). cancel unregisters the subscriber on disconnect.
+	ch, cancel := s.fanout.Subscribe(bc.brainID)
+	defer cancel()
 
 	// Backlog replay: ship every memory row strictly after `since`, scoped
 	// to the acting brain. Paginates internally via List's cursor semantics.
@@ -558,7 +558,11 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	heartbeat := time.NewTicker(15 * time.Second)
+	hbInterval := s.sseHeartbeat
+	if hbInterval <= 0 {
+		hbInterval = 15 * time.Second
+	}
+	heartbeat := time.NewTicker(hbInterval)
 	defer heartbeat.Stop()
 
 	for {
@@ -566,17 +570,18 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-heartbeat.C:
-			if _, err := fmt.Fprint(w, ":\n\n"); err != nil {
+			// SSE comment keepalive: a line starting with ":" is ignored by
+			// the client parser but keeps proxies/LBs from closing the idle
+			// connection. The client (internal/agent runSSE) tolerates these.
+			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
 				return
 			}
 			flusher.Flush()
 		case row := <-ch:
-			// Live fan-out rows carry the STORED (brain-prefixed) key.
-			// Deliver only those under the acting brain, and strip the
+			// Live fan-out rows carry the STORED (brain-prefixed) key and
+			// the plaintext blob. The hub already routed only THIS brain's
+			// rows here (it's keyed on brain_id), so we just strip the
 			// prefix so the client sees brain-agnostic keys.
-			if bc.brainID != "" && !strings.HasPrefix(row.Key, bc.brainID+"/") {
-				continue
-			}
 			if err := writeSSEEvent(w, PushRow{Key: unscopeKey(bc.brainID, row.Key), Blob: row.Blob}); err != nil {
 				return
 			}
