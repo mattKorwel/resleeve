@@ -12,13 +12,51 @@ Pre-1.0 versions (`0.x.y`) may include breaking changes in minor bumps. See
 
 ### Added
 
-- _(your next entry here)_
-
 ### Changed
 
 ### Fixed
 
 ### Security
+
+## [0.3.0] - 2026-06-09
+
+### Added
+
+- **More coding CLIs.** Capture and resume sessions from **Codex** and
+  **opencode** at full fidelity (native resume back into the same tool), plus
+  **Google Antigravity** (experimental). Choose the tool with
+  `resleeve install-bridge --adapter <name>`; Claude Code stays the default.
+- **In-session memory tools (MCP).** `resleeve install-bridge --mcp` registers
+  resleeve's memory server into each CLI so an agent can read and curate your
+  plans and learnings while it works. `--mcp-only` installs just the server;
+  `install-bridge --uninstall` removes it.
+- **Team mode.** `resleeve serve` can host a group: each person gets their own
+  private memory, and you can create **shared memory** a team reads and writes.
+  New `resleeve brain` commands — `create`, `list`, `member add|rm|list`,
+  `use` — create and join shared spaces and choose which one a machine writes
+  to. Use `serve --single-tenant` for a solo server.
+- **Plan history + safe concurrent edits.** Plans now keep a full version
+  history; concurrent edits are conflict-checked — a stale edit is rejected
+  with the current version so you can reconcile instead of silently
+  overwriting. Learnings now record who added them.
+
+### Changed
+
+- **Encryption is layered and configurable.** A team server
+  (`serve --master-key`) encrypts data at rest with a separate key per memory
+  space; a solo `--single-tenant` server keeps full end-to-end encryption and
+  only ever stores ciphertext. On a team server you can switch a personal space
+  back to end-to-end with `resleeve brain encrypt <id> e2e`. Team servers
+  require a master key (`--master-key` / `$RESLEEVE_SERVER_MASTER_KEY`).
+- Refreshed the README and user/architecture docs; added a team-shared-memory
+  walkthrough.
+
+### Security
+
+- Multi-user servers enforce per-user isolation: each token can read and write
+  only its own (and explicitly shared) memory — never another user's.
+- The encryption key is now wiped from daemon memory on logout instead of
+  lingering until garbage collection.
 
 ## [0.2.0] - 2026-06-04
 
@@ -79,6 +117,7 @@ Pre-1.0 versions (`0.x.y`) may include breaking changes in minor bumps. See
   (user-visible notice), `hookSpecificOutput.additionalContext`
   (model-visible context), and `~/.resleeve/last-injected.md` (audit trail).
 
-[Unreleased]: https://github.com/mattkorwel/resleeve/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/mattkorwel/resleeve/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/mattkorwel/resleeve/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mattkorwel/resleeve/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mattkorwel/resleeve/releases/tag/v0.1.0

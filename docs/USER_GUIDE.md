@@ -1,15 +1,17 @@
 # resleeve — User Guide
 
 The comprehensive how-to for the `resleeve` CLI. Covers daemon lifecycle, the
-memory module (scopes / plans / learnings + inheritance), the MCP curation
+CLI adapters (Claude Code, Codex, opencode, Antigravity), the memory module
+(scopes / plans / learnings + inheritance + plan versioning), the MCP curation
 server, the two capture modes, cross-machine sync (standalone vs connected,
-identity, pairing, KEK migration), the `resume` verb, manual-sync escape
-hatches, pre-existing data backfill, and troubleshooting.
+identity, pairing, KEK migration), team mode and shared brains, the encryption
+model, the `resume` verb, manual-sync escape hatches, pre-existing data
+backfill, and troubleshooting.
 
 For a 5-minute setup, read [`QUICKSTART.md`](../QUICKSTART.md) first. For the
 internal model, see [`ARCHITECTURE.md`](../ARCHITECTURE.md). For a
 non-destructive validation checklist, see [`SMOKE.md`](./SMOKE.md). For the
-round-by-round design history, see [`docs/design/round-{1,2,3,4}/`](./design/).
+full design history, see [`docs/design/`](./design/).
 
 ---
 
@@ -30,8 +32,8 @@ Everything lives under `~/.resleeve/`:
   daemon.pid           PID of the running daemon (used by `down`, `doctor`)
   daemon.log           stdout/stderr of the background daemon
   endpoint             "127.0.0.1:PORT BEARER" pair — discovered by every CLI verb
-  last-injected.md     F14 audit trail: the most recent SessionStart additionalContext
-  seal.key             (legacy) round-4 placeholder KEK — see §5.5
+  last-injected.md     audit trail: the most recent SessionStart additionalContext
+  seal.key             (legacy) placeholder KEK — see §5.5
 ```
 
 Override with `RESLEEVE_DATA_DIR` if you need to. Mode bits are `0700` for the
@@ -89,7 +91,7 @@ resleeve doctor
   hook env         ✓ bridge + daemon both up
 ```
 
-Exit code: **1** when bridge is installed but the daemon is down — the F13
+Exit code: **1** when bridge is installed but the daemon is down — the
 silent-no-op state. Scripted callers (CI, smoke tests, `doctor && up` chains)
 will catch this. On a TTY the warning is bright red.
 
@@ -122,6 +124,49 @@ resleeve purge
 # This will delete /Users/you/.resleeve permanently.
 # Type 'purge' to confirm: purge
 # purged.
+```
+
+### 1.7 CLI adapters and `install-bridge`
+
+resleeve supports four CLIs. `resleeve up` installs the Claude Code bridge by
+default; to wire another CLI use `resleeve install-bridge --adapter <name>`.
+Each adapter self-registers, so the rest of resleeve (scopes, plans, learnings,
+sync) behaves identically regardless of which CLI you drive.
+
+| Adapter (`--adapter`) | Session capture | Native resume (same CLI) | Prime resume (cross-CLI) | MCP memory tools |
+| --- | --- | --- | --- | --- |
+| `claude` | ✓ hooks + reconcile | ✓ JSONL replay | ✓ | ✓ |
+| `codex` | ✓ hooks + rollout reconcile | ✓ `codex resume` | ✓ | ✓ |
+| `opencode` | ✓ DB + SSE (no bridge needed) | ✓ `opencode import` | ✓ | ✓ |
+| `antigravity` | ⚠ experimental (file-watch) | ✗ | ✓ | ✓ |
+
+Legend: ✓ shipped · ⚠ experimental · ✗ not supported. Antigravity reads an
+undocumented on-disk format and only resumes via the synthesized prime path.
+
+```bash
+resleeve install-bridge --adapter codex          # install the Codex bridge
+resleeve install-bridge --adapter opencode       # opencode
+resleeve install-bridge --adapter antigravity    # experimental
+```
+
+`install-bridge` flags:
+
+| Flag | Meaning |
+| --- | --- |
+| `--adapter NAME` | Which CLI to wire (`claude` \| `codex` \| `opencode` \| `antigravity`; default `claude`) |
+| `--memory-only` | Install only the SessionStart injection hook — no capture (see §4) |
+| `--mcp` | **Also** register the `resleeve mcp` memory server in the CLI's MCP config (in addition to the capture hook) |
+| `--mcp-only` | Register **only** the MCP memory server; skip the capture hook entirely |
+| `--uninstall` | Remove resleeve's entries instead of installing (honors `--mcp` / `--mcp-only` to scope what's removed) |
+| `--dry-run` | Print the resulting settings; don't write |
+
+`--mcp` is how you let the in-session agent read and curate memory directly
+(see §3). `--mcp-only` is useful for CLIs that pull memory rather than being
+push-injected via a hook. To tear a bridge down:
+
+```bash
+resleeve install-bridge --adapter codex --uninstall            # remove hook + (if added) mcp
+resleeve install-bridge --adapter opencode --mcp-only --uninstall  # remove only the mcp entry
 ```
 
 ---
@@ -244,6 +289,40 @@ resleeve plan list resleeve
 shallow→deep order — the same format the SessionStart hook bakes into
 `additionalContext`.
 
+#### 2.2.1 Plan version history and safe concurrent edits
+
+Plans keep **version history**: every write creates a new version rather than
+discarding the old content. Each write also records **who** made it (the
+author), which matters once a brain is shared across a team (§10).
+
+Writes use **optimistic concurrency**. `plan write` reads the current version
+first and writes against it. If someone else advanced the plan since you last
+read it, your write is **rejected** — resleeve prints the current version and
+tells you to reconcile, instead of silently overwriting their change:
+
+```bash
+echo "..." | resleeve plan write acme-backend
+# plan write: conflict — acme-backend [_default] was advanced to version 7
+# since you last read it.
+# Re-read with `resleeve plan read acme-backend`, merge, and retry
+# (or pass --force to overwrite).
+```
+
+The fix is to re-read, merge in your change, and write again — or pass
+`--force` to overwrite the current version deliberately. `plan read` prints the
+version it returned (to stderr, so stdout stays pure content) so you can see
+exactly what you're writing against.
+
+```bash
+resleeve plan read acme-backend          # stderr: "# plan acme-backend [_default] version 7"
+# ...edit...
+echo "merged content" | resleeve plan write acme-backend          # writes version 8
+echo "merged content" | resleeve plan write acme-backend --force  # overwrite, skip the check
+```
+
+On a single-user machine you'll rarely see a conflict; it's the safety net for
+shared brains where two people (or two of your own devices) edit the same plan.
+
 ### 2.3 Learnings
 
 Learnings are **append-only**. Use them for durable, punctuated conclusions
@@ -252,7 +331,7 @@ you don't want to relitigate, gotchas the next session needs. Don't use them
 as a chat log.
 
 ```bash
-resleeve learning append resleeve "F4 seq = ts.UnixNano() — same-ns ties broken by event_uuid asc."
+resleeve learning append resleeve "Event seq = ts.UnixNano() — same-ns ties broken by event_uuid asc."
 resleeve learning append resleeve - <<EOF        # multiline via stdin
 Memory-only mode: ./resleeve up --memory-only installs only the SessionStart hook.
 SessionStart still injects context; no events are persisted.
@@ -329,28 +408,39 @@ running the equivalent CLI verb.
 ### 3.1 Why it exists
 
 Before MCP, the curation pattern was: agent suggests, user types
-`resleeve plan write …` into the chat, Claude Code runs it via Bash. Round-3
-made that work but it cost a Bash invocation and a confirmation prompt per
+`resleeve plan write …` into the chat, Claude Code runs it via Bash. That
+worked but it cost a Bash invocation and a confirmation prompt per
 operation. The MCP server collapses that to one in-process tool call per
 curation, with an `instructions` field the host loads on connect.
 
-### 3.2 Registering with Claude Code
+### 3.2 Registering the MCP server
+
+The simplest path is to let `install-bridge` write the MCP entry into the CLI's
+own MCP config for you. Add `--mcp` to register the memory server alongside the
+capture hook, or `--mcp-only` to register just the memory server:
 
 ```bash
-claude mcp add resleeve resleeve mcp --scope $RESLEEVE_SCOPE
+resleeve install-bridge --adapter claude --mcp        # capture hook + MCP server
+resleeve install-bridge --adapter codex  --mcp        # same for Codex
+resleeve install-bridge --adapter opencode --mcp-only # MCP server only
+```
+
+This auto-registers `resleeve mcp` into each CLI's MCP config, so the in-session
+agent gets the `resleeve_*` tools without you editing config by hand. Remove it
+with `--uninstall` (see §1.7).
+
+You can also register manually — the binary speaks JSON-RPC 2.0 over
+stdin/stdout, so any MCP host can launch it:
+
+```bash
+claude mcp add resleeve resleeve mcp --scope $RESLEEVE_SCOPE   # manual, Claude Code
+resleeve mcp                                                   # the raw stdio server
 ```
 
 `$RESLEEVE_SCOPE` is optional. If unset, the server resolves a default scope
 at boot using the same walk the SessionStart hook does (env var → marker file
 → `filepath.Base(cwd)`). That default is the auto-loaded context the
 `instructions` field carries.
-
-For other hosts (opencode, codex, gemini-cli) the registration verb differs
-but the binary is the same:
-
-```bash
-resleeve mcp           # speaks JSON-RPC 2.0 over stdin/stdout
-```
 
 ### 3.3 The 10 tools
 
@@ -502,8 +592,8 @@ row never loops it back to upstream
 
 ### 5.3 Identity — `register` / `login` / `logout`
 
-The pre-round-5 model used a single shared bearer token plus a shared
-`seal.key` file. Round-5 replaces that with per-device identity tokens and a
+The legacy model used a single shared bearer token plus a shared
+`seal.key` file. Newer versions replace that with per-device identity tokens and a
 master-password-derived KEK.
 
 ```bash
@@ -560,7 +650,7 @@ Device tokens live in the OS keychain, not on disk:
 | Linux | `libsecret` (GNOME Keyring / KWallet / etc.) |
 | Windows | Credential Manager |
 
-The pre-follow-up-A file backend is automatically migrated on first
+The legacy file backend is automatically migrated on first
 `login` for a given `(upstream, email)` pair — upgraders don't lose tokens.
 
 ### 5.4 Pairing — `pair invite` / `pair accept`
@@ -607,13 +697,13 @@ device over an out-of-band channel within 60s is unrealistic. Adjust with
 
 Once accepted: device A's KEK is now installed on device B. Both machines
 sync against the same upstream identity. Pair invite revokes its own
-ephemeral login token on the way out (see follow-up B in
+ephemeral login token on the way out (see
 `docs/design/round-4/`).
 
 ### 5.5 `migrate-key` — placeholder → real KEK
 
-Round-4 shipped envelope encryption with a placeholder: a random 32-byte AES
-key at `~/.resleeve/seal.key`. Round-5 retires that file in favor of a KEK
+An earlier version shipped envelope encryption with a placeholder: a random 32-byte AES
+key at `~/.resleeve/seal.key`. Newer versions retire that file in favor of a KEK
 derived from your master password. If you have existing upstream-encrypted
 data captured under the old `seal.key`, run `migrate-key` ONCE to re-encrypt
 all server-side blobs under the new KEK:
@@ -670,9 +760,11 @@ modes (with a third "auto" default).
 
 Writes the captured session's events back into the target CLI's native
 on-disk format — for Claude Code that's the `.jsonl` transcript under
-`~/.claude/`. Then `exec`s `claude --resume <session-id>` so the user lands
-inside Claude Code as if they had run it themselves. Only works when the
-captured session and the target CLI are the same (claude → claude).
+`~/.claude/` — then hands off to the CLI's own resume (`claude --resume`,
+`codex resume`, `opencode import`) so you land inside that CLI as if you'd run
+it yourself. Replay is full-fidelity but only works when the captured session
+and the target CLI are the **same** vendor. Claude Code, Codex, and opencode
+each support native replay; Antigravity does not (it's prime-only).
 
 ### 6.2 Prime mode (`--mode prime`)
 
@@ -688,15 +780,15 @@ skipped — prime renders with an empty plan in that case.
 
 ### 6.3 Auto (default)
 
-`auto` picks replay when the source and target CLIs match, prime otherwise.
-opencode is forced into prime regardless (its adapter can't ingest claude's
-JSONL).
+`auto` picks replay when the source and target CLIs match and the target
+adapter supports native replay, and prime otherwise (cross-vendor, or a target
+like Antigravity that has no native replay path).
 
 ### 6.4 Flags
 
 | Flag | Meaning |
 | --- | --- |
-| `--cli NAME` | Override the target CLI (`claude`, `opencode`) |
+| `--cli NAME` | Override the target CLI (`claude`, `codex`, `opencode`, `antigravity`) |
 | `--mode replay\|prime\|auto` | Force a render mode |
 | `--cwd DIR` | Override the working directory the resumed CLI lands in |
 | `--print` | Don't `exec` — print the native resume command instead |
@@ -711,7 +803,7 @@ waiting for the 30s polling tick.
 
 If the pull times out or upstream is unreachable, `resume` falls back to
 local state and prints a warning to stderr. See
-`docs/design/round-4/03-rehydrate-ux.md` §"Failure modes".
+[`docs/design/round-4/03-rehydrate-ux.md`](./design/round-4/03-rehydrate-ux.md) §"Failure modes".
 
 ### 6.6 Examples
 
@@ -766,8 +858,8 @@ specific fix landed:
 ### 8.1 `doctor --backfill-counts`
 
 Recomputes `sessions.event_count` for every row. Cleanup for sessions
-captured before the F7 fix (`fde1c40`) wired `SyncEventCount` into
-`IngestBatch` — pre-F7 rows stayed at `event_count=0` until their next batch
+captured before the fix (`fde1c40`) wired `SyncEventCount` into
+`IngestBatch` — older rows stayed at `event_count=0` until their next batch
 arrived. Safe to re-run; `SyncEventCount` is `COUNT(*)` over events, not a
 delta.
 
@@ -799,7 +891,7 @@ resleeve up
 
 ## 9. Troubleshooting
 
-### 9.1 F13 — silent injection failure
+### 9.1 Silent injection failure
 
 **Symptom:** You opened a fresh Claude Code session and saw no
 `Resleeve memory for scope ...` notice. `doctor` shows `bridge ✓` and
@@ -812,7 +904,7 @@ down it gets connection-refused and emits nothing. Claude Code sees no
 **Fix:** `resleeve up`. The `hook env` card in `doctor` will yell at you
 loudly (bright red on a TTY, non-zero exit code) when it detects this state.
 
-### 9.2 F14 — auditing what got injected
+### 9.2 Auditing what got injected
 
 `~/.resleeve/last-injected.md` is the audit trail. After every successful
 SessionStart injection, the hook persists the exact body it emitted as
@@ -834,7 +926,7 @@ issue — the file's `mtime` tells you whether the hook ran at all.
 **Symptom:** `doctor` shows `sealer ✗ locked (run resleeve login)`. Sync
 push/pull stalls; new captures land in the outbox but never drain.
 
-**Cause:** Daemon started without a KEK installed. After round-5, the
+**Cause:** Daemon started without a KEK installed. In current versions, the
 daemon does NOT auto-load `seal.key` — you must `login` to install the KEK.
 
 **Fix:**
@@ -866,7 +958,7 @@ Three layers to check, in order:
    handler?
 
 If the file exists with recent mtime but Claude Code shows no notice,
-suspect the host-side envelope shape. The F13 fix established that Claude
+suspect the host-side envelope shape. resleeve established that Claude
 Code expects:
 
 ```json
@@ -884,17 +976,177 @@ Anything else gets silently dropped.
 ### 9.6 "Daemon down" after `down`
 
 That's how it works — `resleeve down` removes both the daemon and the
-bridge. Running `doctor` afterward shows the post-down state, not the F13
-silent-no-op state. If you want to validate F13 specifically, kill the PID
+bridge. Running `doctor` afterward shows the post-down state, not the
+silent-no-op state. If you want to validate the silent-no-op guard specifically, kill the PID
 without removing the bridge:
 
 ```bash
 kill -9 $(cat ~/.resleeve/daemon.pid) && rm ~/.resleeve/daemon.pid
-resleeve doctor   # → loud F13 warning, exit 1
+resleeve doctor   # → loud silent-no-op warning, exit 1
 ```
 
 (That stanza appears in `docs/SMOKE.md` as well — it's the standard
 recovery validation.)
+
+---
+
+## 10. Team mode and shared brains
+
+`resleeve serve` is **multi-user by default**. Each account gets its own
+private memory namespace — a **brain** — and a group can share one. This is how
+several people drive their AI agents off the same plans and learnings while
+keeping unrelated work private.
+
+For an end-to-end walkthrough (operator stands up the server, members join,
+someone creates and populates a shared brain) see
+[`use-cases/06-team-shared-memory.md`](./use-cases/06-team-shared-memory.md).
+This section is the verb/flag reference.
+
+### 10.1 What a brain is
+
+A brain is a memory namespace: its own scopes, plans, and learnings. Every
+account has a personal brain. A **shared brain** is created by a member, who
+becomes its **owner**; the owner adds other members, and any member can point a
+machine at it. When a machine's active brain is a shared brain, that machine's
+sessions read and write that shared namespace — so a plan one member writes
+auto-injects into every member's sessions, and learnings record who added them.
+
+### 10.2 Standing up a team server
+
+```bash
+resleeve serve \
+  --addr 127.0.0.1:7860 \
+  --root /var/lib/resleeve/serve \
+  --master-key /var/lib/resleeve/master.key
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--master-key FILE` | File holding the 32-byte server master key (hex or base64). **Required in team mode.** Also reads `$RESLEEVE_SERVER_MASTER_KEY`. |
+| `--single-tenant` | Solo self-host: no brains, flat behavior, client end-to-end encryption (master key optional). The old single-user model. |
+| `--addr` | Listen address (default `127.0.0.1:7860`; non-loopback prints a TLS warning) |
+| `--root` | Blob storage root |
+| `--auth-token` | Legacy single bearer (per-device tokens are the norm; see §5.3) |
+| `--dsn` | SQLite DSN for the identity database |
+
+The master key wraps each brain's at-rest encryption key (§11). **A team server
+refuses to boot without one** — clients send plaintext under the default policy,
+so the server's at-rest key is the only encryption layer and resleeve won't
+persist plaintext silently. Generate one with `openssl rand -hex 32`, store it
+mode `0600`, and back it up out of band: lose it and every brain's at-rest data
+is unrecoverable.
+
+Pass `--single-tenant` for a solo box: no brain partitioning, the client
+encrypts end-to-end (zero-knowledge — the server only sees ciphertext), and the
+master key is optional. That's the behavior covered in
+[`use-cases/05-self-hosted-serve.md`](./use-cases/05-self-hosted-serve.md).
+
+### 10.3 Joining and identity
+
+Members join exactly as in §5.3: `register` once per account, `login` to unlock
+the local sealer, `up --upstream` to bring the daemon online. A second device
+for the same person uses pairing (§5.4) instead of a second `register`.
+
+Identity is **per-device** — each device carries its own token, so a lost laptop
+is revoked with `resleeve logout` without disturbing the account's other devices
+or the rest of the team.
+
+### 10.4 `resleeve brain` — managing brains
+
+The management verbs talk to the upstream with your device token; each takes
+`--upstream URL` (or `$RESLEEVE_UPSTREAM`) and an optional `--email` for the
+keychain lookup.
+
+```bash
+resleeve brain create <name>                 # create a shared brain (you own it) → prints the brain id
+resleeve brain list                          # brains you belong to (active one starred)
+resleeve brain member list <brain-id>        # list a brain's members
+resleeve brain member add  <brain-id> <user-id>   # owner only
+resleeve brain member rm   <brain-id> <user-id>   # owner only
+```
+
+`brain create` prints the new brain id (e.g. `brn_…`) to stdout. `brain list`
+shows id, name, kind, your role, and which brain is active. User ids (`usr_…`)
+are printed by `register` / `login`; the owner needs them to add members.
+
+### 10.5 `resleeve brain use` — selecting the active brain
+
+`brain use` is **local** — it sets which brain this machine's daemon syncs
+against. It does not touch the server.
+
+```bash
+resleeve brain use <brain-id>       # make this machine read/write the shared brain
+resleeve brain use --clear          # revert to your personal brain
+```
+
+The running daemon samples the active brain at startup, so **restart it**
+(`resleeve down && resleeve up`) after switching for the change to take effect.
+The command prints this reminder.
+
+### 10.6 Shared plans and learnings
+
+Once a shared brain is active, the ordinary memory verbs (§2) operate on it.
+Plans inject into every member's sessions on SessionStart; learnings the team
+appends carry forward and record their author. Concurrent plan edits are guarded
+by optimistic concurrency (§2.2.1): a stale write is rejected with the current
+version so two members never silently clobber each other.
+
+---
+
+## 11. Encryption model
+
+resleeve encrypts data both in transit and at rest. Which layer protects your
+data depends on whether you run a team server, a solo `--single-tenant` server,
+or no upstream at all.
+
+| Layer | When it applies | What it protects | Who can read plaintext |
+| --- | --- | --- | --- |
+| **In transit (TLS)** | Any upstream | The connection to `resleeve serve` (operator fronts it with a TLS reverse proxy) | Transport only |
+| **Server-side at rest** (default on a team server) | Multi-user `serve` | Each brain's data, encrypted at rest under a per-brain key wrapped by the operator's master key | The server (to fan a shared brain out to its members); the operator holds the master key |
+| **End-to-end** (a personal brain opted in on a team server) | `brain encrypt <id> e2e` | That brain's data; the server stores ciphertext only | Only that member |
+| **End-to-end** (solo) | `serve --single-tenant` | All data; the client seals before it leaves the box | Only the account owner |
+
+### 11.1 In transit
+
+`resleeve serve` speaks plaintext HTTP and is meant to sit on loopback behind a
+TLS-terminating reverse proxy (Caddy, nginx). Binding a non-loopback `--addr`
+prints a startup warning for exactly this reason. See
+[`use-cases/05-self-hosted-serve.md`](./use-cases/05-self-hosted-serve.md).
+
+### 11.2 Server-side at rest (team default)
+
+On a team server, the default policy is **server-side**: clients send plaintext
+over TLS, and the server encrypts each brain's data at rest under a per-brain
+key that is itself wrapped by the operator's master key (`--master-key`). This
+is what lets the server hand a shared brain's contents to every member of its
+group. A member only ever sees the brains they belong to; the bytes on disk are
+ciphertext. Because clients send plaintext, the master key is **mandatory** — a
+team server won't boot without one.
+
+### 11.3 End-to-end (solo `--single-tenant`)
+
+A solo server runs zero-knowledge: the **client** seals every blob (AES-256-GCM
+under a KEK derived from your master password via Argon2id) before it crosses
+the wire, and the server stores ciphertext only. The master password and the
+unwrapped KEK never leave the client — a compromised server can reorder blobs
+and see operational metadata but cannot decrypt anything. This is the model
+detailed in §5 and `use-cases/05`.
+
+### 11.4 Opting a personal brain back to end-to-end
+
+On a team server, a member can make a **personal** brain zero-knowledge — so
+even the operator can't read it — by switching its policy:
+
+```bash
+resleeve brain encrypt <brain-id> e2e          # zero-knowledge; server stores ciphertext only
+resleeve brain encrypt <brain-id> server-side  # switch back to server-readable
+```
+
+End-to-end is **only valid on a personal brain** — the server rejects `e2e` on a
+shared brain, because a shared brain must be server-readable to fan out to its
+members. The new policy applies to **new** writes after the daemon re-samples it
+(restart with `resleeve down && resleeve up`, or run `resleeve brain use`);
+existing rows are not re-encrypted. `brain encrypt` is owner-only.
 
 ---
 

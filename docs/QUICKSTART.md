@@ -6,6 +6,13 @@ each verb: [USER_GUIDE.md](USER_GUIDE.md). Why the pieces fit:
 [ARCHITECTURE.md](ARCHITECTURE.md). End-to-end smoke checklist:
 [SMOKE.md](SMOKE.md).
 
+This walkthrough uses Claude Code, but the same flow works for the other
+supported CLIs — **Codex** and **opencode** (full session capture + native
+resume), and **Antigravity** (experimental capture + prime resume). Swap the
+adapter with `resleeve install-bridge --adapter <name>` (see step 3) and run
+that CLI instead of `claude`. The scope / plan / learning / inject pieces are
+identical regardless of which CLI you drive.
+
 ## 1. Prerequisite check
 
 ```bash
@@ -28,6 +35,23 @@ go build -o resleeve ./cmd/resleeve
 The walkthrough invokes `./resleeve` from `~/dev/resleeve`; move it
 onto `$PATH` once you're past the first run.
 
+### Using a CLI other than Claude Code
+
+`resleeve up` installs the Claude Code bridge by default. To wire a different
+CLI instead (or in addition), install its bridge explicitly:
+
+```bash
+./resleeve up --no-bridge                          # daemon only, no Claude hook
+./resleeve install-bridge --adapter codex          # capture Codex sessions
+./resleeve install-bridge --adapter opencode       # capture opencode sessions
+./resleeve install-bridge --adapter antigravity    # experimental
+```
+
+Each adapter self-registers, so the rest of this guide is the same — open the
+CLI in a scoped directory and the SessionStart context loads. To also let the
+in-session agent read and curate memory directly, add `--mcp` (see
+[USER_GUIDE.md](USER_GUIDE.md) → "MCP in-agent curation").
+
 ## 3. `resleeve up`
 
 Spawns the daemon (loopback HTTP on a random port) and wires the
@@ -46,7 +70,7 @@ Expected output:
 resleeve is up.
 ```
 
-Bridge entries use Claude Code's **matcher-wrapped** hook format (F12)
+Bridge entries use Claude Code's **matcher-wrapped** hook format
 — `{matcher: "", hooks: [{type, command, _resleeve: true}]}`. The
 `_resleeve: true` tag is how `install-bridge` re-finds its own entries
 without disturbing hand-authored hooks. For injection-only (no event
@@ -87,7 +111,7 @@ Card guide:
   `_resleeve: true` entries.
 - **upstream / sync (slow|fast)** — meaningful only with a
   `resleeve serve` upstream. See USER_GUIDE.md → "Sync".
-- **hook env** — the F13 silent-failure guard. `bridge ✓` + `daemon ✗`
+- **hook env** — the silent-failure guard. `bridge ✓` + `daemon ✗`
   produces a loud red line and a non-zero exit code:
 
   ```text
@@ -120,7 +144,7 @@ name one:
 - **Auto-derived** — no marker → hook falls back to `filepath.Base(cwd)`,
   so `~/dev/some-project` → scope `some-project`.
 
-Full F11 resolution: `$RESLEEVE_SCOPE` override → `.resleeve-scope`
+Full scope resolution: `$RESLEEVE_SCOPE` override → `.resleeve-scope`
 marker walked up cwd ancestors (scope =
 `<marker>/<rel-from-marker-dir>`) → `filepath.Base(cwd)` → `unknown`.
 
@@ -213,7 +237,7 @@ cd ~/dev/some-project
 claude
 ```
 
-F14 renders a top-level `systemMessage` notice at the top of the chat
+resleeve renders a top-level `systemMessage` notice at the top of the chat
 UI on every SessionStart injection:
 
 ```text
@@ -221,7 +245,7 @@ resleeve: loaded scope "my-project" (193 bytes)
 ```
 
 That notice is the visible indicator the hook fired AND the daemon
-answered AND Claude Code accepted the envelope shape (F13). No notice
+answered AND Claude Code accepted the envelope shape. No notice
 = run `resleeve doctor`.
 
 ## 12. Ask a question that uses the loaded context
@@ -266,11 +290,17 @@ Useful for "did the right scope load?" debugging without re-running
 - **Cross-machine sync** — `resleeve up --upstream URL --upstream-token
   TOK`. USER_GUIDE.md → "Sync (two tiers)".
 - **Identity** — `resleeve register / login / logout` + `pair invite /
-  pair accept` replace the round-4 placeholder `seal.key`.
+  pair accept` replace the legacy placeholder `seal.key`.
   USER_GUIDE.md → "Identity".
 - **Memory-only mode** — `resleeve up --memory-only` skips event
   capture; injection still fires. USER_GUIDE.md → "Memory-only mode".
 - **Resume a past session** — `resleeve resume <session-id>` rebuilds
   state for a fresh `claude --resume`. USER_GUIDE.md → "Resume".
+- **Team mode (shared memory)** — `resleeve serve` runs a multi-user
+  upstream where each person has a private memory namespace and a group can
+  read/write a **shared brain**. Members `register` / `pair`, then
+  `resleeve brain create` + `brain use` a shared namespace. Walkthrough:
+  [use-cases/06-team-shared-memory.md](use-cases/06-team-shared-memory.md);
+  reference: USER_GUIDE.md → "Team mode".
 
 End-to-end smoke checklist: [SMOKE.md](SMOKE.md).
