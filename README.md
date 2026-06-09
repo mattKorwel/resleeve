@@ -4,7 +4,7 @@
 
 The metaphor: your consciousness lives in a cortical "stack" and downloads into any compatible "sleeve." Bodies are interchangeable; the stack is what's you.
 
-`resleeve` does the same for AI coding agents. Your **stack** — transcripts, plans, scope-keyed memory, learnings — is portable. Keep it on this laptop, host it on a server you control, or stand up `resleeve serve` for a team. Your **sleeves** — `claude`, `opencode`, whatever ships next — connect to wherever the stack lives. End-to-end encrypted: even your own server stores ciphertext only. Pick up where you left off, on any machine, in any CLI vendor.
+`resleeve` does the same for AI coding agents. Your **stack** — transcripts, plans, scope-keyed memory, learnings — is portable. Keep it on this laptop, host it on a server you control, or stand up `resleeve serve` for a team. Your **sleeves** — `claude`, `codex`, `opencode`, and more — connect to wherever the stack lives. Encrypted in transit and at rest: self-host solo for full end-to-end (your server only ever stores ciphertext), or run one server for a team. Pick up where you left off, on any machine, in any CLI.
 
 Self-hosted. Apache-2.0. Single Go binary. SQLite under the hood.
 
@@ -37,9 +37,11 @@ Building from source? `go install github.com/mattkorwel/resleeve/cmd/resleeve@la
 - **Scope-keyed memory**: a hierarchical scope tree (`.resleeve-scope` markers walk the file tree), with named plans and append-only learnings per scope.
 - **Auto-injects** the rolled-up scope context into fresh sessions via the SessionStart hook — your agent picks up your standing prompt without you typing it.
 - **`--memory-only` mode** if you want the memory layer without persisting transcripts.
-- **Sync** (optional) across machines: outbox-based push, 30 s pull, SSE fast tier for memory; all blobs AEAD-sealed under a KEK derived from your master password.
+- **Plan history**: plans keep a full version history, and concurrent edits are conflict-checked (a stale edit is rejected with the current version, never silently overwritten). Learnings record who added them.
+- **Sync** (optional) across machines: push-on-commit + pull + an SSE fast tier for memory. End-to-end encrypted when you self-host solo; encrypted server-side at rest when you run a server for a team.
+- **Team mode**: `resleeve serve` can host a group — everyone gets their own private memory, plus **shared memory** a team reads and writes. `resleeve brain create|list|member|use` manage the shared spaces.
 - **`resleeve resume`** replays a captured session into a fresh CLI process — same vendor (full fidelity) or cross-vendor (synthesized prime).
-- **MCP server** so an agent in-session can curate its own memory (`resleeve_scope_set`, `resleeve_plan_write`, `resleeve_learning_append`, …).
+- **MCP server** so an agent in-session can curate its own memory (`resleeve_plan_write`, `resleeve_learning_append`, …). Wire it into each CLI with `resleeve install-bridge --mcp`.
 
 ## CLI support
 

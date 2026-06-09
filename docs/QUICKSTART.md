@@ -6,6 +6,13 @@ each verb: [USER_GUIDE.md](USER_GUIDE.md). Why the pieces fit:
 [ARCHITECTURE.md](ARCHITECTURE.md). End-to-end smoke checklist:
 [SMOKE.md](SMOKE.md).
 
+This walkthrough uses Claude Code, but the same flow works for the other
+supported CLIs — **Codex** and **opencode** (full session capture + native
+resume), and **Antigravity** (experimental capture + prime resume). Swap the
+adapter with `resleeve install-bridge --adapter <name>` (see step 3) and run
+that CLI instead of `claude`. The scope / plan / learning / inject pieces are
+identical regardless of which CLI you drive.
+
 ## 1. Prerequisite check
 
 ```bash
@@ -27,6 +34,23 @@ go build -o resleeve ./cmd/resleeve
 
 The walkthrough invokes `./resleeve` from `~/dev/resleeve`; move it
 onto `$PATH` once you're past the first run.
+
+### Using a CLI other than Claude Code
+
+`resleeve up` installs the Claude Code bridge by default. To wire a different
+CLI instead (or in addition), install its bridge explicitly:
+
+```bash
+./resleeve up --no-bridge                          # daemon only, no Claude hook
+./resleeve install-bridge --adapter codex          # capture Codex sessions
+./resleeve install-bridge --adapter opencode       # capture opencode sessions
+./resleeve install-bridge --adapter antigravity    # experimental
+```
+
+Each adapter self-registers, so the rest of this guide is the same — open the
+CLI in a scoped directory and the SessionStart context loads. To also let the
+in-session agent read and curate memory directly, add `--mcp` (see
+[USER_GUIDE.md](USER_GUIDE.md) → "MCP in-agent curation").
 
 ## 3. `resleeve up`
 
@@ -272,5 +296,11 @@ Useful for "did the right scope load?" debugging without re-running
   capture; injection still fires. USER_GUIDE.md → "Memory-only mode".
 - **Resume a past session** — `resleeve resume <session-id>` rebuilds
   state for a fresh `claude --resume`. USER_GUIDE.md → "Resume".
+- **Team mode (shared memory)** — `resleeve serve` runs a multi-user
+  upstream where each person has a private memory namespace and a group can
+  read/write a **shared brain**. Members `register` / `pair`, then
+  `resleeve brain create` + `brain use` a shared namespace. Walkthrough:
+  [use-cases/06-team-shared-memory.md](use-cases/06-team-shared-memory.md);
+  reference: USER_GUIDE.md → "Team mode".
 
 End-to-end smoke checklist: [SMOKE.md](SMOKE.md).

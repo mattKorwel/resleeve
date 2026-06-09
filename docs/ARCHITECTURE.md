@@ -11,9 +11,12 @@ Resleeve is a single Go binary plus an embedded SQLite database that
 captures AI-coding-CLI sessions, maintains a hierarchical memory store
 (plans + learnings under scopes), and optionally syncs both to a
 self-hosted upstream so a "stack" of context can follow the operator
-across machines. The locked persona is the **fleet operator**
+across machines. The original persona is the **fleet operator**
 (`design/round-1/05-decisions.md`): one human, elastic compute, stacks
-persist, sleeves rotate. Three concurrent surfaces run inside the
+persist, sleeves rotate. The upstream has since grown into a
+**multi-user** server: each account has a private memory namespace (a
+"brain") and groups can share one (§6.5), with data encrypted at rest
+under an operator-held key (§8). Three concurrent surfaces run inside the
 binary: a **local daemon** on loopback that the host CLI talks to via
 hooks, an **MCP server** the model talks to over stdio, and an optional
 **`resleeve serve`** HTTP API the daemon syncs against over the
@@ -98,11 +101,14 @@ internal/
   serve/            upstream HTTP API (/v2/auth/*, /v2/sync/*)
   sync/             Backend interface; sync/local implements local-disk
   auth/             Argon2id, KEK derivation, AES-GCM envelope (Sealer)
-  adapter/          Adapter interface; claude impl + opencode stub
+  adapter/          Adapter interface + self-registering registry
+    registry/       name → factory registry (adapters self-register in init())
+    claude/ codex/ opencode/ antigravity/   the four adapters
     common/         shared prime-mode synthesizer
   mcp/              MCP JSON-RPC server, tool registry, INSTRUCTIONS.md
-  memory/           scope tree walk, plans, learnings, BuildContext
-  storage/sql/sqlite/   store + migrations 0001-0005
+  memory/           scope tree walk, plan versions, learnings, BuildContext
+  storage/sql/sqlite/   store + migrations (capture, identity, tenancy,
+                        plan versions, server-at-rest)
   cli/              verb dispatch
   event/            normalized event type used across adapters
 ```
@@ -175,6 +181,8 @@ type Adapter interface {
     Detect(ctx context.Context) (Detection, error)
     InstallBridge(ctx context.Context, opts InstallOpts) error
     UninstallBridge(ctx context.Context) error
+    InstallMCP(ctx context.Context, opts InstallOpts) error
+    UninstallMCP(ctx context.Context) error
     FromNative(ctx context.Context, raw []byte, src Source) ([]event.Event, error)
     ToNative(ctx context.Context, events []event.Event, mode RenderMode) ([]byte, error)
     Hydrate(ctx context.Context, session SessionView, opts HydrateOpts) (HydrateResult, error)
@@ -182,12 +190,34 @@ type Adapter interface {
 }
 ```
 
-`adapter/claude` is the only fully-featured implementation:
-hook-install via `~/.claude/settings.json`, JSONL parsing/emission for
-session capture and replay, prime-mode synthesizer wired through
-`adapter/common/prime.go`. `adapter/opencode` is a stub that
-implements `Detect` + the prime path only; full opencode capture is
-v3.
+#### The adapter registry
+
+Adapters are not referenced by a hard-coded list. Each adapter package
+self-registers in its own `init()` via
+`internal/adapter/registry.Register(name, factory)`, triggered simply by
+importing the package. The CLI wires each one in a dedicated
+`internal/cli/adapter_<name>.go` file (plus `cli/adapters.go` for claude),
+so a new adapter lands without editing any shared list — no cross-adapter
+merge conflicts. `registry.New(name)` resolves a factory; `registry.Names()`
+lists the registered set. `internal/cli/hook.go:pickAdapter` and
+`install_bridge.go` both resolve through the registry.
+
+#### The four adapters
+
+| Adapter | Capture | Native resume (replay) | Prime (cross-CLI) | Notes |
+|---|---|---|---|---|
+| `adapter/claude` | hooks + reconcile sweep over `~/.claude/projects` | JSONL replay → `claude --resume` | ✓ | hook-install via `~/.claude/settings.json` |
+| `adapter/codex` | hooks + rollout reconcile over `$CODEX_HOME/sessions` | `codex resume` | ✓ | reconcile gated on `Detect` |
+| `adapter/opencode` | reads opencode's SQLite DB + SSE (no hook bridge needed) | `opencode import` | ✓ | reconcile skipped on a pre-SQLite store |
+| `adapter/antigravity` | experimental file-watch over `~/.gemini/antigravity-cli/conversations` | ✗ (none) | ✓ | reads an undocumented on-disk format; prime-only |
+
+All four implement the full `Adapter` contract; the shared prime synthesizer
+lives in `adapter/common/prime.go`. Antigravity is experimental and has no
+native replay path, so its `Hydrate` always resolves to prime.
+
+Adapters also implement `InstallMCP` / `UninstallMCP`, which register (or
+remove) the `resleeve mcp` memory server in each CLI's MCP config —
+`resleeve install-bridge --mcp` / `--mcp-only` drive these (see §4).
 
 ### `internal/mcp`
 
@@ -312,8 +342,11 @@ CREATE TABLE learnings (
 );
 ```
 
-Plans are named slots (default `_default`); writes overwrite. Learnings
-are append-only with `supersedes_id` chains for soft retraction.
+Plans are named slots (default `_default`); learnings are append-only with
+`supersedes_id` chains for soft retraction. The mutate-in-place `plans` table
+shown above was later replaced by an append-only `plan_versions` log — see
+§3.1 (plan version history). Both plans and learnings now also carry an
+`author_user_id` for provenance once a brain is shared.
 
 ### Round 4 (migration 0004) — outbox + sync state
 
@@ -349,6 +382,36 @@ compromise of one device rotates that device, not the account.
 `pairing_codes` is the short-lived (≤5 min, one-shot) bridge for
 adding a second device: code-derived verifier and code-derived KEK
 wrap, brute-force bounded by Argon2id cost plus the 5-minute TTL.
+
+### Later migrations — tenancy, plan versioning, server-at-rest
+
+Migrations past 0005 add the multi-user and durability features:
+
+- **0008 (tenancy)** — `brains`, `memberships` on the server: the
+  brain/membership model behind team mode (§6.5).
+- **0009 (plan versioning)** — see §3.1.
+- **0010 (server-at-rest)** — `brain_keys`: per-brain DEKs wrapped under
+  the operator master key (§8 "Encryption layers").
+
+### 3.1 Plan version history
+
+Migration 0009 replaces the mutate-in-place `plans` table with an
+append-only **`plan_versions`** log. A write is an **append**, never an
+update: each row is immutable and keyed `(scope, name, version)` with
+`content`, `author_user_id` (provenance), `parent_version` (the version it
+was derived from; 0 = first), and `created_at`. The **materialized HEAD** of
+a slot is the row with `max(version)` for that `(scope, name)`; an index on
+`(scope, name, version)` makes both the HEAD lookup and the history walk
+cheap.
+
+**Optimistic concurrency** lives in the store layer. A `plan write` carries
+the `base_version` it derived from (read from the current HEAD first); if
+`base_version != HEAD` the write is a **conflict** — surfaced to the CLI as a
+`PlanConflictError` (`internal/memory`) / `agent.PlanConflict`, which
+`internal/cli/plan.go` renders as a "re-read, merge, retry (or `--force`)"
+message. This is what stops two members of a shared brain from silently
+clobbering each other's plan edits. The same migration adds `author_user_id`
+to `learnings` (already append-only) so learning provenance is recorded too.
 
 ## 4. The hook contract
 
@@ -472,6 +535,40 @@ standalone install to the password-derived KEK; the v1 placeholder is
 deprecated and called out before any "encrypted sync" claim in the
 user-facing docs.
 
+### 6.5 The brain model (multi-user)
+
+`resleeve serve` is multi-user by default; `--single-tenant` selects the
+old flat, single-account behavior.
+
+A **brain** is a memory namespace — its own scopes, plans, and learnings.
+Every account has a personal brain; a member can create a **shared brain**
+and add other members to it. The server tracks three concerns
+(`internal/serve/brains.go`, `internal/storage/sql/sqlite`):
+
+- **brains** — one row per brain, with a `kind` (`personal` | `shared`),
+  an owner, and an `encryption_policy` (`server-side` | `e2e`).
+- **memberships** — `(brain, user)` rows defining who may read/write a
+  brain. Mutation is owner-gated (`requireOwner`); a non-owner adding a
+  member or flipping policy gets 403.
+- **brain keys** — the per-brain data-encryption key (DEK), wrapped under
+  the operator master key (§8). Provisioned on `brain create`; absent when
+  the server runs without a master key.
+
+Brain selection is **client-side routing plus server-side key-scoping**.
+The daemon's sync client appends `?brain=<id>` to its upstream calls based
+on the machine's active brain (`resleeve brain use`, persisted in the client
+config the daemon reads — `agent.LoadActiveBrain` / `WriteActiveBrain`). The
+server scopes every `/v2/sync/*` request to the brains the presented device
+token is a member of, so a member can only ever touch their own brains.
+Identity stays per-device — `register` / `login` / `pair` mint per-device
+bearer tokens; brains layer authorization on top of that identity.
+
+Brain-management verbs (`brain create | list | member … | encrypt | use`)
+live in `internal/cli/brain.go`. The management calls hit the upstream with
+the device bearer (mirroring `pair` / `login`); `brain use` is local-only
+(it writes the active-brain client config — a running daemon re-samples it
+on restart).
+
 ## 7. Sync data flow
 
 `SyncClient` (`internal/agent/sync.go`) owns three concurrent loops.
@@ -569,6 +666,35 @@ multi-device required manual `seal.key` copy + matching auth token.
 `resleeve migrate-key` migrates a standalone install onto the
 password-derived KEK once the user has registered with an upstream.
 
+### Encryption layers
+
+There are three layers, and which one protects a given blob depends on the
+server's tenancy and the brain's policy:
+
+| Layer | When it applies | Who seals | Server sees plaintext? |
+|---|---|---|---|
+| **In transit (TLS)** | any upstream | reverse proxy in front of `serve` | n/a (transport) |
+| **Server-side at rest** | multi-tenant `serve`, default `server-side` policy | the **server**, per-brain DEK wrapped under the operator master key | yes — to fan a shared brain out to its members |
+| **End-to-end** | `--single-tenant`, or a personal brain with `e2e` policy | the **client** (`AESGCMSealer` at the sync boundary, §7) | never |
+
+On a **multi-tenant** server the default policy is `server-side`: clients send
+plaintext over TLS and the server encrypts each brain's data at rest under that
+brain's DEK. The DEK is wrapped under the operator master key
+(`--master-key` / `$RESLEEVE_SERVER_MASTER_KEY`, 32 bytes hex or base64,
+loaded by `cli/serve.go:loadMasterKey`). This is what lets a shared brain's
+contents be served to every member. Because clients send plaintext, a
+multi-tenant server **refuses to boot without a master key** —
+`cli/serve.go` and `serve.New` both enforce this so plaintext is never
+persisted silently.
+
+A **single-tenant** server keeps the zero-knowledge property: the client seals
+every blob before it leaves loopback (§7's `Enqueue*` boundary), so the server
+stores ciphertext only and the master key is optional. A member on a
+multi-tenant server can opt a **personal** brain back to this end-to-end mode
+with `resleeve brain encrypt <id> e2e` (`handleSetPolicy`); `e2e` is rejected
+on a shared brain (it would need group keys the server can't provision yet),
+and the policy applies to new writes only — existing rows are not re-encrypted.
+
 ## 9. Reconcile sweep
 
 On daemon startup the Claude adapter (`internal/agent/backfill.go`)
@@ -625,10 +751,15 @@ the adapter pick: replay if it can, prime if it can't.
 
 ### Per-CLI implementations
 
-| Adapter           | Capture (FromNative) | Replay (ToNative)    | Prime (Hydrate) |
-|-------------------|----------------------|----------------------|-----------------|
-| `adapter/claude`  | Hook + JSONL         | JSONL                | via common      |
-| `adapter/opencode`| stub (`ErrNotImplemented`) | stub          | via common      |
+All four adapters self-register through `internal/adapter/registry` (see §2);
+the table below summarizes their capture/replay support.
+
+| Adapter             | Capture (FromNative)        | Replay (ToNative)   | Prime (Hydrate) |
+|---------------------|-----------------------------|---------------------|-----------------|
+| `adapter/claude`    | Hook + JSONL reconcile      | JSONL → `claude --resume` | via common |
+| `adapter/codex`     | Hook + rollout reconcile    | `codex resume`      | via common      |
+| `adapter/opencode`  | opencode SQLite DB + SSE    | `opencode import`   | via common      |
+| `adapter/antigravity` | experimental file-watch   | ✗ (prime-only)      | via common      |
 
 ## 11. Design doc index
 
