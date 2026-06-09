@@ -70,7 +70,7 @@ Expected output:
 resleeve is up.
 ```
 
-Bridge entries use Claude Code's **matcher-wrapped** hook format (F12)
+Bridge entries use Claude Code's **matcher-wrapped** hook format
 — `{matcher: "", hooks: [{type, command, _resleeve: true}]}`. The
 `_resleeve: true` tag is how `install-bridge` re-finds its own entries
 without disturbing hand-authored hooks. For injection-only (no event
@@ -111,7 +111,7 @@ Card guide:
   `_resleeve: true` entries.
 - **upstream / sync (slow|fast)** — meaningful only with a
   `resleeve serve` upstream. See USER_GUIDE.md → "Sync".
-- **hook env** — the F13 silent-failure guard. `bridge ✓` + `daemon ✗`
+- **hook env** — the silent-failure guard. `bridge ✓` + `daemon ✗`
   produces a loud red line and a non-zero exit code:
 
   ```text
@@ -144,7 +144,7 @@ name one:
 - **Auto-derived** — no marker → hook falls back to `filepath.Base(cwd)`,
   so `~/dev/some-project` → scope `some-project`.
 
-Full F11 resolution: `$RESLEEVE_SCOPE` override → `.resleeve-scope`
+Full scope resolution: `$RESLEEVE_SCOPE` override → `.resleeve-scope`
 marker walked up cwd ancestors (scope =
 `<marker>/<rel-from-marker-dir>`) → `filepath.Base(cwd)` → `unknown`.
 
@@ -237,7 +237,7 @@ cd ~/dev/some-project
 claude
 ```
 
-F14 renders a top-level `systemMessage` notice at the top of the chat
+resleeve renders a top-level `systemMessage` notice at the top of the chat
 UI on every SessionStart injection:
 
 ```text
@@ -245,7 +245,7 @@ resleeve: loaded scope "my-project" (193 bytes)
 ```
 
 That notice is the visible indicator the hook fired AND the daemon
-answered AND Claude Code accepted the envelope shape (F13). No notice
+answered AND Claude Code accepted the envelope shape. No notice
 = run `resleeve doctor`.
 
 ## 12. Ask a question that uses the loaded context
@@ -290,7 +290,7 @@ Useful for "did the right scope load?" debugging without re-running
 - **Cross-machine sync** — `resleeve up --upstream URL --upstream-token
   TOK`. USER_GUIDE.md → "Sync (two tiers)".
 - **Identity** — `resleeve register / login / logout` + `pair invite /
-  pair accept` replace the round-4 placeholder `seal.key`.
+  pair accept` replace the legacy placeholder `seal.key`.
   USER_GUIDE.md → "Identity".
 - **Memory-only mode** — `resleeve up --memory-only` skips event
   capture; injection still fires. USER_GUIDE.md → "Memory-only mode".

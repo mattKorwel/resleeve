@@ -11,7 +11,7 @@ backfill, and troubleshooting.
 For a 5-minute setup, read [`QUICKSTART.md`](../QUICKSTART.md) first. For the
 internal model, see [`ARCHITECTURE.md`](../ARCHITECTURE.md). For a
 non-destructive validation checklist, see [`SMOKE.md`](./SMOKE.md). For the
-round-by-round design history, see [`docs/design/round-{1,2,3,4}/`](./design/).
+full design history, see [`docs/design/`](./design/).
 
 ---
 
@@ -32,8 +32,8 @@ Everything lives under `~/.resleeve/`:
   daemon.pid           PID of the running daemon (used by `down`, `doctor`)
   daemon.log           stdout/stderr of the background daemon
   endpoint             "127.0.0.1:PORT BEARER" pair — discovered by every CLI verb
-  last-injected.md     F14 audit trail: the most recent SessionStart additionalContext
-  seal.key             (legacy) round-4 placeholder KEK — see §5.5
+  last-injected.md     audit trail: the most recent SessionStart additionalContext
+  seal.key             (legacy) placeholder KEK — see §5.5
 ```
 
 Override with `RESLEEVE_DATA_DIR` if you need to. Mode bits are `0700` for the
@@ -91,7 +91,7 @@ resleeve doctor
   hook env         ✓ bridge + daemon both up
 ```
 
-Exit code: **1** when bridge is installed but the daemon is down — the F13
+Exit code: **1** when bridge is installed but the daemon is down — the
 silent-no-op state. Scripted callers (CI, smoke tests, `doctor && up` chains)
 will catch this. On a TTY the warning is bright red.
 
@@ -331,7 +331,7 @@ you don't want to relitigate, gotchas the next session needs. Don't use them
 as a chat log.
 
 ```bash
-resleeve learning append resleeve "F4 seq = ts.UnixNano() — same-ns ties broken by event_uuid asc."
+resleeve learning append resleeve "Event seq = ts.UnixNano() — same-ns ties broken by event_uuid asc."
 resleeve learning append resleeve - <<EOF        # multiline via stdin
 Memory-only mode: ./resleeve up --memory-only installs only the SessionStart hook.
 SessionStart still injects context; no events are persisted.
@@ -408,8 +408,8 @@ running the equivalent CLI verb.
 ### 3.1 Why it exists
 
 Before MCP, the curation pattern was: agent suggests, user types
-`resleeve plan write …` into the chat, Claude Code runs it via Bash. Round-3
-made that work but it cost a Bash invocation and a confirmation prompt per
+`resleeve plan write …` into the chat, Claude Code runs it via Bash. That
+worked but it cost a Bash invocation and a confirmation prompt per
 operation. The MCP server collapses that to one in-process tool call per
 curation, with an `instructions` field the host loads on connect.
 
@@ -592,8 +592,8 @@ row never loops it back to upstream
 
 ### 5.3 Identity — `register` / `login` / `logout`
 
-The pre-round-5 model used a single shared bearer token plus a shared
-`seal.key` file. Round-5 replaces that with per-device identity tokens and a
+The legacy model used a single shared bearer token plus a shared
+`seal.key` file. Newer versions replace that with per-device identity tokens and a
 master-password-derived KEK.
 
 ```bash
@@ -650,7 +650,7 @@ Device tokens live in the OS keychain, not on disk:
 | Linux | `libsecret` (GNOME Keyring / KWallet / etc.) |
 | Windows | Credential Manager |
 
-The pre-follow-up-A file backend is automatically migrated on first
+The legacy file backend is automatically migrated on first
 `login` for a given `(upstream, email)` pair — upgraders don't lose tokens.
 
 ### 5.4 Pairing — `pair invite` / `pair accept`
@@ -697,13 +697,13 @@ device over an out-of-band channel within 60s is unrealistic. Adjust with
 
 Once accepted: device A's KEK is now installed on device B. Both machines
 sync against the same upstream identity. Pair invite revokes its own
-ephemeral login token on the way out (see follow-up B in
+ephemeral login token on the way out (see
 `docs/design/round-4/`).
 
 ### 5.5 `migrate-key` — placeholder → real KEK
 
-Round-4 shipped envelope encryption with a placeholder: a random 32-byte AES
-key at `~/.resleeve/seal.key`. Round-5 retires that file in favor of a KEK
+An earlier version shipped envelope encryption with a placeholder: a random 32-byte AES
+key at `~/.resleeve/seal.key`. Newer versions retire that file in favor of a KEK
 derived from your master password. If you have existing upstream-encrypted
 data captured under the old `seal.key`, run `migrate-key` ONCE to re-encrypt
 all server-side blobs under the new KEK:
@@ -803,7 +803,7 @@ waiting for the 30s polling tick.
 
 If the pull times out or upstream is unreachable, `resume` falls back to
 local state and prints a warning to stderr. See
-`docs/design/round-4/03-rehydrate-ux.md` §"Failure modes".
+[`docs/design/round-4/03-rehydrate-ux.md`](./design/round-4/03-rehydrate-ux.md) §"Failure modes".
 
 ### 6.6 Examples
 
@@ -858,8 +858,8 @@ specific fix landed:
 ### 8.1 `doctor --backfill-counts`
 
 Recomputes `sessions.event_count` for every row. Cleanup for sessions
-captured before the F7 fix (`fde1c40`) wired `SyncEventCount` into
-`IngestBatch` — pre-F7 rows stayed at `event_count=0` until their next batch
+captured before the fix (`fde1c40`) wired `SyncEventCount` into
+`IngestBatch` — older rows stayed at `event_count=0` until their next batch
 arrived. Safe to re-run; `SyncEventCount` is `COUNT(*)` over events, not a
 delta.
 
@@ -891,7 +891,7 @@ resleeve up
 
 ## 9. Troubleshooting
 
-### 9.1 F13 — silent injection failure
+### 9.1 Silent injection failure
 
 **Symptom:** You opened a fresh Claude Code session and saw no
 `Resleeve memory for scope ...` notice. `doctor` shows `bridge ✓` and
@@ -904,7 +904,7 @@ down it gets connection-refused and emits nothing. Claude Code sees no
 **Fix:** `resleeve up`. The `hook env` card in `doctor` will yell at you
 loudly (bright red on a TTY, non-zero exit code) when it detects this state.
 
-### 9.2 F14 — auditing what got injected
+### 9.2 Auditing what got injected
 
 `~/.resleeve/last-injected.md` is the audit trail. After every successful
 SessionStart injection, the hook persists the exact body it emitted as
@@ -926,7 +926,7 @@ issue — the file's `mtime` tells you whether the hook ran at all.
 **Symptom:** `doctor` shows `sealer ✗ locked (run resleeve login)`. Sync
 push/pull stalls; new captures land in the outbox but never drain.
 
-**Cause:** Daemon started without a KEK installed. After round-5, the
+**Cause:** Daemon started without a KEK installed. In current versions, the
 daemon does NOT auto-load `seal.key` — you must `login` to install the KEK.
 
 **Fix:**
@@ -958,7 +958,7 @@ Three layers to check, in order:
    handler?
 
 If the file exists with recent mtime but Claude Code shows no notice,
-suspect the host-side envelope shape. The F13 fix established that Claude
+suspect the host-side envelope shape. resleeve established that Claude
 Code expects:
 
 ```json
@@ -976,13 +976,13 @@ Anything else gets silently dropped.
 ### 9.6 "Daemon down" after `down`
 
 That's how it works — `resleeve down` removes both the daemon and the
-bridge. Running `doctor` afterward shows the post-down state, not the F13
-silent-no-op state. If you want to validate F13 specifically, kill the PID
+bridge. Running `doctor` afterward shows the post-down state, not the
+silent-no-op state. If you want to validate the silent-no-op guard specifically, kill the PID
 without removing the bridge:
 
 ```bash
 kill -9 $(cat ~/.resleeve/daemon.pid) && rm ~/.resleeve/daemon.pid
-resleeve doctor   # → loud F13 warning, exit 1
+resleeve doctor   # → loud silent-no-op warning, exit 1
 ```
 
 (That stanza appears in `docs/SMOKE.md` as well — it's the standard
