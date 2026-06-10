@@ -153,6 +153,16 @@ func runServe(ctx context.Context, args []string) int {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	// Bind explicitly so we can report the resolved address — when --addr
+	// uses :0 the OS assigns the port, and logging the requested addr would
+	// print ":0" instead of the port the operator needs to connect to.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "serve:", err)
+		return 1
+	}
+	addr = ln.Addr().String()
+
 	fmt.Fprintf(os.Stderr, "resleeve serve listening on http://%s\n", addr)
 	if !addrIsLoopback(addr) {
 		fmt.Fprintf(os.Stderr, "  WARNING  --addr %s is not loopback — operator: confirm you've fronted this with TLS + auth\n", addr)
@@ -177,7 +187,7 @@ func runServe(ctx context.Context, args []string) int {
 	// Graceful shutdown on context cancel.
 	errCh := make(chan error, 1)
 	go func() {
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
 	}()
