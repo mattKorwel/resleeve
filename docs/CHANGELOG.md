@@ -18,6 +18,31 @@ Pre-1.0 versions (`0.x.y`) may include breaking changes in minor bumps. See
 
 ### Security
 
+## [0.4.0] - 2026-06-10
+
+### Added
+
+- **Live shared memory.** When someone updates a shared team space, the other
+  members now see it in real time instead of waiting for the next sync. Idle
+  connections are kept alive with periodic heartbeats so proxies don't drop
+  them.
+
+### Changed
+
+- **Team-server abuse limits.** A server now applies configurable per-user
+  caps so one account can't exhaust a shared host: maximum request size,
+  concurrent live connections, and number of memory spaces. Tune with
+  `--max-push-bytes`, `--max-sse-per-user`, and `--max-brains-per-user`.
+
+### Security
+
+- **At-rest encryption is now fail-secure.** On a team server, every memory
+  space is encrypted at rest — including one left without a key by an
+  interrupted setup. The server provisions a key on demand rather than ever
+  storing content in the clear.
+- Refreshed the security review to cover the team-server and full encryption
+  posture.
+
 ## [0.3.0] - 2026-06-09
 
 ### Added
@@ -117,7 +142,8 @@ Pre-1.0 versions (`0.x.y`) may include breaking changes in minor bumps. See
   (user-visible notice), `hookSpecificOutput.additionalContext`
   (model-visible context), and `~/.resleeve/last-injected.md` (audit trail).
 
-[Unreleased]: https://github.com/mattkorwel/resleeve/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/mattkorwel/resleeve/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/mattkorwel/resleeve/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mattkorwel/resleeve/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mattkorwel/resleeve/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mattkorwel/resleeve/releases/tag/v0.1.0
