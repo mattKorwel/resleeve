@@ -65,6 +65,12 @@ const (
 	// CodeServiceUnavailable — 503. Used by /v2/auth/* when the identity
 	// store isn't configured on the server.
 	CodeServiceUnavailable = "service_unavailable"
+	// CodePayloadTooLarge — 413. round-15 (M-B): the push body exceeded the
+	// MaxPushBytes cap.
+	CodePayloadTooLarge = "payload_too_large"
+	// CodeTooManyRequests — 429. round-15 (M-C): a per-user DoS cap was hit
+	// (concurrent SSE connections, owned brains).
+	CodeTooManyRequests = "too_many_requests"
 	// CodeInternal — 500 catchall.
 	CodeInternal = "internal"
 )
@@ -91,6 +97,10 @@ func defaultCodeForStatus(status int) string {
 		return CodeGone
 	case http.StatusServiceUnavailable:
 		return CodeServiceUnavailable
+	case http.StatusRequestEntityTooLarge:
+		return CodePayloadTooLarge
+	case http.StatusTooManyRequests:
+		return CodeTooManyRequests
 	default:
 		if status >= 500 {
 			return CodeInternal

@@ -34,12 +34,19 @@ func runServe(ctx context.Context, args []string) int {
 	var dsn string
 	var singleTenant bool
 	var masterKeyFile string
+	var maxPushBytes int64
+	var maxSSEPerUser int
+	var maxBrainsPerUser int
 	fs.StringVar(&addr, "addr", "127.0.0.1:7860", "listen address")
 	fs.StringVar(&root, "root", "", "blob storage root (default: ~/.local/share/resleeve/serve)")
 	fs.StringVar(&token, "auth-token", "", "legacy single bearer token (default: $RESLEEVE_SERVE_TOKEN; empty disables legacy auth — per-device only)")
 	fs.StringVar(&dsn, "dsn", "", "sqlite DSN for the identity database (default: ~/.local/share/resleeve/serve/identity.db)")
 	fs.BoolVar(&singleTenant, "single-tenant", false, "solo self-host mode: no brain partitioning, legacy bearer accepted on /v2/sync/* (tiers 1–2)")
 	fs.StringVar(&masterKeyFile, "master-key", "", "file holding the 32-byte server-at-rest master key (hex or base64; default: $RESLEEVE_SERVER_MASTER_KEY; absent = at-rest encryption disabled)")
+	// round-15 multi-tenant DoS caps. 0 = server default (see serve.Config).
+	fs.Int64Var(&maxPushBytes, "max-push-bytes", 0, "max decoded POST /v2/sync/push body in bytes (0 = default 32 MiB); over the cap returns 413")
+	fs.IntVar(&maxSSEPerUser, "max-sse-per-user", 0, "max concurrent SSE connections per user (0 = default 16); over the cap returns 429")
+	fs.IntVar(&maxBrainsPerUser, "max-brains-per-user", 0, "max brains a single user may own (0 = default 100); over the cap returns 429")
 
 	fs.SetOutput(os.Stderr)
 	if err := fs.Parse(args); err != nil {
@@ -130,6 +137,10 @@ func runServe(ctx context.Context, args []string) int {
 		Memberships:  store.Memberships(),
 		SingleTenant: singleTenant,
 		MasterKey:    masterKey,
+		// round-15 DoS caps (0 = serve.Config default).
+		MaxPushBytes:     maxPushBytes,
+		MaxSSEPerUser:    maxSSEPerUser,
+		MaxBrainsPerUser: maxBrainsPerUser,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "serve:", err)

@@ -82,7 +82,59 @@ type Config struct {
 	// a per-device bearer and acts in the caller's personal brain unless
 	// a ?brain=<id> selector (validated for membership) overrides it.
 	SingleTenant bool
+
+	// --- round-15 multi-tenant DoS caps ---
+	// All three are bounded resources a single (possibly compromised) tenant
+	// could otherwise exhaust on a shared server. Zero means "use the
+	// default" so existing callers / tests keep working unchanged.
+
+	// MaxPushBytes caps the decoded request body of POST /v2/sync/push (M-B).
+	// Without it, handlePush streams an unbounded JSON body into the decoder
+	// — a single client could pin memory / fill disk. The cap is generous
+	// (a push batch of session/memory ciphertext) but bounded. Zero =
+	// defaultMaxPushBytes (32 MiB).
+	MaxPushBytes int64
+
+	// MaxSSEPerUser caps the number of concurrent SSE connections a single
+	// user (by UserID) may hold open (M-C). Each connection costs a
+	// goroutine + a buffered fan-out channel; without a cap one user can
+	// exhaust both. Over the cap, handleSSE returns 429. Zero =
+	// defaultMaxSSEPerUser (16). Single-tenant mode (no user identity) is
+	// exempt — there is one tenant.
+	MaxSSEPerUser int
+
+	// MaxBrainsPerUser caps how many brains a single user may OWN (M-C).
+	// handleCreateBrain checks the owner's current brain count before
+	// inserting; over the cap it returns 429. Zero = defaultMaxBrainsPerUser
+	// (100).
+	MaxBrainsPerUser int
+
+	// MaxStorageBytesPerUser would cap a user's total stored-blob bytes
+	// across their brains. DEFERRED in round-15: the Backend interface
+	// exposes List (keys) + Get (one blob) but no cheap per-user byte sum,
+	// so enforcing this on every push needs persistent accounting we
+	// declined to build. Left as 0 (unlimited); see
+	// docs/design/round-15/00-hardening-slice.md. round-15 follow-up.
+	MaxStorageBytesPerUser int64
 }
+
+// round-15 DoS-cap defaults. Each is applied when the corresponding Config
+// field is zero, so existing constructors (tests, single-tenant) keep their
+// historical unbounded-but-now-bounded behavior without code changes.
+const (
+	// defaultMaxPushBytes bounds the push body at 32 MiB — comfortably above
+	// any realistic batch of session/memory ciphertext, far below a
+	// memory-pressure / disk-fill threat.
+	defaultMaxPushBytes = 32 << 20
+	// defaultMaxSSEPerUser bounds concurrent live streams per user. A user
+	// rarely needs more than a handful of devices streaming at once; 16
+	// leaves generous headroom while capping goroutine+channel growth.
+	defaultMaxSSEPerUser = 16
+	// defaultMaxBrainsPerUser bounds owned brains per user. 100 is well past
+	// any human team-sharing need while stopping a script from minting
+	// brains (each provisions a DEK row) without bound.
+	defaultMaxBrainsPerUser = 100
+)
 
 // Server is the HTTP handler exposed at /v2/sync/* and /v2/auth/*.
 type Server struct {
@@ -96,6 +148,19 @@ type Server struct {
 	brainKeys    rsql.BrainKeyStore
 	memberships  rsql.MembershipStore
 	singleTenant bool
+
+	// round-15 DoS caps (resolved from Config, defaults applied in New).
+	maxPushBytes     int64
+	maxSSEPerUser    int
+	maxBrainsPerUser int
+
+	// sseCountMu + sseCounts is the per-user concurrent-SSE-connection
+	// counter (round-15 M-C). handleSSE increments on connect (rejecting
+	// 429 over maxSSEPerUser) and decrements on disconnect. Keyed by UserID;
+	// a user with no open streams has no map entry (cleaned up on the last
+	// disconnect) so the map doesn't grow unbounded with churned users.
+	sseCountMu sync.Mutex
+	sseCounts  map[string]int
 
 	// masterKey is the operator's 32-byte server-at-rest master key (round-12
 	// Part A). When non-nil (with brainKeys), brain provisioning wraps a
@@ -220,6 +285,20 @@ func New(cfg Config) (*Server, error) {
 	if _, err := rand.Read(timingDecoy); err != nil {
 		return nil, fmt.Errorf("serve: gen login-timing decoy: %w", err)
 	}
+	// round-15: resolve DoS caps, applying defaults for the zero value so
+	// existing constructors (tests, single-tenant) keep working unchanged.
+	maxPushBytes := cfg.MaxPushBytes
+	if maxPushBytes <= 0 {
+		maxPushBytes = defaultMaxPushBytes
+	}
+	maxSSEPerUser := cfg.MaxSSEPerUser
+	if maxSSEPerUser <= 0 {
+		maxSSEPerUser = defaultMaxSSEPerUser
+	}
+	maxBrainsPerUser := cfg.MaxBrainsPerUser
+	if maxBrainsPerUser <= 0 {
+		maxBrainsPerUser = defaultMaxBrainsPerUser
+	}
 	s := &Server{
 		mux:               http.NewServeMux(),
 		backend:           cfg.Backend,
@@ -237,6 +316,10 @@ func New(cfg Config) (*Server, error) {
 		loginTimingDecoy:  timingDecoy,
 		fanout:            newInProcessHub(),
 		pairAttempts:      map[string]int{},
+		maxPushBytes:      maxPushBytes,
+		maxSSEPerUser:     maxSSEPerUser,
+		maxBrainsPerUser:  maxBrainsPerUser,
+		sseCounts:         map[string]int{},
 	}
 	s.routes()
 	if cfg.ServerUsers != nil && cfg.Devices != nil {
@@ -356,10 +439,21 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "missing brain context")
 		return
 	}
+	// round-15 (M-B): bound the request body. Without this the decoder
+	// streams an unbounded JSON body — a single client could pin memory or
+	// fill disk. MaxBytesReader makes the decoder return an error once the
+	// cap is exceeded, which we surface as 413.
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxPushBytes)
 	var req PushReq
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("push body exceeds %d-byte cap", s.maxPushBytes))
+			return
+		}
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("decode body: %v", err))
 		return
 	}
@@ -382,6 +476,16 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		storedKey := scopeKey(bc.brainID, row.Key)
+		// round-15 (L-A): validate the FULLY-SCOPED key here, before handing
+		// it to backend.Put, so tenant isolation does not depend on each
+		// backend re-implementing the dot-segment/empty-segment check (today
+		// only the local backend re-validates). A '..' segment in the client
+		// key would otherwise let a write escape the brain prefix on a
+		// backend that doesn't re-check.
+		if err := rsync.ValidateKey(storedKey); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("rejected key %q: %v", row.Key, err))
+			return
+		}
 		// Server-at-rest (round-12 Part A): encrypt the blob with the brain
 		// DEK before persisting. No-op (returns row.Blob) when no master
 		// key / brain DEK is configured. The SSE fan-out below still ships
@@ -509,6 +613,21 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// round-15 (M-C): cap concurrent SSE connections per user. Each open
+	// stream costs a goroutine + a buffered fan-out channel; without a cap
+	// one user can exhaust both. We reserve a slot BEFORE writing the 200 /
+	// subscribing, reject 429 over the cap, and release on disconnect.
+	// Single-tenant mode carries no user identity (UserID == ""), so it is
+	// exempt — there is exactly one tenant.
+	if userID := bc.dev.UserID; userID != "" {
+		if !s.acquireSSESlot(userID) {
+			writeError(w, http.StatusTooManyRequests,
+				fmt.Sprintf("too many concurrent SSE connections (max %d per user)", s.maxSSEPerUser))
+			return
+		}
+		defer s.releaseSSESlot(userID)
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -587,6 +706,32 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			}
 			flusher.Flush()
 		}
+	}
+}
+
+// acquireSSESlot reserves one of userID's maxSSEPerUser concurrent SSE
+// slots (round-15 M-C). Returns false (no slot taken) when the user is
+// already at the cap. Concurrency-safe.
+func (s *Server) acquireSSESlot(userID string) bool {
+	s.sseCountMu.Lock()
+	defer s.sseCountMu.Unlock()
+	if s.sseCounts[userID] >= s.maxSSEPerUser {
+		return false
+	}
+	s.sseCounts[userID]++
+	return true
+}
+
+// releaseSSESlot returns userID's SSE slot on disconnect, deleting the map
+// entry on the last release so the counter map doesn't grow unbounded with
+// churned users. Concurrency-safe.
+func (s *Server) releaseSSESlot(userID string) {
+	s.sseCountMu.Lock()
+	defer s.sseCountMu.Unlock()
+	if n := s.sseCounts[userID] - 1; n > 0 {
+		s.sseCounts[userID] = n
+	} else {
+		delete(s.sseCounts, userID)
 	}
 }
 
