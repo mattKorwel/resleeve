@@ -3,8 +3,10 @@ package serve
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/mattkorwel/resleeve/internal/auth"
 	rsql "github.com/mattkorwel/resleeve/internal/storage/sql"
@@ -235,5 +237,66 @@ func TestAtRest_RejectsBadMasterKeyLength(t *testing.T) {
 	}
 	if _, err := New(Config{Backend: backend, AuthToken: testToken, MasterKey: []byte("too-short")}); err == nil {
 		t.Fatal("New accepted a 9-byte master key")
+	}
+}
+
+// TestAtRest_MissingBrainKeyFailsSecure: on an at-rest server, a brain that
+// somehow has NO provisioned DEK (e.g. orphaned by a partial-failure create)
+// must NOT be stored in plaintext — brainDEK lazily provisions a key
+// (fail-secure) rather than falling through to passthrough.
+func TestAtRest_MissingBrainKeyFailsSecure(t *testing.T) {
+	master := mustMaster(t)
+	ctx := context.Background()
+	backend, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("local.New: %v", err)
+	}
+	store, err := sqlite.Open(ctx, "file:"+t.TempDir()+"/id.db?_pragma=journal_mode=WAL&_pragma=foreign_keys=on")
+	if err != nil {
+		t.Fatalf("sqlite.Open: %v", err)
+	}
+	s, err := New(Config{
+		Backend: backend, AuthToken: testToken,
+		ServerUsers: store.ServerUsers(), Devices: store.Devices(),
+		Pairings: store.Pairings(), ServeMeta: store.ServeMeta(),
+		Brains: store.Brains(), BrainKeys: store.BrainKeys(), Memberships: store.Memberships(),
+		MasterKey: master, SingleTenant: false,
+	})
+	if err != nil {
+		t.Fatalf("serve.New: %v", err)
+	}
+	ts := httptest.NewServer(s)
+	t.Cleanup(func() { ts.Close(); _ = store.Close() })
+
+	// A real user (FK), then a keyless orphan brain they own.
+	userID, _, _ := regUser(t, ts.URL, "owner@example.com")
+	brainID := "deadbeefcafebabe00000001"
+	if err := store.Brains().Create(ctx, &rsql.Brain{
+		ID: brainID, Name: "orphan", Kind: rsql.BrainKindPersonal, OwnerUserID: userID,
+		EncryptionPolicy: rsql.EncryptionPolicyServerSide, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create orphan brain: %v", err)
+	}
+	if _, err := store.BrainKeys().GetBrainKey(ctx, brainID); !errors.Is(err, rsql.ErrNotFound) {
+		t.Fatalf("precondition: brain must be keyless, got err=%v", err)
+	}
+
+	plaintext := []byte("must-not-be-stored-in-the-clear")
+	ct, err := s.encryptForBrain(ctx, brainID, plaintext)
+	if err != nil {
+		t.Fatalf("encryptForBrain: %v", err)
+	}
+	if bytes.Equal(ct, plaintext) {
+		t.Fatal("fail-secure violated: a brain with no DEK stored plaintext")
+	}
+	if _, err := store.BrainKeys().GetBrainKey(ctx, brainID); err != nil {
+		t.Fatalf("DEK was not lazily provisioned: %v", err)
+	}
+	pt, err := s.decryptForBrain(ctx, brainID, ct)
+	if err != nil {
+		t.Fatalf("decryptForBrain: %v", err)
+	}
+	if !bytes.Equal(pt, plaintext) {
+		t.Fatalf("round-trip mismatch: got %q want %q", pt, plaintext)
 	}
 }
