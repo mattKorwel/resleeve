@@ -55,12 +55,18 @@ func (s *Server) provisionBrainKey(ctx context.Context, brainID string) error {
 }
 
 // brainDEK returns the unwrapped DEK for brainID, memoized in-process. It
-// returns (nil, false, nil) when at-rest is disabled or the brain simply
-// has no key provisioned (e.g. created while no master key was set) — the
-// caller then falls back to storing/serving the blob as-is. A real error
-// (DB failure, or a wrapped DEK that won't unwrap under the current
-// master key) is returned so we never silently fall back to plaintext on
-// a key mismatch.
+// returns (nil, false, nil) ONLY when at-rest is disabled (no master key)
+// — that is the legitimate legacy/single-tenant passthrough. When at-rest
+// IS enabled, every brain must be encrypted: a brain with no provisioned
+// key (e.g. orphaned by a partial-failure create) is FAIL-SECURE — we
+// lazily provision a DEK rather than silently storing plaintext. A real
+// error (DB failure, or a wrapped DEK that won't unwrap under the current
+// master key) is returned so we never fall back to plaintext on a mismatch.
+//
+// Note: lazy provisioning makes future writes encrypted; it does not
+// re-encrypt blobs a brain may already hold from a no-key window (none
+// exist in a green-field deploy — a decrypt of such a blob fails the GCM
+// tag and errors rather than leaking, which is the fail-closed outcome).
 func (s *Server) brainDEK(ctx context.Context, brainID string) ([]byte, bool, error) {
 	if !s.atRestEnabled() {
 		return nil, false, nil
@@ -74,8 +80,18 @@ func (s *Server) brainDEK(ctx context.Context, brainID string) ([]byte, bool, er
 	wrapped, err := s.brainKeys.GetBrainKey(ctx, brainID)
 	if err != nil {
 		if errors.Is(err, rsql.ErrNotFound) {
-			// No key for this brain → legacy passthrough for this brain.
-			return nil, false, nil
+			// Fail-secure: an at-rest server must encrypt every brain. Lazily
+			// provision a missing DEK instead of passthrough-to-plaintext.
+			if perr := s.provisionBrainKey(ctx, brainID); perr != nil {
+				return nil, false, fmt.Errorf("provision missing brain dek: %w", perr)
+			}
+			s.dekCacheMu.RLock()
+			dek, ok := s.dekCache[brainID]
+			s.dekCacheMu.RUnlock()
+			if !ok {
+				return nil, false, fmt.Errorf("brain dek absent after provision for %s", brainID)
+			}
+			return dek, true, nil
 		}
 		return nil, false, fmt.Errorf("get brain key: %w", err)
 	}
