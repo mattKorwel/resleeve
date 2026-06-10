@@ -16,6 +16,9 @@ Pre-1.0 versions (`0.x.y`) may include breaking changes in minor bumps. See
 
 ### Fixed
 
+- `serve` now logs the resolved listen address (the actual bound port) when
+  `--addr` uses `:0`, instead of printing the requested `:0`.
+
 ### Security
 
 ## [0.4.0] - 2026-06-10
