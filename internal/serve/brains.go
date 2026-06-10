@@ -117,6 +117,21 @@ func (s *Server) handleCreateBrain(w http.ResponseWriter, r *http.Request, dev *
 		writeError(w, http.StatusBadRequest, "missing brain name")
 		return
 	}
+	// round-15 (M-C): cap how many brains one user may own. Each brain
+	// provisions a DEK row + a membership row; without a cap a script can
+	// mint brains without bound. We count the caller's currently-owned
+	// brains (which includes their auto-provisioned personal brain) and
+	// reject 429 at/over the cap.
+	owned, err := s.brains.ListByOwner(r.Context(), dev.UserID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "count owned brains: "+err.Error())
+		return
+	}
+	if len(owned) >= s.maxBrainsPerUser {
+		writeError(w, http.StatusTooManyRequests,
+			fmt.Sprintf("brain limit reached (max %d per user)", s.maxBrainsPerUser))
+		return
+	}
 	now := time.Now().UTC()
 	b := &rsql.Brain{
 		ID:          newID(16),
