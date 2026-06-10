@@ -39,7 +39,7 @@ Building from source? `go install github.com/mattkorwel/resleeve/cmd/resleeve@la
 - **`--memory-only` mode** if you want the memory layer without persisting transcripts.
 - **Plan history**: plans keep a full version history, and concurrent edits are conflict-checked (a stale edit is rejected with the current version, never silently overwritten). Learnings record who added them.
 - **Sync** (optional) across machines: push-on-commit + pull + an SSE fast tier for memory. End-to-end encrypted when you self-host solo; encrypted server-side at rest when you run a server for a team.
-- **Team mode**: `resleeve serve` can host a group — everyone gets their own private memory, plus **shared memory** a team reads and writes. `resleeve brain create|list|member|use` manage the shared spaces.
+- **Team mode**: `resleeve serve` can host a group — everyone gets their own private memory, plus **shared memory** a team reads and writes, with updates propagating to members in real time. `resleeve brain create|list|member|use` manage the shared spaces.
 - **`resleeve resume`** replays a captured session into a fresh CLI process — same vendor (full fidelity) or cross-vendor (synthesized prime).
 - **MCP server** so an agent in-session can curate its own memory (`resleeve_plan_write`, `resleeve_learning_append`, …). Wire it into each CLI with `resleeve install-bridge --mcp`.
 
